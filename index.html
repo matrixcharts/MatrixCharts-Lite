@@ -1,0 +1,52 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>MatrixCharts Engine Test</title>
+    <style>
+        body {
+            background-color: #0d1117; /* Dark institutional background */
+            color: #c9d1d9;
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            margin: 0;
+            padding: 40px;
+        }
+        h2 {
+            margin-bottom: 20px;
+            font-weight: 500;
+        }
+        /* This is the target container we pass to the library */
+        #chart-container {
+            width: 800px;
+            height: 500px;
+            background-color: #161b22;
+            border: 1px solid #30363d;
+            border-radius: 6px;
+            box-shadow: 0 8px 24px rgba(0,0,0,0.5);
+            resize: both;
+            overflow: hidden; /* Allows you to drag the corner to test the ResizeObserver */
+        }
+    </style>
+</head>
+<body>
+    <h2>MatrixCharts Layered Architecture</h2>
+    
+    <!-- The Empty Container -->
+    <div id="chart-container"></div>
+
+<!-- Initialize the library -->
+    <script type="module">
+        import { Chart } from './src/index.ts';
+        // Boot up the engine and attach it to the div
+        const chart = new Chart('chart-container');
+        
+        chart.testDrawWebGLCandlesticks();
+        
+        console.log("MatrixCharts successfully initialized.", chart);
+    </script>
+</body>
+</html>
