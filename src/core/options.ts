@@ -93,6 +93,37 @@ export interface PanesOptions {
     separatorColor?: string;
 }
 
+/**
+ * How the price pane's vertical axis is scaled. Additive in 1.x.
+ *
+ * `mode` is a property of the *price* pane only. A pane holding something that is
+ * not a price — an RSI, a MACD histogram — stays linear whatever this is set to,
+ * because a log axis has no reading for a bounded oscillator and rounding its
+ * labels to a tradable increment is meaningless.
+ */
+export interface PriceScaleOptions {
+    /**
+     * `linear` or `log`. Defaults to `linear`, so a chart with no log in it behaves
+     * exactly as it did before this option existed.
+     *
+     * Log is not a different transform: the axis is still affine, over log of the
+     * price rather than over the price itself. That is why this needs no new uniform
+     * and no second program.
+     */
+    mode?: 'linear' | 'log';
+    /**
+     * Whether higher prices sit lower down the pane. Defaults to false.
+     */
+    inverted?: boolean;
+    /**
+     * Whether the price pane follows the visible data. Defaults to true, which is
+     * the behaviour without this option. Set it false to lock the pane to whatever
+     * `setPriceRange` last established, which is what a trader comparing two
+     * instruments on the same scale needs.
+     */
+    autoScale?: boolean;
+}
+
 export interface GridOptions {
     vertLines?: boolean;
     horzLines?: boolean;
@@ -173,6 +204,7 @@ export interface ChartOptions {
     priceFormat?: PriceFormatOptions;
     layout?: LayoutOptions;
     volume?: VolumeOptions;
+    priceScale?: PriceScaleOptions;
     panes?: PanesOptions;
     grid?: GridOptions;
     crosshair?: CrosshairOptions;
@@ -199,6 +231,11 @@ export interface ResolvedVolume {
     visible: boolean;
     colors: ResolvedVolumeColors;
     heightRatio: number;
+}
+export interface ResolvedPriceScale {
+    mode: 'linear' | 'log';
+    inverted: boolean;
+    autoScale: boolean;
 }
 export interface ResolvedPanes {
     weights: number[];
@@ -231,6 +268,7 @@ export interface ResolvedChartOptions {
     priceFormat: ResolvedPriceFormat;
     layout: ResolvedLayout;
     volume: ResolvedVolume;
+    priceScale: ResolvedPriceScale;
     panes: ResolvedPanes;
     grid: ResolvedGrid;
     crosshair: ResolvedCrosshair;
@@ -250,6 +288,7 @@ const BASE_DEFAULTS: Omit<ResolvedChartOptions, 'theme' | 'locale' | 'candlestic
     maxRetainedCandles: DEFAULT_MAX_RETAINED_CANDLES,
     timeZone: 'UTC',
     priceFormat: { precision: 2, minMove: 0.01 },
+    priceScale: { mode: 'linear', inverted: false, autoScale: true },
     // One pane filling the plot, and a hairline between panes. The separator
     // colour is resolved after the grid colour, which it defaults to.
     panes: { weights: [1], separatorHeight: 1, separatorColor: '' },
@@ -531,6 +570,7 @@ export function themeDefaults(theme: ChartTheme): ResolvedChartOptions {
         locale: runtimeLocale(),
         priceFormat: { ...BASE_DEFAULTS.priceFormat },
         layout: { ...preset.layout, ...DEFAULT_LAYOUT_METRICS },
+        priceScale: { ...BASE_DEFAULTS.priceScale },
         volume: {
             ...DEFAULT_VOLUME_METRICS,
             colors: {
@@ -576,6 +616,22 @@ export function resolveOptions(partial: ChartOptions, fallbackTheme: ChartTheme 
     }
     if (partial.locale !== undefined) resolved.locale = requireLocale(partial.locale);
     if (partial.timeZone !== undefined) resolved.timeZone = requireTimeZone(partial.timeZone);
+
+    if (partial.priceScale !== undefined) {
+        const scale = requirePlainObject(partial.priceScale, 'priceScale');
+        if (scale.mode !== undefined) {
+            if (scale.mode !== 'linear' && scale.mode !== 'log') {
+                fail('priceScale.mode must be \'linear\' or \'log\'.');
+            }
+            resolved.priceScale.mode = scale.mode;
+        }
+        if (scale.inverted !== undefined) {
+            resolved.priceScale.inverted = requireBoolean(scale.inverted, 'priceScale.inverted');
+        }
+        if (scale.autoScale !== undefined) {
+            resolved.priceScale.autoScale = requireBoolean(scale.autoScale, 'priceScale.autoScale');
+        }
+    }
 
     if (partial.panes !== undefined) {
         const panes = requirePlainObject(partial.panes, 'panes');
@@ -766,7 +822,7 @@ export function mergeOptionPartials(
     }
 
     const merged: ChartOptions = { ...base };
-    const nestedKeys = ['priceFormat', 'layout', 'volume', 'panes', 'grid', 'crosshair', 'timeScale', 'candlestick'] as const;
+    const nestedKeys = ['priceFormat', 'layout', 'volume', 'priceScale', 'panes', 'grid', 'crosshair', 'timeScale', 'candlestick'] as const;
     for (const key of nestedKeys) {
         const patchValue = patch[key];
         if (patchValue === undefined) continue;

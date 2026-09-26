@@ -224,20 +224,20 @@ test('a timestamp inside a break belongs to the nearer side', () => {
     const offsets = computeSlotOffsets(times, sizeSessionBreaks(times, resolved));
     const gapStart = times[9];
     const gapEnd = times[10];
-    assert.equal(indexAtTime(times, offsets, gapStart), 9, 'the gap start belongs to the earlier bar');
-    assert.equal(indexAtTime(times, offsets, gapEnd), 10, 'the gap end belongs to the later bar');
+    assert.equal(indexAtTime(times, gapStart), 9, 'the gap start belongs to the earlier bar');
+    assert.equal(indexAtTime(times, gapEnd), 10, 'the gap end belongs to the later bar');
     assert.equal(
-        indexAtTime(times, offsets, gapStart + (gapEnd - gapStart) / 2 - 1),
+        indexAtTime(times, gapStart + (gapEnd - gapStart) / 2 - 1),
         9,
         'the first half of a break belongs to the earlier bar',
     );
     assert.equal(
-        indexAtTime(times, offsets, gapStart + (gapEnd - gapStart) / 2 + 1),
+        indexAtTime(times, gapStart + (gapEnd - gapStart) / 2 + 1),
         10,
         'the second half belongs to the later bar',
     );
     // And outside the series it clamps.
-    assert.equal(indexAtTime(times, offsets, 0), 0);
-    assert.equal(indexAtTime(times, offsets, Number.MAX_SAFE_INTEGER), times.length - 1);
+    assert.equal(indexAtTime(times, 0), 0);
+    assert.equal(indexAtTime(times, Number.MAX_SAFE_INTEGER), times.length - 1);
     assert.equal(indexAtTime([], offsets, 0), -1);
 });

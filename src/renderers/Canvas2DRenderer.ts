@@ -14,10 +14,9 @@ import {
     coordinateToIndex,
     coordinateToPrice,
     indexToCoordinate,
-    priceToCoordinate,
-    visiblePriceRange,
 } from '../core/coordinates.js';
-import { paneTickStep, paneValueAt, paneValueSpan, MIN_PANE_TICKS, type PaneLayout } from '../core/panes.js';
+import { paneValueAt, type PaneLayout } from '../core/panes.js';
+import { fromScaleSpace, priceTicks, toScaleSpace, type PriceScale, type Tick } from '../core/priceScale.js';
 import {
     LABEL_PRIORITY,
     layoutLabels,
@@ -77,8 +76,7 @@ interface DecorationLabels {
 interface PriceBand {
     rect: PlotRect;
     y: (value: number) => number;
-    step: number;
-    range: [number, number];
+    ticks: Tick[];
 }
 
 export class Canvas2DRenderer implements IRenderer {
@@ -287,14 +285,14 @@ public init(canvas: HTMLCanvasElement, emitter: EventEmitter<ChartEvents>): void
         const labels: DecorationLabels = this.planLabels();
 
         if (this.options.grid.horzLines) {
-            // Horizontal lines are per pane, from that pane's own scale. Drawing
-            // them from the price scale across the whole plot would put a price
-            // grid through an RSI pane, labelling it in prices it does not have.
+            // Horizontal lines are per pane, from that pane's own scale, and off the
+            // same tick list the labels come from. Drawing them from the price scale
+            // across the whole plot would put a price grid through an RSI pane,
+            // labelling it in prices it does not have; and computing the lines and the
+            // labels from the same list is what stops a label drifting off its line.
             for (const band of this.priceBands()) {
-                const [minimumVisiblePrice, maximumVisiblePrice]: [number, number] = band.range;
-                const firstPriceTick: number = Math.ceil(minimumVisiblePrice / band.step) * band.step;
-                for (let price: number = firstPriceTick; price <= maximumVisiblePrice + band.step * 1e-9; price += band.step) {
-                    const y: number = band.y(price);
+                for (const tick of band.ticks) {
+                    const y: number = band.y(tick.value);
                     if (y < band.rect.y || y > band.rect.y + band.rect.height) continue;
                     const crispY: number = Math.floor(y) + 0.5;
                     this.ctx.moveTo(plot.x, crispY);
@@ -329,25 +327,38 @@ public init(canvas: HTMLCanvasElement, emitter: EventEmitter<ChartEvents>): void
      * has to displace that tick, or the two are drawn on top of each other and both
      * become unreadable.
      */
+    /**
+     * Screen y of a price on the price pane, honouring its scale.
+     *
+     * Every decoration arrives in prices and has to be placed in scale space, since
+     * that is what the pane's transform is affine over. Funnelling all of them
+     * through here is deliberate: five call sites each converting for themselves is
+     * five chances to forget one, and on a log axis a forgotten conversion puts a
+     * price line at a plausible-looking wrong place rather than off screen.
+     */
+    private pricePaneY(price: number): number {
+        const band: PriceBand | undefined = this.priceBands()[0];
+        if (band === undefined) return price;
+        return band.y(toScaleSpace(price, this.options.priceScale.mode));
+    }
+
     private planLabels(): DecorationLabels {
         const bands: PriceBand[] = this.priceBands();
         const priceBand: PriceBand | undefined = bands[0];
 
         const ticks: Array<{ y: number; price: number }> = [];
         for (const band of bands) {
-            const [low, high]: [number, number] = band.range;
-            const first: number = Math.ceil(low / band.step) * band.step;
-            for (let price: number = first; price <= high + band.step * 1e-9; price += band.step) {
-                const y: number = band.y(price);
+            for (const tick of band.ticks) {
+                const y: number = band.y(tick.value);
                 if (y < band.rect.y || y > band.rect.y + band.rect.height) continue;
-                ticks.push({ y, price });
+                ticks.push({ y, price: tick.price });
             }
         }
 
         const lines: Array<{ y: number; line: ResolvedPriceLine }> = [];
         for (const line of this.priceLines) {
             if (priceBand === undefined) continue;
-            const y: number = priceBand.y(line.price);
+            const y: number = priceBand.y(toScaleSpace(line.price, this.options.priceScale.mode));
             // A line scrolled off the top or bottom of the price pane is not drawn at
             // all, tag included: a tag for a price that is not on screen reads as a
             // price that is.
@@ -357,7 +368,7 @@ public init(canvas: HTMLCanvasElement, emitter: EventEmitter<ChartEvents>): void
 
         let lastY: number | null = null;
         if (this.lastPrice !== null && priceBand !== undefined) {
-            const y: number = priceBand.y(this.lastPrice.price);
+            const y: number = priceBand.y(toScaleSpace(this.lastPrice.price, this.options.priceScale.mode));
             if (y >= priceBand.rect.y && y <= priceBand.rect.y + priceBand.rect.height) lastY = y;
         }
 
@@ -388,42 +399,67 @@ public init(canvas: HTMLCanvasElement, emitter: EventEmitter<ChartEvents>): void
     }
 
     /**
-     * One price band per pane: the rect, the transform from a value to a y within
-     * it, and a tick step sized to that pane's own scale.
+     * One price band per pane: the rect, the transform from a scale-space value to a
+     * y within it, and the ticks to label.
      *
-     * With no panes declared this is a single band covering the whole plot on the
-     * price scale, which is the behaviour that shipped before panes existed.
+     * The tick list is built here and reused by both the grid lines and the labels,
+     * so a label cannot drift off the line it belongs to. It is built from the
+     * pane's *scale*, which is why a log pane is labelled 1, 2, 5, 10 rather than
+     * 2.7, 7.4, 148 — and why `priceFormat.minMove` is only ever applied to the
+     * price pane, it being a property of prices.
+     *
+     * With no panes declared this is a single band covering the whole plot, which is
+     * the behaviour that shipped before panes existed.
      */
     private priceBands(): PriceBand[] {
         const viewport: ChartViewport = this.viewport;
         const panes: PaneLayout | null = this.panes;
         if (panes === null || panes.rects.length === 0) {
-            return [{
-                rect: viewport.plot,
-                y: (price: number): number => priceToCoordinate(viewport, price),
-                step: this.priceTickStepFor(viewport.scaleY, viewport.plot, true),
-                range: visiblePriceRange(viewport),
-            }];
+            const transform: VerticalTransform = {
+                scaleY: viewport.scaleY,
+                offsetY: viewport.offsetY,
+            };
+            return [this.makeBand(viewport.plot, transform, this.options.priceScale.mode, true)];
         }
         const bands: PriceBand[] = [];
         for (let index = 0; index < panes.rects.length; index++) {
             const rect: PlotRect = panes.rects[index];
             if (rect.height <= 0) continue;
-            const transform: VerticalTransform = panes.transforms[index];
             // A pane with nothing on it is left unlabelled rather than given the
             // placeholder 0-to-1 scale, which would read as a real axis on a chart
             // with nothing plotted.
             if (panes.empty[index]) continue;
-            const top: number = paneValueAt(transform, rect.y);
-            const bottom: number = paneValueAt(transform, rect.y + rect.height);
-            bands.push({
-                rect,
-                y: (price: number): number => transform.offsetY + price * transform.scaleY,
-                step: this.priceTickStepFor(transform.scaleY, rect, index === 0),
-                range: [Math.min(top, bottom), Math.max(top, bottom)],
-            });
+            // Only the price pane is loggable. A pane holding an oscillator has no
+            // reading on a log axis, so it stays linear whatever the price pane is
+            // set to.
+            const scale: PriceScale = index === 0 ? this.options.priceScale.mode : 'linear';
+            bands.push(this.makeBand(rect, panes.transforms[index], scale, index === 0));
         }
         return bands;
+    }
+
+    private makeBand(
+        rect: PlotRect,
+        transform: VerticalTransform,
+        scale: PriceScale,
+        isPricePane: boolean,
+    ): PriceBand {
+        const top: number = fromScaleSpace(paneValueAt(transform, rect.y), scale);
+        const bottom: number = fromScaleSpace(paneValueAt(transform, rect.y + rect.height), scale);
+        const low: number = Math.min(top, bottom);
+        const high: number = Math.max(top, bottom);
+        // One label per 56 CSS pixels of pane, and never fewer than two: a short pane
+        // sized purely by pixels ends up with a single line, which is an axis nobody
+        // can read a level off.
+        const target: number = Math.max(2, Math.min(8, Math.round(rect.height / 56)));
+        return {
+            rect,
+            // Takes a scale-space value, because that is what the transform is affine
+            // over. Passing a price here is the mistake this indirection exists to
+            // make impossible.
+            y: (value: number): number => transform.offsetY + value * transform.scaleY,
+            ticks: priceTicks(low, high, scale, target, isPricePane ? this.options.priceFormat.minMove : 0),
+        };
     }
 
     public destroy(): void {
@@ -557,17 +593,16 @@ public init(canvas: HTMLCanvasElement, emitter: EventEmitter<ChartEvents>): void
         this.ctx.lineTo(plotRight, plotBottom - 0.5);
         this.ctx.stroke();
 
-        // One set of price labels per pane, from that pane's own scale, minus
-        // whichever ones a price line or the last-price tag has claimed.
+        // One set of price labels per pane, from that pane's own scale and its own
+        // tick list, minus whichever ones a price line or the last-price tag has
+        // claimed.
         for (const band of this.priceBands()) {
-            const [minimumVisiblePrice, maximumVisiblePrice]: [number, number] = band.range;
-            const firstPriceTick: number = Math.ceil(minimumVisiblePrice / band.step) * band.step;
-            for (let price: number = firstPriceTick; price <= maximumVisiblePrice + band.step * 1e-9; price += band.step) {
-                const y: number = band.y(price);
+            for (const tick of band.ticks) {
+                const y: number = band.y(tick.value);
                 if (y < band.rect.y || y > band.rect.y + band.rect.height) continue;
                 const index: number | undefined = labels.tickIndex.get(y);
                 if (index !== undefined && labels.keep[index] === false) continue;
-                this.drawLabel(this.formatAxisValue(price), plot.x - 6, y, 'right');
+                this.drawLabel(this.formatAxisValue(tick.price), plot.x - 6, y, 'right');
             }
         }
 
@@ -637,7 +672,7 @@ public init(canvas: HTMLCanvasElement, emitter: EventEmitter<ChartEvents>): void
         this.renderMarkers(viewport, plot);
 
         for (const line of this.priceLines) {
-            const y: number = priceToCoordinate(viewport, line.price);
+            const y: number = this.pricePaneY(line.price);
             if (y < plot.y || y > plot.y + plot.height) continue;
 
             this.ctx.save();
@@ -670,7 +705,7 @@ public init(canvas: HTMLCanvasElement, emitter: EventEmitter<ChartEvents>): void
         }
 
         if (labels.lastShown && labels.lastY !== null && this.lastPrice !== null) {
-            const y: number = priceToCoordinate(viewport, this.lastPrice.price);
+            const y: number = this.pricePaneY(this.lastPrice.price);
             const crispY: number = Math.floor(y) + 0.5;
             const color: readonly [number, number, number, number] = this.lastPrice.direction === 'up'
                 ? this.colors.up
@@ -712,8 +747,8 @@ public init(canvas: HTMLCanvasElement, emitter: EventEmitter<ChartEvents>): void
             const x1: number = zone.toIndex === null
                 ? plot.x + plot.width
                 : indexToCoordinate(viewport, zone.toIndex) + viewport.scaleX / 2;
-            const yTop: number = priceToCoordinate(viewport, zone.top);
-            const yBottom: number = priceToCoordinate(viewport, zone.bottom);
+            const yTop: number = this.pricePaneY(zone.top);
+            const yBottom: number = this.pricePaneY(zone.bottom);
             if (yTop === yBottom) continue;
 
             // A zone entirely above or below the pane is not drawn at all. Clipping a
@@ -776,7 +811,7 @@ public init(canvas: HTMLCanvasElement, emitter: EventEmitter<ChartEvents>): void
             if (x < plot.x - MARKER_MARGIN || x > plot.x + plot.width + MARKER_MARGIN) continue;
 
             const size: number = MARKER_SIZE * marker.size;
-            let y: number = priceToCoordinate(viewport, marker.price);
+            let y: number = this.pricePaneY(marker.price);
             // Arrows stand off the bar they annotate; a circle or square sits on the
             // price itself, because a marker's job is to point at a level.
             if (marker.position === 'aboveBar') y -= MARKER_OFFSET;
@@ -870,44 +905,6 @@ public init(canvas: HTMLCanvasElement, emitter: EventEmitter<ChartEvents>): void
         return this.priceFormatter.format(value);
     }
 
-    /**
-     * Tick step for one pane's own scale.
-     *
-     * `priceFormat.minMove` is the instrument's tradable increment, which is a
-     * property of prices and therefore belongs to the price pane only. Applying it
-     * to a pane holding an RSI would round every tick to a multiple of 0.01 and
-     * leave a pane spanning 0 to 100 labelled with a tick every hundredth.
-     */
-    /**
-     * Tick step for one pane's own scale.
-     *
-     * `priceFormat.minMove` is the instrument's tradable increment, which is a
-     * property of prices and therefore belongs to the price pane only. Applying it
-     * to a pane holding an RSI would round every tick to a multiple of 0.01 and
-     * leave a pane spanning 0 to 100 labelled with a tick every hundredth.
-     *
-     * A non-price pane also gets a minimum tick *count*. Sizing a step from a fixed
-     * pixel spacing suits a tall pane and starves a short one: an RSI pane a
-     * quarter as tall as the price pane still spans its whole range in far fewer
-     * pixels, so a step chosen for 56px of separation rounds up past the pane's
-     * own range and leaves a single label on the axis — an RSI you cannot read a
-     * level off.
-     */
-    private priceTickStepFor(scaleY: number, rect: PlotRect, isPricePane: boolean): number {
-        const pixelTarget: number = 56 / Math.abs(scaleY);
-        // The span comes from the pane module rather than being recomputed here,
-        // because combining a rect with a transform is exactly where the units get
-        // mixed up, and getting it wrong is completely silent.
-        const span: number = paneValueSpan(rect, { scaleY, offsetY: 0 });
-        const target: number = isPricePane
-            ? this.niceStep(pixelTarget)
-            : paneTickStep(span, pixelTarget, MIN_PANE_TICKS, (value: number): number => this.niceStep(value));
-
-        const { minMove } = this.options.priceFormat;
-        if (!isPricePane || !(minMove > 0)) return target;
-        const steps: number = Math.ceil(target / minMove - 1e-9);
-        return Math.max(minMove, steps * minMove);
-    }
     private formatTimeAtIndex(index: number): string {
         if (this.timeValues.length === 0) return this.formatAxisValue(index);
         const candleIndex: number = this.nearestCandleIndex(index);

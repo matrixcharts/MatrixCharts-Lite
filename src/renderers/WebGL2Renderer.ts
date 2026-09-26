@@ -757,8 +757,15 @@ export class WebGL2Renderer implements IRenderer {
             const physicalBottom: number = Math.floor(
                 (bodyBottom * this.currentScale[1] + this.currentOffset[1]) * this.devicePixelRatio + 0.5,
             );
-            const upperPixelCenter: number = physicalTop + 1.5;
-            const lowerPixelCenter: number = physicalBottom - 1.5;
+            // The wick ends 1.5px *inside* the body, so it cannot leave a seam where
+            // it meets the body edge. "Inside" is toward the body's centre, which is
+            // down the screen on an ordinary axis and **up** the screen on an
+            // inverted one — so the inset follows the sign of the scale rather than
+            // assuming higher values sit higher. Assuming it is what puts an inverted
+            // chart's wick clamp on the wrong edge and draws it across the body.
+            const inward: number = this.currentScale[1] < 0 ? 1.5 : -1.5;
+            const upperPixelCenter: number = physicalTop + inward;
+            const lowerPixelCenter: number = physicalBottom - inward;
             const upperWickBoundary: number = (
                 upperPixelCenter / this.devicePixelRatio - this.currentOffset[1]
             ) / this.currentScale[1];

@@ -152,6 +152,20 @@
                 <option value="both">zones + markers</option>
             </select>
         </label>
+        <label class="swatch">Price scale
+            <select id="price-scale" aria-label="Price axis scale">
+                <option value="linear">linear</option>
+                <option value="log">log</option>
+                <option value="log,1">log + inverted</option>
+                <option value="linear,1">inverted</option>
+            </select>
+        </label>
+        <label class="swatch">Scale lock
+            <select id="scale-lock" aria-label="Lock the price range">
+                <option value="auto">auto</option>
+                <option value="locked">locked</option>
+            </select>
+        </label>
         <label class="swatch">Panes
             <select id="pane-weights" aria-label="Pane layout">
                 <option value="1">1 pane</option>
@@ -717,6 +731,28 @@
             }
         };
         decorationInput.addEventListener('change', () => setDecorations(decorationInput.value));
+
+        // The price axis: linear or log, with or without inversion, and a lock.
+        // A log chart is the reason the price scale lives where it does rather than
+        // in a second shader program, so it is worth being able to look at.
+        const scaleInput = document.querySelector('#price-scale');
+        const lockInput = document.querySelector('#scale-lock');
+        scaleInput.addEventListener('change', () => {
+            const [mode, inverted] = scaleInput.value.split(',');
+            chart.applyOptions({
+                priceScale: { mode, inverted: inverted === '1', autoScale: lockInput.value !== 'locked' },
+            });
+        });
+        lockInput.addEventListener('change', () => {
+            if (lockInput.value === 'locked') {
+                // Locked to the range already on screen, which is the useful thing to
+                // compare two instruments on: the same range, not a chosen one.
+                const [low, high] = chart.getPriceRange();
+                chart.setPriceRange([low, high]);
+            } else {
+                chart.fitPriceRange();
+            }
+        });
         setInterval(() => {
             if (decorationInput.value !== 'none') setDecorations(decorationInput.value);
         }, 700);

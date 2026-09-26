@@ -16,6 +16,7 @@
 
 import type { Rgba } from './options.js';
 import { nearestCandleIndexByTime } from './coordinates.js';
+import { LOG_PRICE_FLOOR } from './priceScale.js';
 
 /** A marker with the price resolved, which is what the renderer actually draws. */
 export interface PlacedMarker extends ResolvedMarker {
@@ -532,6 +533,28 @@ export function resolveZones(
         });
     }
     return resolved;
+}
+
+/**
+ * Overlay points with their values put through a price→scale-space conversion.
+ *
+ * Only the value is converted, never the x, and the per-point colour payload is
+ * carried across untouched. A stride of 6 means each point is
+ * `[x, value, r, g, b, a]`; converting the x as well would put a price where a
+ * timestamp belongs.
+ */
+export function scaleOverlayPoints(points: Float32Array, stride: 2 | 6): Float32Array {
+    if (stride !== 6) {
+        const out: Float32Array = new Float32Array(points.length);
+        for (let i = 1; i < points.length; i += 2) out[i] = Math.log(Math.max(points[i], LOG_PRICE_FLOOR));
+        return out;
+    }
+    const out: Float32Array = new Float32Array(points.length);
+    out.set(points);
+    for (let i = 0; i < points.length; i += 6) {
+        out[i + 1] = Math.log(Math.max(points[i + 1], LOG_PRICE_FLOOR));
+    }
+    return out;
 }
 
 /** Ordinal of an exact timestamp, or -1. */

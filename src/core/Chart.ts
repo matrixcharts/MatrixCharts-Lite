@@ -47,9 +47,16 @@ import {
     type PriceLineSpec,
     type ResolvedMarker,
     type ResolvedPriceLine,
+    scaleOverlayPoints,
     type ZoneSpec,
 } from './decorations.js';
 import type { VerticalTransform } from '../renderers/WebGLSeries.js';
+import {
+    fromScaleSpace,
+    representableRange,
+    toScaleSpace,
+    type PriceScale,
+} from './priceScale.js';
 import {
     bucketOverlay,
     resolveOverlays,
@@ -78,7 +85,6 @@ import {
     nearestCandleIndexByTime,
     plotCentreX,
     plotRight,
-    priceToCoordinate,
     visibleLogicalRange,
 } from './coordinates.js';
 
@@ -139,6 +145,13 @@ export class Chart {
     private priceLines: ResolvedPriceLine[] = [];
     private markers: ResolvedMarker[] = [];
     private zones: PlacedZone[] = [];
+    /** Set by setPriceRange; null while the pane is free to fit the data. */
+    private lockedPriceRange: [number, number] | null = null;
+    /**
+     * Reused each frame, so a log chart converts prices in place rather than
+     * reallocating a full candle buffer on every animation frame.
+     */
+    private scaledCandleBuffer: Float32Array = new Float32Array(0);
     /**
      * Pane rects and vertical transforms for the current frame, in CSS pixels.
      * Recomputed with the viewport, because both depend on it.
@@ -637,7 +650,7 @@ export class Chart {
                 y: this.crosshairY as number,
                 index: this.crosshairIndex,
                 time: this.crosshairCandle.time,
-                price: coordinateToPrice(this.viewport, this.crosshairY as number),
+                price: this.coordinateToPrice(this.crosshairY as number),
                 candle: this.crosshairCandle,
             }
             : { x: null, y: null, index: -1, time: null, price: null, candle: null };
@@ -691,7 +704,7 @@ export class Chart {
                 y,
                 index,
                 time: candle.time,
-                price: coordinateToPrice(this.viewport, y),
+                price: this.coordinateToPrice(y),
                 candle,
                 button,
             }
@@ -1059,6 +1072,126 @@ export class Chart {
     }
 
     /**
+     * The price range the price pane is currently showing, low first.
+     *
+     * Prices, not scale-space values, whatever the scale is — this is the API a
+     * caller reads to display the current range or to hand the same range to
+     * another chart.
+     */
+    public getPriceRange(): [number, number] {
+        this.assertAlive();
+        const rect: PlotRect = this.pricePaneRect();
+        if (rect.height <= 0 || this.scaleY === 0) {
+            const last: CandleData | null = this.getLastCandle();
+            const price: number = last === null ? 0 : last.close;
+            return [price, price];
+        }
+        // Both ends of the pane, converted back out of scale space. Read in that
+        // order and normalised afterwards, so an inverted pane reports low first
+        // like every other range in the API.
+        const atTop: number = fromScaleSpace(this.offsetY, this.priceScale());
+        const atBottom: number = fromScaleSpace(this.offsetY + rect.height * this.scaleY, this.priceScale());
+        return [Math.min(atTop, atBottom), Math.max(atTop, atBottom)];
+    }
+
+    /**
+     * Sets the price range the price pane shows, and locks it.
+     *
+     * Locking is the point: a fit that runs every frame would undo this on the next
+     * append. `priceScale.autoScale` goes false, so the range holds until a caller
+     * turns it back on or calls `fitPriceRange`.
+     */
+    public setPriceRange(range: readonly [number, number]): void {
+        this.assertAlive();
+        if (!Array.isArray(range) || range.length !== 2) {
+            throw new Error('MatrixCharts: setPriceRange expects [minimum, maximum].');
+        }
+        const minimum: number = range[0];
+        const maximum: number = range[1];
+        if (!Number.isFinite(minimum) || !Number.isFinite(maximum)) {
+            throw new Error('MatrixCharts: setPriceRange expects two finite prices.');
+        }
+        if (maximum <= minimum) {
+            throw new Error(`MatrixCharts: setPriceRange expects a maximum above its minimum, got [${minimum}, ${maximum}].`);
+        }
+        const scale: PriceScale = this.priceScale();
+        if (scale === 'log' && minimum <= 0) {
+            throw new Error(`MatrixCharts: a log price scale cannot show a range starting at ${minimum}.`);
+        }
+        this.lockedPriceRange = [minimum, maximum];
+        this.resolvedOptions.priceScale.autoScale = false;
+        this.explicitOptions.priceScale = {
+            ...(this.explicitOptions.priceScale ?? {}),
+            autoScale: false,
+        };
+        this.applyPriceRange([minimum, maximum]);
+        this.refreshCrosshairAfterViewportChange();
+        this.redraw();
+    }
+
+    /**
+     * Unlocks the price pane and lets it fit the visible data again.
+     *
+     * Separate from `applyOptions({priceScale: {autoScale: true}})` only in
+     * spelling: the range is forgotten either way, so the next frame is a fit.
+     */
+    public fitPriceRange(): void {
+        this.assertAlive();
+        this.lockedPriceRange = null;
+        this.resolvedOptions.priceScale.autoScale = true;
+        this.explicitOptions.priceScale = {
+            ...(this.explicitOptions.priceScale ?? {}),
+            autoScale: true,
+        };
+        this.updateViewport();
+    }
+
+    /**
+     * Fits the horizontal axis to every retained candle.
+     *
+     * Only the horizontal axis: a vertical fit is what the pane already does on
+     * every frame, so "fit content" that also touched the vertical would be a way of
+     * saying "autoscale" and would silently unlock a pane the caller had locked. A
+     * locked price range survives this.
+     */
+    public fitContent(): void {
+        this.assertAlive();
+        const count: number = this.candlePyramid.candleCount;
+        if (count === 0) return;
+        // Whatever the current bar spacing, the whole series has to land inside the
+        // plot. `clampBarSpacing` applies the configured minimum and maximum, so a
+        // series of two bars is not blown up past `maxBarSpacing`.
+        const plot: PlotRect = this.viewport.plot;
+        const spacing: number = this.clampBarSpacing(plot.width / count);
+        this.scaleX = spacing;
+        this.offsetX = liveEdgeOffsetX(plotRight(this.viewport), count, spacing);
+        this.followsLiveEdge = true;
+        this.updateViewport();
+    }
+
+    /**
+     * Returns to the live edge, re-arming the follow that a pan switches off.
+     *
+     * Separate from setting the range by hand because the latch is the part a
+     * caller cannot see: a chart that has been panned keeps the old offset and looks
+     * frozen at the new one, and the only way back is this.
+     */
+    public scrollToRealtime(): void {
+        this.assertAlive();
+        const count: number = this.candlePyramid.candleCount;
+        if (count === 0) return;
+        this.offsetX = liveEdgeOffsetX(plotRight(this.viewport), count, this.scaleX);
+        this.followsLiveEdge = true;
+        this.updateViewport();
+    }
+
+    /** Whether the chart is currently following the newest candle. */
+    public isAtRealtime(): boolean {
+        this.assertAlive();
+        return this.followsLiveEdge;
+    }
+
+    /**
      * The value range currently shown in a pane, low first, or `null` for a pane
      * that does not exist or has nothing on screen to scale to.
      *
@@ -1145,13 +1278,19 @@ export class Chart {
     /** Screen y of a price. */
     public priceToCoordinate(price: number): number {
         this.assertAlive();
-        return priceToCoordinate(this.viewport, price);
+        return this.offsetY + toScaleSpace(price, this.priceScale()) * this.scaleY;
     }
 
-    /** Price at a screen y, using the current auto-fitted vertical scale. */
+    /**
+     * Price at a screen y on the price pane, honouring the scale and the inversion.
+     *
+     * The inverse of `priceToCoordinate`. A y outside the pane is still converted
+     * rather than clamped: a crosshair dragged above the chart has a price, and it
+     * is a real one.
+     */
     public coordinateToPrice(coordinateY: number): number {
         this.assertAlive();
-        return coordinateToPrice(this.viewport, coordinateY);
+        return fromScaleSpace((coordinateY - this.offsetY) / this.scaleY, this.priceScale());
     }
 
     /** Replaces authoritative feed history while retaining the current time anchor when available. */
@@ -1499,13 +1638,33 @@ export class Chart {
      * screen, and it fills the whole plot height; there is no plot rect yet, so
      * "plot" is currently the entire canvas.
      */
+    /**
+     * The scale the price pane is drawn on.
+     *
+     * A property of the price pane alone: a pane holding something that is not a
+     * price stays linear, because a log axis has no reading for a bounded oscillator
+     * and a tradable increment means nothing on one.
+     */
+    private priceScale(): PriceScale {
+        return this.resolvedOptions.priceScale.mode;
+    }
+
     private autoScaleY(): void {
+        // Locked panes keep whatever range they were given. This is the condition the
+        // option exists to introduce, and it is why the fit is a method rather than
+        // inlined into the viewport update: a fit that runs unconditionally every
+        // frame cannot be skipped, and therefore cannot be locked.
+        if (!this.resolvedOptions.priceScale.autoScale && this.lockedPriceRange !== null) {
+            this.applyPriceRange(this.lockedPriceRange);
+            return;
+        }
         if (this.displayedCandles.length === 0) return;
 
         // Fitted to the price pane rather than the whole plot, so a pane below it
         // does not squash the candles. With one pane the two are the same rect and
         // this is the behaviour that shipped before panes existed.
         const pricePane: PlotRect = this.pricePaneRect();
+        const scale: PriceScale = this.priceScale();
 
         let maxHigh = Number.NEGATIVE_INFINITY;
         let minLow = Number.POSITIVE_INFINITY;
@@ -1516,19 +1675,47 @@ export class Chart {
             minLow = Math.min(minLow, this.displayedCandles[offset + CANDLE_LOW]);
         }
 
-        // Add 10% padding to top and bottom
-        const priceRange = maxHigh - minLow;
-        const padding = priceRange === 0
-            ? Math.max(Math.abs(maxHigh) * 0.1, 1)
-            : priceRange * 0.1;
+        // A log axis has no position for a zero or negative price, so those bars are
+        // excluded from the fit rather than clamped into it. Clamping the fit would
+        // put the floor in the range and crush every real price into the top pixel.
+        const range: [number, number] | null = representableRange(minLow, maxHigh, scale);
+        if (range === null) return;
 
-        const paddedMin = minLow - padding;
-        const paddedMax = maxHigh + padding;
+        // Padding is applied in scale space, so a log pane's headroom is a ratio of
+        // log rather than a number of price units. Ten percent of the visible span
+        // means the same thing on either axis.
+        const low: number = toScaleSpace(range[0], scale);
+        const high: number = toScaleSpace(range[1], scale);
+        const span: number = high - low;
+        const padding: number = span === 0
+            ? Math.max(Math.abs(high) * 0.1, 1)
+            : span * 0.1;
+        const paddedMin = low - padding;
+        const paddedMax = high + padding;
 
         // Fitted to the price pane, so the highest and lowest visible candle land
-        // inside the pane rather than inside the canvas.
-        this.scaleY = -pricePane.height / (paddedMax - paddedMin);
-        this.offsetY = pricePane.y + pricePane.height - paddedMin * this.scaleY;
+        // inside the pane rather than inside the canvas. The sign carries the
+        // inversion: scaleY is negative for an ordinary axis, where a larger value
+        // sits higher up.
+        const magnitude: number = pricePane.height / (paddedMax - paddedMin);
+        this.scaleY = this.resolvedOptions.priceScale.inverted ? magnitude : -magnitude;
+        this.offsetY = this.resolvedOptions.priceScale.inverted
+            ? pricePane.y + paddedMin * magnitude
+            : pricePane.y + pricePane.height - paddedMin * magnitude;
+    }
+
+    /** Establishes the pane's transform from a price range, without padding. */
+    private applyPriceRange(range: readonly [number, number]): void {
+        const pricePane: PlotRect = this.pricePaneRect();
+        const scale: PriceScale = this.priceScale();
+        const low: number = toScaleSpace(range[0], scale);
+        const high: number = toScaleSpace(range[1], scale);
+        if (!(high > low)) return;
+        const magnitude: number = pricePane.height / (high - low);
+        this.scaleY = this.resolvedOptions.priceScale.inverted ? magnitude : -magnitude;
+        this.offsetY = this.resolvedOptions.priceScale.inverted
+            ? pricePane.y + low * magnitude
+            : pricePane.y + pricePane.height - low * magnitude;
     }
 
     /** The price pane's rect: pane 0 of the current layout, or the whole plot. */
@@ -1723,6 +1910,37 @@ export class Chart {
 
     }
 
+    /**
+     * The candle records as the renderer should see them.
+     *
+     * On a linear axis this is the slice itself, with nothing copied. On a log axis
+     * the four price fields are replaced by their logs and the record is otherwise
+     * untouched — `CANDLE_X` is an index, `CANDLE_WIDTH` is a pixel count and
+     * `CANDLE_VOLUME` is not a price at all, so converting any of them would be a
+     * silent corruption rather than a scaling.
+     *
+     * This is where the whole of log scale lives. The renderer's geometry code is
+     * unchanged and knows nothing about scale, because it never receives a price.
+     */
+    private scaledCandles(): Float32Array {
+        if (this.priceScale() === 'linear') return this.displayedCandles;
+        const source: Float32Array = this.displayedCandles;
+        // Reused across frames: a log chart reallocating a full candle buffer every
+        // animation frame is exactly the cost this phase is meant to be avoiding.
+        if (this.scaledCandleBuffer.length !== source.length) {
+            this.scaledCandleBuffer = new Float32Array(source.length);
+        }
+        const out: Float32Array = this.scaledCandleBuffer;
+        out.set(source);
+        const scale: PriceScale = this.priceScale();
+        for (let offset = 0; offset < source.length; offset += CANDLE_STRIDE) {
+            for (const field of [CANDLE_OPEN, CANDLE_HIGH, CANDLE_LOW, CANDLE_CLOSE]) {
+                out[offset + field] = toScaleSpace(source[offset + field], scale);
+            }
+        }
+        return out;
+    }
+
     private uploadVisibleCandles(): void {
         // Colours were parsed to vec4 when the options were applied, so this
         // per-frame path only copies four precomputed channels.
@@ -1734,7 +1952,7 @@ export class Chart {
             this.dataRenderer.clearCandlesticks();
             this.uploadVisibleClose(style);
         } else {
-            this.dataRenderer.drawCandlesticks(this.displayedCandles, {
+            this.dataRenderer.drawCandlesticks(this.scaledCandles(), {
                 colors: this.candleColors,
                 style,
                 wickVisible: this.resolvedOptions.candlestick.wickVisible,
@@ -1774,12 +1992,18 @@ export class Chart {
                 overlay.lastIndex,
                 overlay.pointColors,
             );
+            // An overlay on the price pane is measured in prices, so it needs the
+            // same conversion the candles got. One on any other pane is left alone:
+            // those panes stay linear whatever the price pane is set to.
+            const points: Float32Array = overlay.pane === PRICE_PANE && this.priceScale() === 'log'
+                ? scaleOverlayPoints(bucketed.points, bucketed.stride)
+                : bucketed.points;
             // A pane below the price one has its own scale, so an overlay there is
             // read against its own axis rather than the price axis. Pane 0 passes
             // null and shares the price transform with the candles.
             this.dataRenderer.drawOverlay(
                 overlay.id,
-                bucketed.points,
+                points,
                 bucketed.stride,
                 overlay.color,
                 overlay.pane === PRICE_PANE ? null : this.paneLayout.transforms[overlay.pane],
@@ -1803,22 +2027,28 @@ export class Chart {
             return;
         }
         const points = new Float32Array(count * 2);
+        const scale: PriceScale = this.priceScale();
         for (let i = 0; i < count; i++) {
             const offset: number = i * CANDLE_STRIDE;
             points[i * 2] = this.displayedCandles[offset + CANDLE_X];
-            points[i * 2 + 1] = this.displayedCandles[offset + CANDLE_CLOSE];
+            points[i * 2 + 1] = toScaleSpace(this.displayedCandles[offset + CANDLE_CLOSE], scale);
         }
         const lineColor = this.resolvedOptions.candlestick.lineColor;
         this.dataRenderer.drawLine(points, lineColor);
 
         if (style === 'area') {
             // The fill runs to the bottom of the plot, which is the lowest price
-            // the axis can show, so the area never invents a scale of its own.
+            // the axis can show, so the area never invents a scale of its own. On a
+            // log axis that floor is the lowest representable price, not zero, and
+            // zero has no position to fill down to.
             const plot: PlotRect = this.viewport.plot;
             this.dataRenderer.drawArea(
                 points,
                 this.resolvedOptions.candlestick.areaFillColor,
-                coordinateToPrice(this.viewport, plot.y + plot.height),
+                toScaleSpace(
+                    fromScaleSpace(coordinateToPrice(this.viewport, plot.y + plot.height), scale),
+                    scale,
+                ),
             );
         } else {
             this.dataRenderer.clearArea();
@@ -1834,9 +2064,14 @@ export class Chart {
     private baselinePrice(): number | null {
         if (this.resolvedOptions.candlestick.style !== 'baseline') return null;
         const configured: number | null = this.resolvedOptions.candlestick.baselinePrice;
-        if (configured !== null) return configured;
-        if (this.displayedCandles.length === 0) return null;
-        return this.displayedCandles[CANDLE_CLOSE];
+        const price: number | null = configured !== null
+            ? configured
+            : (this.displayedCandles.length === 0 ? null : this.displayedCandles[CANDLE_CLOSE]);
+        if (price === null) return null;
+        // The baseline is compared against the candle records, which are in scale
+        // space, so it has to be too. Log is monotonic, so "above the baseline" means
+        // the same thing on both sides of the conversion.
+        return toScaleSpace(price, this.priceScale());
     }
 
     /**

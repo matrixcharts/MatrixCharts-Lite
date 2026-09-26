@@ -264,7 +264,7 @@ export function slotAtIndex(offsets: Float64Array, index: number): number {
  * a caller who has a timestamp: a time inside a session break belongs to the bar
  * on whichever side is nearer, not to whatever ordinal happens to sit there.
  */
-export function indexAtTime(times: readonly number[], offsets: Float64Array, time: number): number {
+export function indexAtTime(times: readonly number[], time: number): number {
     const count: number = times.length;
     if (count === 0) return -1;
     if (time <= times[0]) return 0;
