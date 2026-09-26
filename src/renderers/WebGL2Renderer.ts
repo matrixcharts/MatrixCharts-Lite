@@ -1,7 +1,8 @@
 // src/renderers/WebGL2Renderer.ts
-import type { IRenderer } from '../core/IRenderer';
-import type { EventEmitter, ChartEvents } from '../core/EventEmitter';
-import { candlestickBodyEdgesData } from '../math/candlestickBodyWidth';
+import type { ResolvedCandleColors } from '../core/options.js';
+import type { IRenderer } from '../core/IRenderer.js';
+import type { EventEmitter, ChartEvents } from '../core/EventEmitter.js';
+import { candlestickBodyEdgesData } from '../math/candlestickBodyWidth.js';
 
 export class WebGL2Renderer implements IRenderer {
     private gl: WebGL2RenderingContext | null = null;
@@ -219,11 +220,20 @@ export class WebGL2Renderer implements IRenderer {
     }
 
 
-      /** Uploads [x, open, high, low, close, width] candles to the GPU. */
+      /**
+       * Uploads [x, open, high, low, close, width] candles to the GPU.
+       *
+       * `colors` arrives already parsed from CSS, so this per-frame path never
+       * touches colour strings. `wickVisible` skips generating and drawing the
+       * wick segments entirely. `borderVisible` adds a 1 device-pixel frame
+       * inside the body outline, drawn ahead of the fill in the same indexed
+       * pass, so no extra shader or draw call is needed.
+       */
     public drawCandlesticks(
         candles: Float32Array,
-        bullishColor: [number, number, number, number],
-        bearishColor: [number, number, number, number],
+        colors: ResolvedCandleColors,
+        wickVisible: boolean,
+        borderVisible: boolean,
     ): void {
         const gl: WebGL2RenderingContext = this.requireContext();
         if (candles.length % 6 !== 0) {
@@ -232,23 +242,41 @@ export class WebGL2Renderer implements IRenderer {
 
         const candleCount: number = candles.length / 6;
         const vertexStride: number = 6; // x, y, r, g, b, a
+        if (candleCount === 0) {
+            // Nothing to draw. Skipping the upload avoids handing WebGL zero-length
+            // buffers on the empty first frame, which buys nothing.
+            this.candleWickVertexCount = 0;
+            this.candleBodyVertexCount = 0;
+            return;
+        }
         const scaleX: number = Math.abs(this.currentScale[0]);
         const scaleY: number = Math.abs(this.currentScale[1]);
         if (scaleX === 0 || scaleY === 0) {
             throw new Error('MatrixCharts: Candlestick viewport scales must be non-zero.');
         }
-        
-        // Wicks = 4 vertices per candle (above/below body). Bodies = 4 vertices per candle.
-        const verticesPerCandle: number = 8;
-        const wickVerticesPerCandle: number = 4;
+
+        // Three contiguous blocks per frame: wicks, then optional border frames,
+        // then body fills. Each block starts at a fixed offset so the three can
+        // never overlap, whatever the flags say.
+        const wickVerticesPerCandle: number = wickVisible ? 4 : 0;
+        const borderVerticesPerCandle: number = borderVisible ? 4 : 0;
+        const bodyVertexStart: number = candleCount * (wickVerticesPerCandle + borderVerticesPerCandle);
+        const verticesPerCandle: number = wickVerticesPerCandle + borderVerticesPerCandle + 4;
         const totalVertices: number = candleCount * verticesPerCandle;
         const vertices: Float32Array = new Float32Array(totalVertices * vertexStride);
-        const bodyIndices: Uint32Array = new Uint32Array(candleCount * 6);
+        // Border quads are indexed ahead of the fills, so the frame is laid down
+        // first and the fill covers its interior in the same pass.
+        const indicesPerCandle: number = borderVisible ? 12 : 6;
+        const bodyIndices: Uint32Array = new Uint32Array(candleCount * indicesPerCandle);
 
-        // Partition the array so wick segments never pass through or blend over candle bodies.
-        let wickIndex: number = 0;
-        let bodyIndex: number = candleCount * wickVerticesPerCandle * vertexStride;
-        let bodyVertexIndex: number = candleCount * wickVerticesPerCandle;
+        // Two cursors per block, and they count different things: a float offset
+        // into the interleaved vertex array, and a vertex id for the index buffer.
+        // Conflating them puts every index six times past the end of the buffer.
+        let wickFloat: number = 0;
+        let borderFloat: number = candleCount * wickVerticesPerCandle * vertexStride;
+        let bodyFloat: number = bodyVertexStart * vertexStride;
+        let borderVertexId: number = candleCount * wickVerticesPerCandle;
+        let bodyVertexId: number = bodyVertexStart;
         let bodyIndexOffset: number = 0;
 
         for (let candleIndex: number = 0; candleIndex < candleCount; candleIndex++) {
@@ -264,7 +292,9 @@ export class WebGL2Renderer implements IRenderer {
                 throw new Error('MatrixCharts: Candlestick values must be finite and width must be positive.');
             }
 
-            const color: [number, number, number, number] = close >= open ? bullishColor : bearishColor;
+            const bullish: boolean = close >= open;
+            const color: [number, number, number, number] = bullish ? colors.up : colors.down;
+            const borderColor: [number, number, number, number] = bullish ? colors.borderUp : colors.borderDown;
             let neighborSpacing: number = Number.POSITIVE_INFINITY;
             if (candleIndex > 0) {
                 const previousSpacing: number = Math.abs(x - candles[inputIndex - 6]);
@@ -312,37 +342,82 @@ export class WebGL2Renderer implements IRenderer {
             const lowerWickStart: number = Math.min(bodyTop, Math.max(low, lowerWickBoundary));
 
             // Upper wick ends above the body; lower wick starts below it to avoid overdraw seams.
-            vertices[wickIndex++] = x; vertices[wickIndex++] = high;
-            vertices[wickIndex++] = color[0]; vertices[wickIndex++] = color[1]; vertices[wickIndex++] = color[2]; vertices[wickIndex++] = color[3];
+            if (wickVisible) {
+                vertices[wickFloat++] = x; vertices[wickFloat++] = high;
+                vertices[wickFloat++] = color[0]; vertices[wickFloat++] = color[1]; vertices[wickFloat++] = color[2]; vertices[wickFloat++] = color[3];
 
-            vertices[wickIndex++] = x; vertices[wickIndex++] = upperWickEnd;
-            vertices[wickIndex++] = color[0]; vertices[wickIndex++] = color[1]; vertices[wickIndex++] = color[2]; vertices[wickIndex++] = color[3];
+                vertices[wickFloat++] = x; vertices[wickFloat++] = upperWickEnd;
+                vertices[wickFloat++] = color[0]; vertices[wickFloat++] = color[1]; vertices[wickFloat++] = color[2]; vertices[wickFloat++] = color[3];
 
-            vertices[wickIndex++] = x; vertices[wickIndex++] = lowerWickStart;
-            vertices[wickIndex++] = color[0]; vertices[wickIndex++] = color[1]; vertices[wickIndex++] = color[2]; vertices[wickIndex++] = color[3];
+                vertices[wickFloat++] = x; vertices[wickFloat++] = lowerWickStart;
+                vertices[wickFloat++] = color[0]; vertices[wickFloat++] = color[1]; vertices[wickFloat++] = color[2]; vertices[wickFloat++] = color[3];
 
-            vertices[wickIndex++] = x; vertices[wickIndex++] = low;
-            vertices[wickIndex++] = color[0]; vertices[wickIndex++] = color[1]; vertices[wickIndex++] = color[2]; vertices[wickIndex++] = color[3];
+                vertices[wickFloat++] = x; vertices[wickFloat++] = low;
+                vertices[wickFloat++] = color[0]; vertices[wickFloat++] = color[1]; vertices[wickFloat++] = color[2]; vertices[wickFloat++] = color[3];
+            }
 
-            vertices[bodyIndex++] = bodyLeft; vertices[bodyIndex++] = bodyBottom;
-            vertices[bodyIndex++] = color[0]; vertices[bodyIndex++] = color[1]; vertices[bodyIndex++] = color[2]; vertices[bodyIndex++] = color[3];
+            // The border is the full body outline in the border colour; the fill is
+            // then drawn inset by one device pixel on each side, so the frame stays
+            // visible without the body growing and the bar gutter changing.
+            let fillLeft: number = bodyLeft;
+            let fillRight: number = bodyRight;
+            let fillTop: number = bodyTop;
+            let fillBottom: number = bodyBottom;
 
-            vertices[bodyIndex++] = bodyRight; vertices[bodyIndex++] = bodyBottom;
-            vertices[bodyIndex++] = color[0]; vertices[bodyIndex++] = color[1]; vertices[bodyIndex++] = color[2]; vertices[bodyIndex++] = color[3];
+            if (borderVisible) {
+                const horizontalInset: number = 1 / (scaleX * this.devicePixelRatio);
+                const verticalInset: number = 1 / Math.abs(scaleY * this.devicePixelRatio);
+                const hasRoom: boolean =
+                    Math.abs(bodyRight - bodyLeft) > horizontalInset * 3
+                    && Math.abs(bodyTop - bodyBottom) > verticalInset * 3;
 
-            vertices[bodyIndex++] = bodyLeft; vertices[bodyIndex++] = bodyTop;
-            vertices[bodyIndex++] = color[0]; vertices[bodyIndex++] = color[1]; vertices[bodyIndex++] = color[2]; vertices[bodyIndex++] = color[3];
+                vertices[borderFloat++] = bodyLeft; vertices[borderFloat++] = bodyBottom;
+                vertices[borderFloat++] = borderColor[0]; vertices[borderFloat++] = borderColor[1]; vertices[borderFloat++] = borderColor[2]; vertices[borderFloat++] = borderColor[3];
 
-            vertices[bodyIndex++] = bodyRight; vertices[bodyIndex++] = bodyTop;
-            vertices[bodyIndex++] = color[0]; vertices[bodyIndex++] = color[1]; vertices[bodyIndex++] = color[2]; vertices[bodyIndex++] = color[3];
+                vertices[borderFloat++] = bodyRight; vertices[borderFloat++] = bodyBottom;
+                vertices[borderFloat++] = borderColor[0]; vertices[borderFloat++] = borderColor[1]; vertices[borderFloat++] = borderColor[2]; vertices[borderFloat++] = borderColor[3];
 
-            bodyIndices[bodyIndexOffset++] = bodyVertexIndex;
-            bodyIndices[bodyIndexOffset++] = bodyVertexIndex + 1;
-            bodyIndices[bodyIndexOffset++] = bodyVertexIndex + 2;
-            bodyIndices[bodyIndexOffset++] = bodyVertexIndex + 2;
-            bodyIndices[bodyIndexOffset++] = bodyVertexIndex + 1;
-            bodyIndices[bodyIndexOffset++] = bodyVertexIndex + 3;
-            bodyVertexIndex += 4;
+                vertices[borderFloat++] = bodyLeft; vertices[borderFloat++] = bodyTop;
+                vertices[borderFloat++] = borderColor[0]; vertices[borderFloat++] = borderColor[1]; vertices[borderFloat++] = borderColor[2]; vertices[borderFloat++] = borderColor[3];
+
+                vertices[borderFloat++] = bodyRight; vertices[borderFloat++] = bodyTop;
+                vertices[borderFloat++] = borderColor[0]; vertices[borderFloat++] = borderColor[1]; vertices[borderFloat++] = borderColor[2]; vertices[borderFloat++] = borderColor[3];
+
+                bodyIndices[bodyIndexOffset++] = borderVertexId;
+                bodyIndices[bodyIndexOffset++] = borderVertexId + 1;
+                bodyIndices[bodyIndexOffset++] = borderVertexId + 2;
+                bodyIndices[bodyIndexOffset++] = borderVertexId + 2;
+                bodyIndices[bodyIndexOffset++] = borderVertexId + 1;
+                bodyIndices[bodyIndexOffset++] = borderVertexId + 3;
+                borderVertexId += 4;
+
+                if (hasRoom) {
+                    fillLeft = bodyLeft + horizontalInset;
+                    fillRight = bodyRight - horizontalInset;
+                    fillTop = bodyTop - verticalInset;
+                    fillBottom = bodyBottom + verticalInset;
+                }
+            }
+
+            vertices[bodyFloat++] = fillLeft; vertices[bodyFloat++] = fillBottom;
+            vertices[bodyFloat++] = color[0]; vertices[bodyFloat++] = color[1]; vertices[bodyFloat++] = color[2]; vertices[bodyFloat++] = color[3];
+
+            vertices[bodyFloat++] = fillRight; vertices[bodyFloat++] = fillBottom;
+            vertices[bodyFloat++] = color[0]; vertices[bodyFloat++] = color[1]; vertices[bodyFloat++] = color[2]; vertices[bodyFloat++] = color[3];
+
+            vertices[bodyFloat++] = fillLeft; vertices[bodyFloat++] = fillTop;
+            vertices[bodyFloat++] = color[0]; vertices[bodyFloat++] = color[1]; vertices[bodyFloat++] = color[2]; vertices[bodyFloat++] = color[3];
+
+            vertices[bodyFloat++] = fillRight; vertices[bodyFloat++] = fillTop;
+            vertices[bodyFloat++] = color[0]; vertices[bodyFloat++] = color[1]; vertices[bodyFloat++] = color[2]; vertices[bodyFloat++] = color[3];
+
+            bodyIndices[bodyIndexOffset++] = bodyVertexId;
+            bodyIndices[bodyIndexOffset++] = bodyVertexId + 1;
+            bodyIndices[bodyIndexOffset++] = bodyVertexId + 2;
+            bodyIndices[bodyIndexOffset++] = bodyVertexId + 2;
+            bodyIndices[bodyIndexOffset++] = bodyVertexId + 1;
+            bodyIndices[bodyIndexOffset++] = bodyVertexId + 3;
+            bodyVertexId += 4;
         }
 
         gl.bindBuffer(gl.ARRAY_BUFFER, this.candleBuffer);
@@ -350,7 +425,7 @@ export class WebGL2Renderer implements IRenderer {
         gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, this.candleIndexBuffer);
         gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, bodyIndices, gl.DYNAMIC_DRAW);
         this.candleWickVertexCount = candleCount * wickVerticesPerCandle;
-        this.candleBodyVertexCount = bodyIndices.length;
+        this.candleBodyVertexCount = bodyIndexOffset;
     }
 
     public render(): void {
@@ -383,8 +458,12 @@ export class WebGL2Renderer implements IRenderer {
             gl.uniform2f(this.candleScaleLocation, this.currentScale[0], this.currentScale[1]);
             gl.uniform1f(this.candlePixelRatioLocation, this.devicePixelRatio);
             gl.bindVertexArray(this.candleVao);
-            gl.uniform1f(this.candleSnapOffsetLocation, 0.5);
-            gl.drawArrays(gl.LINES, 0, this.candleWickVertexCount);
+            // Skipped entirely when candlestick.wickVisible is false, and the index
+            // buffer already carries any border quads ahead of the fills.
+            if (this.candleWickVertexCount > 0) {
+                gl.uniform1f(this.candleSnapOffsetLocation, 0.5);
+                gl.drawArrays(gl.LINES, 0, this.candleWickVertexCount);
+            }
             gl.uniform1f(this.candleSnapOffsetLocation, 0.0);
             gl.drawElements(
                 gl.TRIANGLES,

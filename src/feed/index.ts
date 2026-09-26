@@ -3,8 +3,8 @@ export type {
     CandleSource,
     CandleSourceState,
     CandleTarget,
-} from './CandleSource';
-export { ChartFeedController } from './ChartFeedController';
-export { MockCandleSource } from './MockCandleSource';
-export { WebSocketCandleSource } from './WebSocketCandleSource';
-export type { WebSocketCandleSourceOptions } from './WebSocketCandleSource';
+} from './CandleSource.js';
+export { ChartFeedController } from './ChartFeedController.js';
+export { MockCandleSource } from './MockCandleSource.js';
+export { WebSocketCandleSource } from './WebSocketCandleSource.js';
+export type { WebSocketCandleSourceOptions } from './WebSocketCandleSource.js';

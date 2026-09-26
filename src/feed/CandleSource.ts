@@ -1,4 +1,4 @@
-import type { CandleData } from '../core/CandleData';
+import type { CandleData } from '../core/CandleData.js';
 
 export type CandleFeedMessage =
     | { type: 'snapshot'; sequence: number; candles: readonly CandleData[] }

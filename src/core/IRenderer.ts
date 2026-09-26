@@ -1,5 +1,5 @@
 // src/core/IRenderer.ts
-import type { EventEmitter, ChartEvents } from './EventEmitter';
+import type { EventEmitter, ChartEvents } from './EventEmitter.js';
 
 export interface IRenderer {
     init(canvas: HTMLCanvasElement, emitter: EventEmitter<ChartEvents>): void;

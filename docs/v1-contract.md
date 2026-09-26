@@ -1,0 +1,236 @@
+# MatrixCharts v1 contract
+
+This is the frozen public surface for **v1.0**. Additive APIs may appear in later 1.x releases. Removing, renaming, or changing the meaning of anything below is a breaking change.
+
+The normative feed wire format lives in [feed-adapters.md](feed-adapters.md). Operational constraints (retention, timestamps, sessions) live in [production-readiness.md](production-readiness.md).
+
+## Package exports
+
+Installable entry is the package root (`matrixcharts`). Only these names are public:
+
+| Export | Kind |
+|---|---|
+| `Chart` | class |
+| `ChartFeedController` | class |
+| `WebSocketCandleSource` | class |
+| `MockCandleSource` | class |
+| `CandleData` | type |
+| `ChartOptions` | type |
+| `ChartTheme` | type |
+| `PriceFormatOptions` | type |
+| `LayoutOptions` | type |
+| `GridOptions` | type |
+| `CrosshairOptions` | type |
+| `TimeScaleOptions` | type |
+| `CandlestickOptions` | type |
+| `ResolvedChartOptions` | type |
+| `LogicalRange` | type |
+| `TimeRange` | type |
+| `CrosshairMoveEvent` | type |
+| `CrosshairData` | type |
+| `CrosshairCleared` | type |
+| `ChartClickEvent` | type |
+| `VisibleRangeEvent` | type |
+| `Unsubscribe` | type |
+| `CandleFeedMessage` | type |
+| `CandleSource` | type |
+| `CandleSourceState` | type |
+| `CandleTarget` | type |
+| `WebSocketCandleSourceOptions` | type |
+
+Renderers, the OHLC pyramid, LTTB, coordinate math, and `IRenderer` are internal. Do not import files under `src/` from an application.
+
+The package ships zero runtime dependencies, `sideEffects: false`, and one entry point with per-condition declarations:
+
+```jsonc
+"exports": {
+  ".": {
+    "import":  { "types": "./dist/esm/index.d.ts", "default": "./dist/esm/index.js" },
+    "require": { "types": "./dist/cjs/index.d.ts", "default": "./dist/cjs/index.js" }
+  }
+}
+```
+
+Each condition carries its own `.d.ts` so a CommonJS consumer's `require('matrixcharts')` is not typed as an ESM-only module. `dist/esm` and `dist/cjs` each carry a `package.json` `type` marker, and the ESM output uses explicit `.js` specifiers so it loads in Node as well as in a bundler. Subpath imports are not published; only the root entry resolves. `npm run verify:package` enforces all of this against the packed tarball.
+
+## Runtime requirements
+
+`Chart` requires a browser document and **WebGL2**. `canvas.getContext('webgl2')` must succeed. There is no Canvas2D candlestick fallback in v1. Unsupported engines throw `MatrixCharts: WebGL2 is not supported by this browser.`
+
+Supported intent: current Chromium, Firefox, and Safari with WebGL2. Not IE, not Safari without WebGL2.
+
+## `CandleData`
+
+```ts
+interface CandleData {
+    time: number; // Unix epoch milliseconds, UTC
+    open: number;
+    high: number;
+    low: number;
+    close: number;
+}
+```
+
+- `time` is milliseconds, not seconds. Do not pass date strings.
+- Values must be finite. `high >= max(open, close)` and `low <= min(open, close)`.
+- A series must be strictly increasing in `time`.
+- v1 has no `volume` field. Extra properties on objects are ignored.
+
+## Chart construction and mutations
+
+```ts
+new Chart(container: HTMLElement | string, options?: ChartOptions)
+```
+
+`container` is an `HTMLElement` or the `id` of one already in `document`. An element that is not yet attached to the document is accepted; it mounts immediately and picks up its size through `ResizeObserver` once it is attached and has a layout box. A missing id, an empty id, or a non-element throws `MatrixCharts: ...`.
+
+`ChartOptions` in v1: `maxRetainedCandles` (positive safe integer, default `1_000_000`; constructor-only) and `theme` (`'dark' | 'paper'`, default `'dark'`).
+
+| Method | Viewport | Meaning |
+|---|---|---|
+| `setData(candles)` | reset | Replace history; fit/live-follow from the new series. |
+| `replaceData(candles)` | preserved | Authoritative snapshot. Keep zoom; rematerialize the time anchor when that timestamp still exists. |
+| `appendData(candle)` / `appendBatch(candles)` | follow if at live edge | Each candle `time` must be strictly after the current last. |
+| `updateLast(candle)` | unchanged | `candle.time` must equal the current last timestamp. |
+| `setTheme(theme)` | redraw | `'dark'` or `'paper'`. |
+| `destroy()` | — | Detach listeners, drop GPU resources, empty the container. |
+
+Historical corrections that are not the current last candle require `replaceData` (or a feed snapshot). The chart never invents missing bars.
+
+The horizontal coordinate is the candle **ordinal index**, not wall-clock time. Closed sessions (nights, weekends, holidays) are compressed. Axis and crosshair labels snap to real candle timestamps.
+
+## Reading the viewport
+
+Every method below is synchronous, works in CSS pixels relative to the container's top-left, and never copies the series. Conversions are independent of `devicePixelRatio`; the renderers apply DPR internally. A value returned here always matches what is drawn.
+
+| Method | Returns |
+|---|---|
+| `getBarSpacing()` | CSS px per candle index. |
+| `getVisibleLogicalRange()` | `{ from, to }` candle indices, **half-open**: `from`..`to - 1`. Partial bars at either edge are included. `from === to` means nothing is visible. |
+| `getVisibleTimeRange()` | `{ from, to }` epoch ms of the first and last visible candle, **both inclusive**, or `null` when empty. |
+| `getCandleCount()` | Retained candle count. |
+| `getCandleAt(index)` | `CandleData \| null`; `null` for a non-integer or out-of-range index. |
+| `getLastCandle()` | `CandleData \| null`; `null` when there is no data. |
+| `indexToCoordinate(index)` | Screen x of a candle index. |
+| `coordinateToIndex(x)` | Fractional candle index at a screen x. Not clamped. |
+| `coordinateToNearestIndex(x)` | Nearest whole candle index, or `-1` when empty. |
+| `coordinateToTime(x)` | Timestamp of the nearest candle, or `null` when empty. |
+| `timeToCoordinate(time)` | Screen x of the candle nearest a timestamp, or `null` when empty. |
+| `priceToCoordinate(price)` | Screen y of a price. |
+| `coordinateToPrice(y)` | Price at a screen y, on the current auto-fitted vertical scale. |
+
+The index range is half-open because it names a set of bars. The time range is inclusive on both ends because it names two real candles, and a closed session has no end instant to report. The two are related by `getVisibleTimeRange().from === getCandleAt(range.from).time` and `.to === getCandleAt(range.to - 1).time`.
+
+`getCandleAt` and `getLastCandle` read the same float32 store the renderer draws from, so prices come back at float32 precision and may differ in the last bits from the doubles that were passed to `setData`. `time` is exact.
+
+Time conversions snap to a real candle timestamp and never interpolate across a gap, so `coordinateToTime` at the midpoint of a weekend returns the Friday or Monday candle, never a Saturday.
+
+`getVisibleTimeRange()` is `null` and `getVisibleLogicalRange()` is `{ from: 0, to: 0 }` when the chart is empty or scrolled entirely off the series.
+
+## User events
+
+Subscribe to the chart; do not attach listeners to the canvases. The chart wrapper is the single input surface, and every layer is transparent to the pointer.
+
+| Method | Fires |
+|---|---|
+| `subscribeCrosshairMove(handler)` | As the pointer moves over the chart, and once when it leaves. |
+| `subscribeClick(handler)` | On a press and release that did not become a pan or pinch. |
+| `subscribeVisibleRangeChange(handler)` | When the visible bars or bar spacing change, at most once per animation frame. |
+
+Each returns an `Unsubscribe` (`() => void`). Calling it more than once is harmless. `destroy()` drops every handler, so a destroyed chart never calls back into application code.
+
+`CrosshairMoveEvent` and `ChartClickEvent` are discriminated unions on `candle`:
+
+| Field | `candle` present | `candle: null` |
+|---|---|---|
+| `x` | CSS x, snapped to the bar centre | `null` |
+| `y` | CSS y, following the pointer | `null` |
+| `index` | ordinal candle index | `-1` |
+| `time` | candle timestamp, epoch ms | `null` |
+| `price` | price at `y` | `null` |
+| `candle` | the `CandleData` under the pointer | `null` |
+| `button` | click only: the pointer button | click only: the pointer button |
+
+`candle` is `null` when the pointer left, when a drag or pinch is in progress, when the chart has no data, or when `x` is past the series. Narrow on `event.candle` to get the populated form.
+
+`x` is snapped to the bar centre so a tooltip can be positioned at the crosshair, while `y` keeps following the pointer so the price readout tracks the cursor. The drawn crosshair and the reported event always agree: Chart owns the hit-test and the UI layer only draws what Chart resolved. The reported `candle` is the exact retained candle, not an aggregate bucket, so it is correct at any zoom level.
+
+`VisibleRangeEvent` carries `logical`, `time`, and `barSpacing` from the read API above. It is silent when the visible bars and bar spacing are unchanged, so a drag that stays between bar boundaries produces no events and float drift from wheel or pinch arithmetic does not re-notify.
+
+A press that travels more than a few CSS pixels is a pan, not a click, and reports no `click`. Touch and pen contacts clear the crosshair on release because they have no hover state.
+
+## Runtime options
+
+Constructor options are the initial `applyOptions`.
+
+```ts
+chart.applyOptions(partial: ChartOptions): void
+chart.options(): Readonly<ResolvedChartOptions>
+chart.setTheme(theme: ChartTheme): void   // same as applyOptions({ theme })
+```
+
+`applyOptions` deep-merges a partial over the current options and re-resolves. An invalid value throws `MatrixCharts: ...` **before anything is mutated**, so a rejected call leaves the chart exactly as it was. `options()` returns a fully resolved snapshot; every field is concrete, including the theme preset colours.
+
+| Section | Fields | Default |
+|---|---|---|
+| `maxRetainedCandles` | positive safe integer | `1_000_000`, **constructor-only** |
+| `theme` | `'dark' \| 'paper'` | `'dark'` |
+| `locale` | BCP 47 tag | the runtime locale |
+| `timeZone` | IANA zone | `'UTC'` |
+| `priceFormat.precision` | integer 0-20 | `2` |
+| `priceFormat.minMove` | positive number | `0.01` |
+| `layout.background` | CSS colour | theme preset |
+| `layout.textColor` | CSS colour | theme preset |
+| `grid.vertLines` / `grid.horzLines` | boolean | `true` |
+| `grid.color` | CSS colour, alpha honoured | theme preset |
+| `crosshair.visible` | boolean | `true` |
+| `crosshair.color` | CSS colour (additive in 1.x) | theme preset |
+| `timeScale.barSpacing` | positive number | `14` |
+| `timeScale.minBarSpacing` | positive number | `0.5` |
+| `timeScale.maxBarSpacing` | positive number | `400` |
+| `candlestick.upColor` / `downColor` | CSS colour | theme preset |
+| `candlestick.wickVisible` | boolean | `true` |
+| `candlestick.borderVisible` | boolean | `false` |
+| `candlestick.borderUpColor` / `borderDownColor` | CSS colour | theme preset |
+
+**Theme switching and overrides.** A theme change re-seeds every colour from that theme's preset and then re-applies anything the caller set explicitly, so an override survives a theme switch:
+
+```ts
+chart.applyOptions({ candlestick: { upColor: '#ff00ff' } });
+chart.applyOptions({ theme: 'paper' });
+chart.options().candlestick.upColor;    // still '#ff00ff'
+```
+
+**Colours** accept `#rgb`, `#rgba`, `#rrggbb`, `#rrggbbaa`, `rgb()`, `rgba()` with numeric or percentage channels, and `transparent`. Channels clamp the way CSS clamps them. Anything else throws rather than rendering black. Colours are parsed to RGBA once per `applyOptions`, never per candle.
+
+**`maxRetainedCandles` is constructor-only.** `applyOptions` rejects it, because changing it means rebuilding the retained pyramid under a live viewport.
+
+**`priceFormat.precision` and `minMove` must agree.** A `precision` that cannot display `minMove` (`precision: 0` with `minMove: 0.01`) throws, so lower precision together with a wider tick:
+
+```ts
+chart.applyOptions({ priceFormat: { precision: 0, minMove: 1 } });
+```
+
+**`timeScale.barSpacing`** sets the zoom while holding the view still: a live-following chart stays pinned to the newest bar, anything else keeps the bar under the viewport centre. `minBarSpacing` and `maxBarSpacing` clamp wheel and pinch zoom, and re-clamp immediately if the current zoom becomes illegal. These replace the old unbounded `1e-4`..`1e4` range.
+
+**Time labels default to UTC** so they do not depend on the viewer's zone. `locale` and `timeZone` feed `Intl.DateTimeFormat` and `Intl.NumberFormat`; price labels use `precision` and locale separators.
+
+**`candlestick.wickVisible: false`** skips generating and drawing the wick segments. **`borderVisible: true`** draws a 1 device-pixel frame inside the body outline and insets the fill to match, in the same indexed pass with no extra shader or draw call. The body is never grown, so the gutter between bars is unchanged, and the frame is skipped on bodies too small to hold it.
+
+Recolouring reaches the GPU without touching the data: `applyOptions` repaints from the existing vertex buffers, and `getCandleCount()` is unchanged.
+
+
+
+## Feed v1
+
+Use `WebSocketCandleSource` + `ChartFeedController` against a `CandleTarget` (`Chart` implements this). Do not open sockets inside renderers.
+
+Message types: `snapshot`, `append`, `update`, `heartbeat`. Sequences are non-negative safe integers and increase once per message. Snapshot is authoritative. Gaps pause deltas and emit `{"type":"resync","afterSequence":n,"reason":"..."}`. Heartbeats must arrive more often than the client timeout. Reconnect backoff is capped; v1 retries indefinitely.
+
+`MockCandleSource` is a development source, not a production protocol.
+
+## Breaking vs additive
+
+**Breaking:** changing `CandleData` field units; adding required fields; new required feed message types for a working live chart; removing any export in the table above; changing the package entry or its `exports` conditions; changing mutation ordering rules; changing the half-open index range or inclusive time range conventions; making a conversion depend on `devicePixelRatio`; changing when an event fires or what a `null` field means; making `maxRetainedCandles` settable at runtime; changing a resolved default or a validation rule; requiring wall-clock X; dropping the WebGL2 requirement without a replacement renderer.
+
+**Additive (allowed in 1.x):** extra optional `ChartOptions`; new `Chart` methods; optional feed fields the v1 client ignores; extra exports.

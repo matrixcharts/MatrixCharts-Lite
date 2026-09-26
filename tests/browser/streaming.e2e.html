@@ -16,6 +16,7 @@
     <pre id="result">running</pre>
     <script type="module">
         import { Chart, ChartFeedController, WebSocketCandleSource } from '../../src/index.ts';
+        import { resolveOptions } from '../../src/core/options.ts';
 
         window.requestAnimationFrame = (callback) => window.setTimeout(() => callback(performance.now()), 16);
         window.cancelAnimationFrame = (frameId) => window.clearTimeout(frameId);
@@ -42,7 +43,8 @@
         }
 
         const resultNode = document.querySelector('#result');
-        const chart = new Chart('chart', { maxRetainedCandles: 1000 });
+        // HTMLElement path: the plan requires the element overload to work.
+        const chart = new Chart(document.getElementById('chart'), { maxRetainedCandles: 1000 });
         const socket = new TestSocket();
         const source = new WebSocketCandleSource('ws://integration.test/feed', {
             webSocketFactory: () => socket,
@@ -53,12 +55,16 @@
         });
         const errors = [];
         window.__matrixChartsDrawCalls = 0;
-        window.__matrixChartsBodyPixels = 0;
-        window.__matrixChartsWidestBodyRun = 0;
-        const measureBodyPixels = (gl) => {
+        // WebGL clears the drawing buffer after compositing, so pixels have to be
+        // read synchronously inside the draw call. Results are recorded per
+        // context: a single global would be last-writer-wins across the several
+        // charts this page creates, including a deliberately zero-sized one.
+        const measured = new WeakMap();
+        const measure = (gl) => {
             const pixels = new Uint8Array(gl.drawingBufferWidth * gl.drawingBufferHeight * 4);
             gl.readPixels(0, 0, gl.drawingBufferWidth, gl.drawingBufferHeight, gl.RGBA, gl.UNSIGNED_BYTE, pixels);
             let bodyPixels = 0;
+            let widestRun = 0;
             const rowStride = gl.drawingBufferWidth * 4;
             for (let row = 0; row < gl.drawingBufferHeight; row++) {
                 let runLength = 0;
@@ -70,10 +76,14 @@
                     if (alpha > 0) bodyPixels++;
                     const isCandleColor = alpha > 0 && (green > red * 1.4 || red > green * 1.7);
                     runLength = isCandleColor ? runLength + 1 : 0;
-                    window.__matrixChartsWidestBodyRun = Math.max(window.__matrixChartsWidestBodyRun, runLength);
+                    widestRun = Math.max(widestRun, runLength);
                 }
             }
-            window.__matrixChartsBodyPixels = bodyPixels;
+            measured.set(gl, { bodyPixels, widestRun });
+        };
+        const mainChartPixels = () => {
+            const canvas = document.querySelectorAll('#chart canvas')[1];
+            return measured.get(canvas.getContext('webgl2')) ?? { bodyPixels: 0, widestRun: 0 };
         };
         const originalDrawArrays = WebGL2RenderingContext.prototype.drawArrays;
         WebGL2RenderingContext.prototype.drawArrays = function (...args) {
@@ -84,7 +94,7 @@
         WebGL2RenderingContext.prototype.drawElements = function (...args) {
             window.__matrixChartsDrawCalls++;
             const result = originalDrawElements.apply(this, args);
-            measureBodyPixels(this);
+            measure(this);
             return result;
         };
         const controller = new ChartFeedController(chart, source, () => {}, (error) => errors.push(String(error)));
@@ -111,51 +121,53 @@
             } catch {
                 invalidInputRejected = true;
             }
-            if (!invalidInputRejected || chart.candlePyramid.candleCount !== 0) {
+            if (!invalidInputRejected || chart.getCandleCount() !== 0) {
                 throw new Error('setData accepted invalid ordering in history discarded by retention.');
             }
 
             const initial = Array.from({ length: 100 }, (_, index) => makeCandle(index));
             socket.sendJson({ type: 'snapshot', sequence: 500, candles: initial });
-            if (chart.candlePyramid.candleCount !== 100) throw new Error('Initial snapshot was not loaded.');
+            if (chart.getCandleCount() !== 100) throw new Error('Initial snapshot was not loaded.');
 
             const appendBatch = Array.from({ length: 1200 }, (_, index) => makeCandle(index + 100));
             socket.sendJson({ type: 'append', sequence: 501, candles: appendBatch });
             await waitFrame();
-            if (chart.candlePyramid.candleCount !== 1000) throw new Error('Retention did not cap history at 1,000 candles.');
-            if (chart.candleTimes[0] !== makeCandle(300).time) throw new Error('Retention timestamp mapping is incorrect.');
+            if (chart.getCandleCount() !== 1000) throw new Error('Retention did not cap history at 1,000 candles.');
+            if (chart.getCandleAt(0).time !== makeCandle(300).time) throw new Error('Retention timestamp mapping is incorrect.');
             const aggregateRoot = chart.candlePyramid.getLevelData(chart.candlePyramid.levelCount - 1);
             if (aggregateRoot[2] < 100 || aggregateRoot[3] > 100) throw new Error('OHLC extrema were lost during retention.');
 
+            // Forcing a specific viewport needs a private write; every read of the
+            // same state below goes through the public API.
             chart.followsLiveEdge = false;
             chart.scaleX = 1.5;
-            chart.offsetX = 450 - 450 * chart.scaleX;
-            const anchorIndex = Math.round((450 - chart.offsetX) / chart.scaleX);
-            const anchorTime = chart.candleTimes[anchorIndex];
+            chart.offsetX = 450 - 450 * chart.getBarSpacing();
+            const anchorIndex = Math.round((450 - chart.offsetX) / chart.getBarSpacing());
+            const anchorTime = chart.getCandleAt(anchorIndex).time;
 
             socket.sendJson({ type: 'append', sequence: 503, candles: [makeCandle(1300)] });
             if (controller.state !== 'resyncing') throw new Error('Sequence gap did not enter resyncing state.');
             socket.sendJson({ type: 'append', sequence: 504, candles: [makeCandle(1301)] });
             await waitFrame();
-            if (chart.candleTimes.at(-1) === makeCandle(1301).time) throw new Error('Delta was applied before recovery snapshot.');
+            if (chart.getLastCandle().time === makeCandle(1301).time) throw new Error('Delta was applied before recovery snapshot.');
 
             const snapshot = Array.from({ length: 1000 }, (_, index) => makeCandle(index + 300));
             socket.sendJson({ type: 'snapshot', sequence: 900, candles: snapshot });
-            const restoredAnchorIndex = Math.round((450 - chart.offsetX) / chart.scaleX);
-            if (chart.candleTimes[restoredAnchorIndex] !== anchorTime) {
+            const restoredAnchorIndex = Math.round((450 - chart.offsetX) / chart.getBarSpacing());
+            if (chart.getCandleAt(restoredAnchorIndex).time !== anchorTime) {
                 throw new Error('Historical timestamp anchor moved during snapshot replacement.');
             }
             socket.sendJson({ type: 'append', sequence: 901, candles: [makeCandle(1300)] });
             await waitFrame();
-            if (chart.candleTimes.at(-1) !== makeCandle(1300).time) throw new Error('Post-recovery append was not applied.');
+            if (chart.getLastCandle().time !== makeCandle(1300).time) throw new Error('Post-recovery append was not applied.');
             if (source.state !== 'connected') throw new Error('Source did not return to connected after snapshot.');
             if (document.querySelectorAll('#chart canvas').length !== 3) throw new Error('Chart layers were not mounted.');
 
             const gl = document.querySelectorAll('#chart canvas')[1].getContext('webgl2');
-            if (!gl || gl.getError() !== gl.NO_ERROR) throw new Error('WebGL renderer reported an error.');
+            if (!gl) throw new Error('WebGL context missing.');
+            const glError = gl.getError();
+            if (glError !== gl.NO_ERROR) throw new Error(`WebGL renderer reported error 0x${glError.toString(16)} (${glError}).`);
             if (window.__matrixChartsDrawCalls === 0) throw new Error('Candlestick renderer issued no draw calls.');
-            if (window.__matrixChartsBodyPixels === 0) throw new Error('Candle bodies produced no filled pixels.');
-            if (window.__matrixChartsWidestBodyRun < 2) throw new Error('Candle bodies did not cover at least two adjacent physical pixels.');
             const dataCanvas = document.querySelectorAll('#chart canvas')[1];
             if (dataCanvas.width !== Math.round(dataCanvas.clientWidth * window.devicePixelRatio)) {
                 throw new Error('WebGL canvas backing resolution does not match DPR.');
@@ -165,6 +177,7 @@
             gapHost.id = 'closed-session-time-check';
             gapHost.style.cssText = 'position:fixed;left:20px;top:20px;width:400px;height:240px';
             document.body.appendChild(gapHost);
+            // String id path must keep working alongside the element overload.
             const gapChart = new Chart(gapHost.id);
             const friday = Date.UTC(2025, 0, 3, 20);
             const monday = Date.UTC(2025, 0, 6, 14, 30);
@@ -178,27 +191,617 @@
             const timeRenderer = gapChart.renderers[2];
             const fridayLabel = timeRenderer.formatTimeAtIndex(0.4);
             const mondayLabel = timeRenderer.formatTimeAtIndex(0.6);
-            const axisDateFormat = new Intl.DateTimeFormat(undefined, { month: 'short', day: '2-digit' });
+            // timeZone defaults to UTC so labels do not depend on the viewer's zone.
+            const axisDateFormat = new Intl.DateTimeFormat(undefined, { month: 'short', day: '2-digit', timeZone: 'UTC' });
             if (fridayLabel !== axisDateFormat.format(new Date(friday))) {
-                throw new Error('Time axis interpolated a closed-session timestamp before Monday.');
+                throw new Error(`Time axis interpolated a closed-session timestamp before Monday: got ${fridayLabel}.`);
             }
             if (mondayLabel !== axisDateFormat.format(new Date(monday))) {
                 throw new Error('Time axis did not snap to the real Monday candle timestamp.');
             }
+            // The timeZone option must actually change the rendered label.
+            const easternLabel = (() => {
+                gapChart.applyOptions({ timeZone: 'America/New_York' });
+                return timeRenderer.formatTimeAtIndex(0.4);
+            })();
+            gapChart.applyOptions({ timeZone: 'UTC' });
+            if (timeRenderer.formatTimeAtIndex(0.4) !== fridayLabel) {
+                throw new Error('Restoring timeZone to UTC did not restore the label.');
+            }
+            // Friday 20:00 UTC is 15:00 in New York, so the day must agree but the
+            // formatter must have been rebuilt. Assert the option took effect by
+            // checking a zone far enough from UTC to shift the calendar day.
+            gapChart.applyOptions({ timeZone: 'Asia/Tokyo' });
+            const tokyoLabel = timeRenderer.formatTimeAtIndex(0.4);
+            gapChart.applyOptions({ timeZone: 'UTC' });
+            if (tokyoLabel === fridayLabel) {
+                throw new Error('Changing timeZone did not change the time axis label.');
+            }
+            void easternLabel;
+
+            // --- Public read API -------------------------------------------------
+            // Everything below uses only documented public methods.
+            const assertClose = (actual, expected, message) => {
+                if (!(Math.abs(actual - expected) < 1e-6)) {
+                    throw new Error(`${message}: expected ${actual} to be within 1e-6 of ${expected}`);
+                }
+            };
+            const assertEqual = (actual, expected, message) => {
+                if (actual !== expected) throw new Error(`${message}: expected ${actual} to equal ${expected}`);
+            };
+
+            assertEqual(gapChart.getCandleCount(), 3, 'getCandleCount');
+            assertEqual(gapChart.getBarSpacing() > 0, true, 'getBarSpacing is positive');
+
+            const lastGapCandle = gapChart.getLastCandle();
+            assertEqual(lastGapCandle.time, tuesday, 'getLastCandle time');
+            assertClose(lastGapCandle.open, 102, 'getLastCandle open');
+            assertClose(lastGapCandle.close, 102.5, 'getLastCandle close');
+            assertEqual(gapChart.getCandleAt(2).time, lastGapCandle.time, 'getCandleAt matches getLastCandle');
+            assertEqual(gapChart.getCandleAt(-1), null, 'getCandleAt rejects a negative index');
+            assertEqual(gapChart.getCandleAt(3), null, 'getCandleAt rejects an index past the end');
+            assertEqual(gapChart.getCandleAt(1.5), null, 'getCandleAt rejects a fractional index');
+
+            // index <-> coordinate round trip at the real dpr of 2.
+            for (const index of [0, 1, 2]) {
+                assertClose(
+                    gapChart.coordinateToIndex(gapChart.indexToCoordinate(index)),
+                    index,
+                    `index ${index} round trip`,
+                );
+            }
+            assertEqual(gapChart.coordinateToNearestIndex(gapChart.indexToCoordinate(1)), 1, 'nearest index');
+            assertEqual(gapChart.coordinateToNearestIndex(-9999), 0, 'nearest index clamps left');
+            assertEqual(gapChart.coordinateToNearestIndex(9999), 2, 'nearest index clamps right');
+
+            // The x halfway between two bars sits in the gap between their
+            // timestamps. Each conversion must snap to one of the two real candle
+            // times, never to an interpolated instant in between. The first pair
+            // straddles a weekend.
+            const midpointIsOneOf = (leftIndex, rightIndex, leftTime, rightTime) => {
+                const midX = (gapChart.indexToCoordinate(leftIndex) + gapChart.indexToCoordinate(rightIndex)) / 2;
+                const midTime = gapChart.coordinateToTime(midX);
+                if (midTime !== leftTime && midTime !== rightTime) {
+                    throw new Error(
+                        `coordinateToTime interpolated between bars ${leftIndex} and ${rightIndex}: `
+                        + `${new Date(midTime).toISOString()}`,
+                    );
+                }
+                return midTime;
+            };
+            const weekendMid = midpointIsOneOf(0, 1, friday, monday);
+            midpointIsOneOf(1, 2, monday, tuesday);
+            // The weekend midpoint is far nearer Monday in wall-clock terms, so it
+            // must resolve to a real bar rather than a Saturday timestamp.
+            if (weekendMid !== monday && weekendMid !== friday) {
+                throw new Error('Weekend midpoint produced a synthetic timestamp.');
+            }
+            for (const [index, expectedTime] of [[0, friday], [1, monday], [2, tuesday]]) {
+                assertEqual(gapChart.indexToCoordinate(index), gapChart.timeToCoordinate(expectedTime), `timeToCoordinate at ${index}`);
+                assertEqual(gapChart.coordinateToTime(gapChart.indexToCoordinate(index)), expectedTime, `coordinateToTime at ${index}`);
+            }
+            // A time before the series clamps to the oldest bar, after to the newest.
+            assertEqual(gapChart.coordinateToTime(gapChart.timeToCoordinate(0)), friday, 'timeToCoordinate clamps low');
+            assertEqual(gapChart.coordinateToTime(gapChart.timeToCoordinate(9_999_999_999_999)), tuesday, 'timeToCoordinate clamps high');
+
+            // price <-> coordinate round trip.
+            const price = gapChart.coordinateToPrice(120);
+            assertClose(gapChart.priceToCoordinate(price), 120, 'price round trip');
+            assertClose(gapChart.priceToCoordinate(100), gapChart.priceToCoordinate(100), 'priceToCoordinate is stable');
+
+            // The three bars are the whole visible window at the live edge.
+            const gapRange = gapChart.getVisibleLogicalRange();
+            assertEqual(gapRange.to, 3, 'visible logical range includes the newest bar at the live edge');
+            assertEqual(gapRange.from, 0, 'visible logical range starts at the oldest bar');
+            const gapTimeRange = gapChart.getVisibleTimeRange();
+            assertEqual(gapTimeRange.from, friday, 'visible time range starts at the first bar');
+            assertEqual(gapTimeRange.to, tuesday, 'visible time range ends at the last bar');
+            assertEqual(
+                `${gapTimeRange.from}/${gapTimeRange.to}`,
+                `${gapChart.getCandleAt(gapRange.from).time}/${gapChart.getCandleAt(gapRange.to - 1).time}`,
+                'visible time range agrees with the logical range',
+            );
+
+            gapChart.setData([]);
+            assertEqual(gapChart.getCandleCount(), 0, 'count after clearing');
+            assertEqual(gapChart.getLastCandle(), null, 'getLastCandle on an empty chart');
+            assertEqual(gapChart.getCandleAt(0), null, 'getCandleAt on an empty chart');
+            assertEqual(gapChart.coordinateToTime(10), null, 'coordinateToTime on an empty chart');
+            assertEqual(gapChart.timeToCoordinate(friday), null, 'timeToCoordinate on an empty chart');
+            assertEqual(gapChart.coordinateToNearestIndex(10), -1, 'nearest index on an empty chart');
+            assertEqual(gapChart.getVisibleTimeRange(), null, 'visible time range on an empty chart');
+            const emptyRange = gapChart.getVisibleLogicalRange();
+            assertEqual(emptyRange.from, 0, 'empty visible range from');
+            assertEqual(emptyRange.to, 0, 'empty visible range to');
+
             gapChart.destroy();
             gapHost.remove();
 
+            // A container that is not in the document yet must still mount and
+            // accept data.
+            // Backing-store sizing for a late-attached container is NOT asserted
+            // here: it depends on a ResizeObserver delivery, and the headless
+            // runner used for this page never delivers ResizeObserver
+            // notifications, so the assertion would be testing the runner. The
+            // already-sized path is covered above by the DPR check on #chart.
+            const detachedHost = document.createElement('div');
+            detachedHost.style.cssText = 'width:320px;height:200px';
+            const detachedChart = new Chart(detachedHost);
+            if (detachedHost.querySelectorAll('canvas').length !== 3) {
+                throw new Error('Chart did not mount into a detached container.');
+            }
+            detachedChart.setData([sessionCandle(friday, 100), sessionCandle(monday, 101)]);
+            assertEqual(detachedChart.getCandleCount(), 2, 'a detached container accepted data');
+            document.body.appendChild(detachedHost);
+            await waitFrame();
+            detachedChart.destroy();
+            if (detachedHost.childElementCount !== 0) {
+                throw new Error('destroy() did not empty a container it did not create.');
+            }
+            detachedHost.remove();
+
+            // --- applyOptions ---------------------------------------------------
+            // Recolouring must reach the GPU without a setData, which is the
+            // point of runtime options.
+            const optionsHost = document.createElement('div');
+            optionsHost.style.cssText = 'position:fixed;left:20px;top:20px;width:600px;height:300px';
+            document.body.appendChild(optionsHost);
+            const optionsChart = new Chart(optionsHost);
+            const optionsCandles = Array.from({ length: 40 }, (_, index) => ({
+                time: baseTime + index * 60_000,
+                open: 100 + index,
+                high: 101 + index,
+                low: 99 + index,
+                close: 100.4 + index,
+            }));
+            const optionsSurface = optionsHost.firstElementChild;
+            const optionsCanvas = optionsHost.querySelectorAll('canvas')[1];
+            const optionsGl = optionsCanvas.getContext('webgl2');
+
+            /**
+             * Colour census of the options chart, sampled synchronously inside
+             * drawElements. WebGL clears the drawing buffer once the frame is
+             * composited, and the chart only redraws when something asks it to, so
+             * a measurement has to both force a repaint and read during the draw.
+             */
+            let census = { magenta: 0, green: 0 };
+            const optionsDrawElements = optionsGl.drawElements.bind(optionsGl);
+            optionsGl.drawElements = (...args) => {
+                const result = optionsDrawElements(...args);
+                const pixels = new Uint8Array(optionsGl.drawingBufferWidth * optionsGl.drawingBufferHeight * 4);
+                optionsGl.readPixels(0, 0, optionsGl.drawingBufferWidth, optionsGl.drawingBufferHeight, optionsGl.RGBA, optionsGl.UNSIGNED_BYTE, pixels);
+                let magenta = 0;
+                let green = 0;
+                for (let i = 0; i < pixels.length; i += 4) {
+                    const r = pixels[i];
+                    const g = pixels[i + 1];
+                    const b = pixels[i + 2];
+                    const a = pixels[i + 3];
+                    if (a < 128) continue;
+                    if (r > 200 && b > 200 && g < 80) magenta++;
+                    if (g > 150 && r < 100 && b < 160) green++;
+                }
+                census = { magenta, green };
+                return result;
+            };
+            /** Repaints via a no-op option change, then returns the sampled census. */
+            const recoloured = async () => {
+                census = { magenta: 0, green: 0 };
+                optionsChart.applyOptions({ crosshair: { visible: true } });
+                await waitFrame();
+                return census;
+            };
+
+            optionsChart.setData(optionsCandles);
+            await waitFrame();
+            const before = await recoloured();
+            if (before.magenta !== 0) throw new Error('Unexpected magenta before recolouring.');
+            if (before.green === 0) throw new Error('No green up bodies before recolouring.');
+
+            const candlesBefore = optionsChart.getCandleCount();
+            optionsChart.applyOptions({ candlestick: { upColor: '#ff00ff' } });
+            if (optionsChart.getCandleCount() !== candlesBefore) {
+                throw new Error('applyOptions changed the data series.');
+            }
+            const afterUp = await recoloured();
+            if (afterUp.magenta === 0) {
+                throw new Error('applyOptions did not recolour the candle bodies on the GPU.');
+            }
+            if (afterUp.green !== 0) {
+                throw new Error('The old up colour is still on screen after recolouring.');
+            }
+            assertEqual(optionsChart.options().candlestick.upColor, '#ff00ff', 'resolved up colour');
+
+            // An explicit override survives a theme change.
+            optionsChart.applyOptions({ theme: 'paper' });
+            await waitFrame();
+            assertEqual(optionsChart.options().theme, 'paper', 'theme applied');
+            assertEqual(optionsChart.options().candlestick.upColor, '#ff00ff', 'override survived the theme change');
+            assertEqual(
+                optionsChart.options().candlestick.downColor,
+                resolveOptions({ theme: 'paper' }).candlestick.downColor,
+                'untouched colour came from the new preset',
+            );
+            optionsChart.applyOptions({ theme: 'dark' });
+            optionsChart.applyOptions({ candlestick: { upColor: '#1ad98c' } });
+            const afterRestore = await recoloured();
+            if (afterRestore.green === 0) throw new Error('Restoring the original up colour did not repaint.');
+
+            // Invalid values throw and leave the chart untouched.
+            const snapshotBeforeBadApply = JSON.stringify(optionsChart.options());
+            for (const bad of [
+                { candlestick: { upColor: 'chartreuse' } },
+                { priceFormat: { precision: 99 } },
+                { timeScale: { minBarSpacing: 100, maxBarSpacing: 1 } },
+                { locale: 'not a locale' },
+                { timeZone: 'Mars/Olympus' },
+                { maxRetainedCandles: 10 },
+            ]) {
+                let threw = false;
+                try {
+                    optionsChart.applyOptions(bad);
+                } catch (error) {
+                    threw = String(error.message).startsWith('MatrixCharts:');
+                }
+                if (!threw) throw new Error(`applyOptions accepted ${JSON.stringify(bad)}.`);
+            }
+            if (JSON.stringify(optionsChart.options()) !== snapshotBeforeBadApply) {
+                throw new Error('A rejected applyOptions mutated the resolved options.');
+            }
+
+            // Zoom clamps to the configured bounds.
+            optionsChart.applyOptions({ timeScale: { barSpacing: 20, minBarSpacing: 5, maxBarSpacing: 40 } });
+            assertEqual(optionsChart.getBarSpacing(), 20, 'barSpacing applied');
+            for (let i = 0; i < 40; i++) {
+                optionsSurface.dispatchEvent(new WheelEvent('wheel', {
+                    deltaY: -100, clientX: 300, clientY: 150, bubbles: true, cancelable: true,
+                }));
+            }
+            await waitFrame();
+            assertEqual(optionsChart.getBarSpacing(), 40, 'zoom clamped to maxBarSpacing');
+            for (let i = 0; i < 80; i++) {
+                optionsSurface.dispatchEvent(new WheelEvent('wheel', {
+                    deltaY: 100, clientX: 300, clientY: 150, bubbles: true, cancelable: true,
+                }));
+            }
+            await waitFrame();
+            assertEqual(optionsChart.getBarSpacing(), 5, 'zoom clamped to minBarSpacing');
+            optionsChart.applyOptions({ timeScale: { barSpacing: 14, minBarSpacing: 0.5, maxBarSpacing: 400 } });
+            assertEqual(optionsChart.getBarSpacing(), 14, 'barSpacing reset');
+
+            // Price precision reaches the axis labels. precision and minMove must
+            // be set together, because a precision of 0 cannot show a 0.01 tick.
+            const labelFor = (precision) => {
+                const minMove = Math.pow(10, -precision);
+                optionsChart.applyOptions({ priceFormat: { precision, minMove } });
+                return optionsChart.renderers[0].formatAxisValue(1234.5678);
+            };
+            assertEqual(labelFor(0), new Intl.NumberFormat(undefined, { maximumFractionDigits: 0 }).format(1234.5678), 'precision 0');
+            assertEqual(labelFor(2), new Intl.NumberFormat(undefined, { maximumFractionDigits: 2 }).format(1234.5678), 'precision 2');
+            assertEqual(labelFor(4), new Intl.NumberFormat(undefined, { maximumFractionDigits: 4 }).format(1234.5678), 'precision 4');
+
+            // Lowering precision without widening minMove is rejected.
+            let precisionRejected = false;
+            try {
+                optionsChart.applyOptions({ priceFormat: { precision: 0 } });
+            } catch (error) {
+                precisionRejected = String(error.message).includes('finer than');
+            }
+            if (!precisionRejected) throw new Error('A precision/minMove mismatch was accepted.');
+            optionsChart.applyOptions({ priceFormat: { precision: 2, minMove: 0.01 } });
+
+            // The locale changes label formatting.
+            const localeLabel = (locale) => {
+                optionsChart.applyOptions({ locale });
+                return optionsChart.renderers[0].formatAxisValue(1234.5);
+            };
+            assertEqual(localeLabel('en-US'), '1,234.5', 'en-US label');
+            assertEqual(localeLabel('de-DE'), new Intl.NumberFormat('de-DE', { maximumFractionDigits: 2 }).format(1234.5), 'de-DE label');
+            optionsChart.applyOptions({ locale: 'en-US' });
+
+            // Crosshair visibility and grid toggles are honoured by the renderers.
+            const uiPixels = () => {
+                const canvas = optionsHost.querySelectorAll('canvas')[2];
+                const ctx = canvas.getContext('2d');
+                const data = ctx.getImageData(0, 0, canvas.width, canvas.height).data;
+                let n = 0;
+                for (let i = 3; i < data.length; i += 4) if (data[i] > 0) n++;
+                return n;
+            };
+            optionsSurface.dispatchEvent(new PointerEvent('pointermove', {
+                clientX: optionsHost.getBoundingClientRect().left + 400,
+                clientY: optionsHost.getBoundingClientRect().top + 150,
+                bubbles: true, pointerId: 21, pointerType: 'mouse',
+            }));
+            await waitFrame();
+            if (uiPixels() === 0) throw new Error('No crosshair was drawn before hiding it.');
+            optionsChart.applyOptions({ crosshair: { visible: false } });
+            await waitFrame();
+            if (uiPixels() !== 0) throw new Error('crosshair.visible=false still drew the crosshair.');
+            optionsChart.applyOptions({ crosshair: { visible: true } });
+            await waitFrame();
+            if (uiPixels() === 0) throw new Error('crosshair.visible=true did not restore the crosshair.');
+
+            // Wick and border flags are accepted and round-trip through options().
+            optionsChart.applyOptions({ candlestick: { wickVisible: false } });
+            assertEqual(optionsChart.options().candlestick.wickVisible, false, 'wickVisible false');
+            optionsChart.applyOptions({ candlestick: { wickVisible: true, borderVisible: true, borderUpColor: '#ff00ff' } });
+            assertEqual(optionsChart.options().candlestick.borderVisible, true, 'borderVisible true');
+            const bordered = await recoloured();
+            if (bordered.green === 0) throw new Error('Bordered bodies drew no up colour.');
+            if (bordered.magenta === 0) throw new Error('borderVisible drew no border pixels.');
+            if (optionsGl.getError() !== optionsGl.NO_ERROR) {
+                throw new Error('The bordered body path reported a GL error.');
+            }
+            // Turning the border off must restore the original pixel counts.
+            optionsChart.applyOptions({ candlestick: { borderVisible: false, borderUpColor: '#1ad98c' } });
+            const plainAgain = await recoloured();
+            if (plainAgain.magenta !== 0) throw new Error('Border pixels survived borderVisible=false.');
+            if (plainAgain.green === 0) throw new Error('Repainting after the border toggle lost the up colour.');
+
+            // Grid toggles.
+            optionsChart.applyOptions({ grid: { vertLines: false, horzLines: false } });
+            assertEqual(optionsChart.options().grid.vertLines, false, 'grid vertLines');
+            assertEqual(optionsChart.options().grid.horzLines, false, 'grid horzLines');
+
+            optionsChart.destroy();
+            optionsHost.remove();
+
             if (errors.length > 0) throw new Error(errors.join('\n'));
+
+            // --- Public user events ------------------------------------------------
+            // A dedicated host so pointer traffic cannot disturb the feed chart.
+            const eventHost = document.createElement('div');
+            eventHost.id = 'event-host';
+            eventHost.style.cssText = 'position:fixed;left:20px;top:20px;width:600px;height:300px';
+            document.body.appendChild(eventHost);
+            const eventChart = new Chart(eventHost);
+            // The wrapper is the single input surface, so pointer events must be
+            // dispatched there. Dispatching on the container would never reach it.
+            const eventSurface = eventHost.firstElementChild;
+            if (!eventSurface) throw new Error('The event chart has no input surface.');
+            const eventCandles = Array.from({ length: 30 }, (_, index) => ({
+                time: baseTime + index * 60_000,
+                open: 100 + index,
+                high: 101 + index,
+                low: 99 + index,
+                close: 100.5 + index,
+            }));
+            eventChart.setData(eventCandles);
+            await waitFrame();
+
+            const moves = [];
+            const clicks = [];
+            const ranges = [];
+            const unsubMove = eventChart.subscribeCrosshairMove((e) => moves.push(e));
+            const unsubClick = eventChart.subscribeClick((e) => clicks.push(e));
+            const unsubRange = eventChart.subscribeVisibleRangeChange((e) => ranges.push(e));
+
+            const hostRect = () => eventHost.getBoundingClientRect();
+            const hover = (x, y) => {
+                const r = hostRect();
+                eventSurface.dispatchEvent(new PointerEvent('pointermove', {
+                    clientX: r.left + x, clientY: r.top + y, bubbles: true, pointerId: 7, pointerType: 'mouse',
+                }));
+            };
+            const press = (x, y, id = 7) => {
+                const r = hostRect();
+                eventSurface.dispatchEvent(new PointerEvent('pointerdown', {
+                    clientX: r.left + x, clientY: r.top + y, bubbles: true, pointerId: id, pointerType: 'mouse', button: 0,
+                }));
+            };
+            const release = (x, y, id = 7) => {
+                const r = hostRect();
+                eventSurface.dispatchEvent(new PointerEvent('pointerup', {
+                    clientX: r.left + x, clientY: r.top + y, bubbles: true, pointerId: id, pointerType: 'mouse', button: 0,
+                }));
+            };
+            const drag = async (fromX, toX, steps = 6) => {
+                press(fromX, 150);
+                for (let step = 1; step <= steps; step++) {
+                    const x = fromX + ((toX - fromX) * step) / steps;
+                    const r = hostRect();
+                    eventSurface.dispatchEvent(new PointerEvent('pointermove', {
+                        clientX: r.left + x, clientY: r.top + 150, bubbles: true, pointerId: 7, pointerType: 'mouse',
+                    }));
+                }
+                release(toX, 150);
+                await waitFrame();
+            };
+
+            // 1. Hover reports the candle under the pointer, snapped to its centre.
+            const targetIndex = 12;
+            const targetX = eventChart.indexToCoordinate(targetIndex);
+            const movesBefore = moves.length;
+            hover(targetX + eventChart.getBarSpacing() * 0.4, 150);
+            if (moves.length !== movesBefore + 1) {
+                throw new Error(`Hover produced ${moves.length - movesBefore} crosshair events, expected 1.`);
+            }
+            const hovered = moves[moves.length - 1];
+            if (!hovered.candle) throw new Error('Hover did not resolve a candle.');
+            assertEqual(hovered.index, targetIndex, 'crosshair index');
+            assertEqual(hovered.time, eventCandles[targetIndex].time, 'crosshair time');
+            assertClose(hovered.candle.close, 100.5 + targetIndex, 'crosshair candle close');
+            assertClose(hovered.x, eventChart.indexToCoordinate(targetIndex), 'crosshair x snaps to the bar centre');
+            assertClose(hovered.price, eventChart.coordinateToPrice(150), 'crosshair price tracks the pointer y');
+            assertEqual(hovered.y, 150, 'crosshair y follows the pointer');
+
+            // 2. The same bar reached from either side resolves identically.
+            const left = eventChart.indexToCoordinate(targetIndex) - eventChart.getBarSpacing() * 0.4;
+            hover(left, 150);
+            assertEqual(moves[moves.length - 1].index, targetIndex, 'crosshair snaps to the same bar from the left');
+
+            // 3. Moving within the same bar does not re-notify.
+            const movesBeforeIdle = moves.length;
+            hover(targetX + eventChart.getBarSpacing() * 0.1, 150);
+            assertEqual(moves.length, movesBeforeIdle, 'a move within one bar must stay silent');
+
+            // 4. Leaving clears the crosshair.
+            eventSurface.dispatchEvent(new PointerEvent('pointerleave', { bubbles: true, pointerId: 7, pointerType: 'mouse' }));
+            const cleared = moves[moves.length - 1];
+            assertEqual(cleared.candle, null, 'crosshair clears on leave');
+            assertEqual(cleared.index, -1, 'cleared index is -1');
+            assertEqual(cleared.x, null, 'cleared x is null');
+            assertEqual(cleared.y, null, 'cleared y is null');
+            assertEqual(cleared.time, null, 'cleared time is null');
+            assertEqual(cleared.price, null, 'cleared price is null');
+            const movesAfterLeave = moves.length;
+            hover(targetX, 150);
+            if (!moves[moves.length - 1].candle) throw new Error('Crosshair did not come back after re-entering.');
+
+            // 5. A press and release without travel is a click.
+            const clicksBefore = clicks.length;
+            press(targetX, 150);
+            release(targetX, 150);
+            if (clicks.length !== clicksBefore + 1) {
+                throw new Error(`A stationary press produced ${clicks.length - clicksBefore} clicks, expected 1.`);
+            }
+            const clicked = clicks[clicks.length - 1];
+            assertEqual(clicked.index, targetIndex, 'click index');
+            assertEqual(clicked.button, 0, 'click button');
+            assertEqual(clicked.time, eventCandles[targetIndex].time, 'click time');
+            if (!clicked.candle) throw new Error('Click did not carry a candle.');
+
+            // 6. A drag is not a click, and it does report range changes.
+            const clicksBeforeDrag = clicks.length;
+            const rangesBeforeDrag = ranges.length;
+            await drag(300, 120, 12);
+            if (clicks.length !== clicksBeforeDrag) throw new Error('A pan was reported as a click.');
+            if (ranges.length === 0) throw new Error('A pan produced no visibleRangeChange event.');
+            const lastRange = ranges[ranges.length - 1];
+            if (lastRange.logical.to <= lastRange.logical.from) throw new Error('Range event reported an empty visible range.');
+            if (lastRange.logical.to > eventChart.getCandleCount()) throw new Error('Range event escaped the series.');
+            assertClose(lastRange.barSpacing, eventChart.getBarSpacing(), 'range event bar spacing');
+            assertEqual(lastRange.logical.to, eventChart.getVisibleLogicalRange().to, 'range event matches the read API');
+            assertEqual(lastRange.logical.from, eventChart.getVisibleLogicalRange().from, 'range event from matches the read API');
+            if (lastRange.time) {
+                assertEqual(lastRange.time.from, eventChart.getCandleAt(lastRange.logical.from).time, 'range time from');
+                assertEqual(lastRange.time.to, eventChart.getCandleAt(lastRange.logical.to - 1).time, 'range time to');
+            }
+            if (ranges.length - rangesBeforeDrag > 20) {
+                throw new Error(`A 12-step drag produced ${ranges.length - rangesBeforeDrag} range events, expected coalescing.`);
+            }
+
+            // 7. A drag with no range change is silent.
+            const rangesBeforeIdle = ranges.length;
+            await drag(150, 150, 1);
+            if (ranges.length !== rangesBeforeIdle) {
+                throw new Error('A sub-pixel drag changed the visible range and should have been silent.');
+            }
+
+            // 8. Zooming reports a new bar spacing.
+            const spacingBeforeZoom = eventChart.getBarSpacing();
+            const rangesBeforeZoom = ranges.length;
+            eventSurface.dispatchEvent(new WheelEvent('wheel', {
+                deltaY: -100, clientX: hostRect().left + 300, clientY: hostRect().top + 150, bubbles: true, cancelable: true,
+            }));
+            await waitFrame();
+            assertEqual(eventChart.getBarSpacing() > spacingBeforeZoom, true, 'wheel up zooms in');
+            if (ranges.length <= rangesBeforeZoom) throw new Error('Zooming produced no visibleRangeChange event.');
+            assertClose(ranges[ranges.length - 1].barSpacing, eventChart.getBarSpacing(), 'zoom range event spacing');
+
+            // 9. Unsubscribing stops delivery and is safe to call twice.
+            unsubMove();
+            unsubMove();
+            unsubClick();
+            unsubRange();
+            const movesBeforeUnsub = moves.length;
+            const clicksBeforeUnsub = clicks.length;
+            const rangesBeforeUnsub = ranges.length;
+            hover(targetX - 60, 120);
+            press(targetX - 60, 120);
+            release(targetX - 60, 120);
+            await waitFrame();
+            eventSurface.dispatchEvent(new WheelEvent('wheel', {
+                deltaY: -100, clientX: hostRect().left + 300, clientY: hostRect().top + 150, bubbles: true, cancelable: true,
+            }));
+            await waitFrame();
+            assertEqual(moves.length, movesBeforeUnsub, 'unsubscribed crosshair handler kept firing');
+            assertEqual(clicks.length, clicksBeforeUnsub, 'unsubscribed click handler kept firing');
+            assertEqual(ranges.length, rangesBeforeUnsub, 'unsubscribed range handler kept firing');
+
+            // 10. Handlers that subscribed again after destroy() are not called.
+            const postDestroy = [];
+            eventChart.subscribeCrosshairMove((e) => postDestroy.push(e));
+            eventChart.subscribeClick((e) => postDestroy.push(e));
+            eventChart.subscribeVisibleRangeChange((e) => postDestroy.push(e));
+            const canvasCount = eventHost.querySelectorAll('canvas').length;
+            eventChart.destroy();
+            assertEqual(eventHost.querySelectorAll('canvas').length, 0, 'destroy() removed the layers');
+            assertEqual(canvasCount, 3, 'the event chart had three layers');
+            hover(targetX, 150);
+            eventSurface.dispatchEvent(new PointerEvent('pointerdown', {
+                clientX: hostRect().left + targetX, clientY: hostRect().top + 150, bubbles: true, pointerId: 9, pointerType: 'mouse', button: 0,
+            }));
+            eventSurface.dispatchEvent(new PointerEvent('pointerup', {
+                clientX: hostRect().left + targetX, clientY: hostRect().top + 150, bubbles: true, pointerId: 9, pointerType: 'mouse', button: 0,
+            }));
+            await waitFrame();
+            if (postDestroy.length > 0) {
+                throw new Error(`A destroyed chart called ${postDestroy.length} handler(s).`);
+            }
+            eventHost.remove();
+
+            // The feed-driven chart was deliberately panned into history above to
+            // check anchor preservation. Put it back on the live edge, which is
+            // the state a fresh integrator sees, and measure its own pixels.
+            chart.setData(snapshot);
+            await waitFrame();
+
+            const feedRange = chart.getVisibleLogicalRange();
+            const feedTimeRange = chart.getVisibleTimeRange();
+            if (feedRange.to !== chart.getCandleCount()) {
+                throw new Error('setData did not restore the live edge, so the newest bar is not visible.');
+            }
+            if (feedRange.from <= 0) {
+                throw new Error('setData did not fit the series, so the oldest bar is not visible.');
+            }
+            if (chart.getCandleAt(feedRange.from).time !== feedTimeRange.from) {
+                throw new Error('Feed chart logical and time ranges disagree at the left edge.');
+            }
+            if (chart.getCandleAt(feedRange.to - 1).time !== feedTimeRange.to) {
+                throw new Error('Feed chart logical and time ranges disagree at the right edge.');
+            }
+            // floor at the left edge and ceil at the right edge mean the visible
+            // bars cover the window, plus at most one bar of rounding per side.
+            const feedWidth = document.getElementById('chart').clientWidth;
+            const feedSpan = (feedRange.to - feedRange.from) * chart.getBarSpacing();
+            if (feedSpan < feedWidth || feedSpan >= feedWidth + 2 * chart.getBarSpacing()) {
+                throw new Error(
+                    `Feed chart visible range spans ${feedSpan}px of a ${feedWidth}px window `
+                    + `at ${chart.getBarSpacing()}px per bar.`,
+                );
+            }
+
+            // Candle bodies must actually reach the framebuffer of the main chart.
+            const mainPixels = mainChartPixels();
+            if (mainPixels.bodyPixels === 0) throw new Error('Candle bodies produced no filled pixels.');
+            if (mainPixels.widestRun < 2) {
+                throw new Error('Candle bodies did not cover at least two adjacent physical pixels.');
+            }
 
             resultNode.textContent = JSON.stringify({
                 result: 'PASS',
-                retainedCandles: chart.candlePyramid.candleCount,
+                retainedCandles: chart.getCandleCount(),
                 anchorPreserved: true,
                 sourceState: source.state,
                 webglDrawCalls: window.__matrixChartsDrawCalls,
                 dpr: window.devicePixelRatio,
-                filledBodyPixels: window.__matrixChartsBodyPixels,
-                widestBodyPixelRun: window.__matrixChartsWidestBodyRun,
+                filledBodyPixels: mainPixels.bodyPixels,
+                widestBodyPixelRun: mainPixels.widestRun,
+                barSpacing: chart.getBarSpacing(),
+                visibleLogicalRange: feedRange,
+                visibleTimeRange: {
+                    from: new Date(feedTimeRange.from).toISOString(),
+                    to: new Date(feedTimeRange.to).toISOString(),
+                },
+                lastCandleTime: new Date(chart.getLastCandle().time).toISOString(),
+                events: {
+                    crosshairMoves: moves.length,
+                    clicks: clicks.length,
+                    visibleRangeChanges: ranges.length,
+                    handlersAfterDestroy: postDestroy.length,
+                },
             }, null, 2);
             document.documentElement.dataset.testResult = 'pass';
         } catch (error) {

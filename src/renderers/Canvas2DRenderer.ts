@@ -1,7 +1,21 @@
 // src/renderers/Canvas2DRenderer.ts
-import type { IRenderer } from '../core/IRenderer';
-import type { EventEmitter, ChartEvents } from '../core/EventEmitter';
-import type { ChartTheme } from '../core/ChartOptions';
+import type { IRenderer } from '../core/IRenderer.js';
+import type { EventEmitter, ChartEvents } from '../core/EventEmitter.js';
+import type { CandleData } from '../core/CandleData.js';
+import {
+    parseCssColor,
+    themeDefaults,
+    type ResolvedChartOptions,
+} from '../core/options.js';
+import {
+    type ChartViewport,
+    clampCandleIndex,
+    coordinateToIndex,
+    coordinateToPrice,
+    indexToCoordinate,
+    priceToCoordinate,
+    visiblePriceRange,
+} from '../core/coordinates.js';
 
 export class Canvas2DRenderer implements IRenderer {
     private canvas!: HTMLCanvasElement;
@@ -15,9 +29,15 @@ export class Canvas2DRenderer implements IRenderer {
     private devicePixelRatio: number = 1;
     private crosshairX: number | null = null;
     private crosshairY: number | null = null;
-    private ohlcData: Float32Array | null = null;
+    private crosshairTime: number | null = null;
+    private crosshairCandle: CandleData | null = null;
     private timeValues: readonly number[] = [];
-    private theme: ChartTheme = 'dark';
+    private options: ResolvedChartOptions = themeDefaults('dark');
+    // Parsed once per apply, not per label or per frame.
+    private colors = this.parseColors(themeDefaults('dark'));
+    private priceFormatter: Intl.NumberFormat = new Intl.NumberFormat(undefined, { maximumFractionDigits: 2 });
+    private timeFormatter: Intl.DateTimeFormat | null = null;
+    private timeFormatterKey: string = '';
     
     private isGridLayer: boolean;
 
@@ -35,12 +55,8 @@ public init(canvas: HTMLCanvasElement, emitter: EventEmitter<ChartEvents>): void
 
         this.emitter.on('viewport', this.handleViewportEvent);
         this.emitter.on('data', this.handleDataEvent);
-        this.emitter.on('theme', this.handleThemeEvent);
-
-        if (!this.isGridLayer) {
-            canvas.addEventListener('mousemove', this.handleMouseMove);
-            canvas.addEventListener('mouseleave', this.handleMouseLeave);
-        }
+        this.emitter.on('options', this.handleOptionsEvent);
+        this.emitter.on('crosshair', this.handleCrosshairEvent);
     }
 
     public resize(width: number, height: number, dpr: number): void {
@@ -59,27 +75,71 @@ public init(canvas: HTMLCanvasElement, emitter: EventEmitter<ChartEvents>): void
         this.scaleY = payload.scaleY;
     };
 
-    private handleThemeEvent = (theme: ChartEvents['theme']): void => {
-        this.theme = theme;
+    private handleOptionsEvent = (options: ResolvedChartOptions): void => {
+        this.options = options;
+        this.colors = this.parseColors(options);
+        this.priceFormatter = new Intl.NumberFormat(options.locale, {
+            maximumFractionDigits: options.priceFormat.precision,
+        });
+        this.timeFormatterKey = '';
+        this.timeFormatter = null;
+    };
+
+    private parseColors(options: ResolvedChartOptions) {
+        return {
+            background: parseCssColor(options.layout.background, 'layout.background'),
+            text: parseCssColor(options.layout.textColor, 'layout.textColor'),
+            grid: parseCssColor(options.grid.color, 'grid.color'),
+            crosshair: parseCssColor(options.crosshair.color, 'crosshair.color'),
+            up: parseCssColor(options.candlestick.upColor, 'candlestick.upColor'),
+            down: parseCssColor(options.candlestick.downColor, 'candlestick.downColor'),
+        };
+    }
+
+    /**
+     * The crosshair is owned by Chart. This layer only draws the lines and the
+     * readout, so what is drawn always matches what crosshairMove reported.
+     */
+    private handleCrosshairEvent = (payload: ChartEvents['crosshair']): void => {
+        this.crosshairX = payload.x;
+        this.crosshairY = payload.y;
+        this.crosshairTime = payload.time;
+        this.crosshairCandle = payload.candle;
+        if (!this.isGridLayer) {
+            this.clear();
+            this.render();
+        }
     };
 
     private handleDataEvent = (payload: ChartEvents['data']): void => {
-        if (payload.ohlc.length % 6 !== 0) {
-            throw new Error('MatrixCharts: OHLC data must contain x/open/high/low/close/width values.');
-        }
-        this.ohlcData = new Float32Array(payload.ohlc);
         this.timeValues = payload.times;
     };
+
+    private get viewport(): ChartViewport {
+        return {
+            offsetX: this.offsetX,
+            offsetY: this.offsetY,
+            scaleX: this.scaleX,
+            scaleY: this.scaleY,
+            cssWidth: this.canvas.width / this.devicePixelRatio,
+            cssHeight: this.canvas.height / this.devicePixelRatio,
+        };
+    }
 
     public clear(): void {
         const cssWidth: number = this.canvas.width / this.devicePixelRatio;
         const cssHeight: number = this.canvas.height / this.devicePixelRatio;
         if (this.isGridLayer) {
-            this.ctx.fillStyle = this.theme === 'dark' ? '#0b0f17' : '#f4f1e8';
+            this.ctx.fillStyle = this.options.layout.background;
             this.ctx.fillRect(0, 0, cssWidth, cssHeight);
             return;
         }
         this.ctx.clearRect(0, 0, cssWidth, cssHeight);
+    }
+
+    /** `rgba(...)` string from an already-parsed colour, at a given alpha. */
+    private withAlpha(color: readonly [number, number, number, number], alpha: number): string {
+        return `rgba(${Math.round(color[0] * 255)}, ${Math.round(color[1] * 255)}, ${Math.round(color[2] * 255)}, ${alpha})`;
     }
 
     public render(): void {
@@ -88,40 +148,44 @@ public init(canvas: HTMLCanvasElement, emitter: EventEmitter<ChartEvents>): void
             return;
         }
 
-        const cssWidth: number = this.canvas.width / this.devicePixelRatio;
-        const cssHeight: number = this.canvas.height / this.devicePixelRatio;
+        const viewport: ChartViewport = this.viewport;
+        const cssWidth: number = viewport.cssWidth;
+        const cssHeight: number = viewport.cssHeight;
 
         this.ctx.save();
-        this.ctx.strokeStyle = this.theme === 'dark'
-            ? 'rgba(184, 198, 218, 0.13)'
-            : 'rgba(54, 62, 70, 0.15)';
+        this.ctx.strokeStyle = this.options.grid.color;
         this.ctx.lineWidth = 1;
         this.ctx.beginPath();
 
-        const priceTickStep: number = this.niceStep(56 / Math.abs(this.scaleY));
-        const [minimumVisiblePrice, maximumVisiblePrice]: [number, number] = this.getVisiblePriceRange(cssHeight);
-        const firstPriceTick: number = Math.ceil(minimumVisiblePrice / priceTickStep) * priceTickStep;
-        for (let price: number = firstPriceTick; price <= maximumVisiblePrice + priceTickStep * 1e-9; price += priceTickStep) {
-            const y: number = this.offsetY + price * this.scaleY;
-            if (y < 0 || y > cssHeight) continue;
-            const crispY: number = Math.floor(y) + 0.5;
-            this.ctx.moveTo(0, crispY);
-            this.ctx.lineTo(cssWidth, crispY);
+        const priceTickStep: number = this.priceTickStep();
+        const timeTickStep: number = this.niceStep(96 / this.scaleX);
+        const firstTimeTick: number = Math.ceil(coordinateToIndex(viewport, 0) / timeTickStep) * timeTickStep;
+
+        if (this.options.grid.horzLines) {
+            const [minimumVisiblePrice, maximumVisiblePrice]: [number, number] = visiblePriceRange(viewport);
+            const firstPriceTick: number = Math.ceil(minimumVisiblePrice / priceTickStep) * priceTickStep;
+            for (let price: number = firstPriceTick; price <= maximumVisiblePrice + priceTickStep * 1e-9; price += priceTickStep) {
+                const y: number = priceToCoordinate(viewport, price);
+                if (y < 0 || y > cssHeight) continue;
+                const crispY: number = Math.floor(y) + 0.5;
+                this.ctx.moveTo(0, crispY);
+                this.ctx.lineTo(cssWidth, crispY);
+            }
         }
 
-        const timeTickStep: number = this.niceStep(96 / this.scaleX);
-        const firstTimeTick: number = Math.ceil((-this.offsetX / this.scaleX) / timeTickStep) * timeTickStep;
-        for (let time: number = firstTimeTick; ; time += timeTickStep) {
-            const x: number = this.offsetX + time * this.scaleX;
-            if (x > cssWidth) break;
-            if (x < 0) continue;
-            const crispX: number = Math.floor(x) + 0.5;
-            this.ctx.moveTo(crispX, 0);
-            this.ctx.lineTo(crispX, cssHeight);
+        if (this.options.grid.vertLines) {
+            for (let time: number = firstTimeTick; ; time += timeTickStep) {
+                const x: number = indexToCoordinate(viewport, time);
+                if (x > cssWidth) break;
+                if (x < 0) continue;
+                const crispX: number = Math.floor(x) + 0.5;
+                this.ctx.moveTo(crispX, 0);
+                this.ctx.lineTo(crispX, cssHeight);
+            }
         }
 
         this.ctx.stroke();
-        this.renderAxes(cssWidth, cssHeight, priceTickStep, timeTickStep, firstTimeTick);
+        this.renderAxes(viewport, priceTickStep, timeTickStep, firstTimeTick);
         this.ctx.restore();
     }
 
@@ -129,39 +193,22 @@ public init(canvas: HTMLCanvasElement, emitter: EventEmitter<ChartEvents>): void
         if (this.emitter) {
             this.emitter.off('viewport', this.handleViewportEvent);
             this.emitter.off('data', this.handleDataEvent);
-            this.emitter.off('theme', this.handleThemeEvent);
-        }
-        if (!this.isGridLayer) {
-            this.canvas.removeEventListener('mousemove', this.handleMouseMove);
-            this.canvas.removeEventListener('mouseleave', this.handleMouseLeave);
+            this.emitter.off('options', this.handleOptionsEvent);
+            this.emitter.off('crosshair', this.handleCrosshairEvent);
         }
         this.clear();
     }
 
-    private handleMouseMove = (event: MouseEvent): void => {
-        const bounds: DOMRect = this.canvas.getBoundingClientRect();
-        this.crosshairX = event.clientX - bounds.left;
-        this.crosshairY = event.clientY - bounds.top;
-        this.clear();
-        this.render();
-    };
-
-    private handleMouseLeave = (): void => {
-        this.crosshairX = null;
-        this.crosshairY = null;
-        this.clear();
-    };
-
     private renderCrosshair(): void {
+        if (!this.options.crosshair.visible) return;
         if (this.crosshairX === null || this.crosshairY === null) return;
 
-        const cssWidth: number = this.canvas.width / this.devicePixelRatio;
-        const cssHeight: number = this.canvas.height / this.devicePixelRatio;
+        const viewport: ChartViewport = this.viewport;
+        const cssWidth: number = viewport.cssWidth;
+        const cssHeight: number = viewport.cssHeight;
 
         this.ctx.save();
-        this.ctx.strokeStyle = this.theme === 'dark'
-            ? 'rgba(0, 220, 255, 0.9)'
-            : 'rgba(0, 111, 145, 0.9)';
+        this.ctx.strokeStyle = this.options.crosshair.color;
         this.ctx.lineWidth = 1;
         this.ctx.setLineDash([4, 4]);
         this.ctx.beginPath();
@@ -171,80 +218,72 @@ public init(canvas: HTMLCanvasElement, emitter: EventEmitter<ChartEvents>): void
         this.ctx.lineTo(cssWidth, this.crosshairY + 0.5);
         this.ctx.stroke();
         this.ctx.restore();
-        this.renderOHLCLabels(cssWidth, cssHeight);
+        this.renderCrosshairReadout(viewport, cssWidth, cssHeight);
     }
 
-    private renderOHLCLabels(cssWidth: number, cssHeight: number): void {
-        if (!this.ohlcData || this.ohlcData.length === 0 || this.crosshairX === null || this.crosshairY === null) {
-            return;
-        }
+    /**
+     * Draws the OHLC panel and the axis price/time tags for the crosshair. The
+     * candle comes from Chart, so it is the exact bar the pointer resolved to
+     * rather than an aggregate bucket from the visible pyramid slice.
+     */
+    private renderCrosshairReadout(viewport: ChartViewport, cssWidth: number, cssHeight: number): void {
+        if (this.crosshairX === null || this.crosshairY === null) return;
 
-        const cursorDataX: number = (this.crosshairX - this.offsetX) / this.scaleX;
-        let nearestCandleIndex: number = 0;
-        let nearestDistance: number = Number.POSITIVE_INFINITY;
-        const candleCount: number = this.ohlcData.length / 6;
-        for (let candleIndex: number = 0; candleIndex < candleCount; candleIndex++) {
-            const candleX: number = this.ohlcData[candleIndex * 6];
-            const distance: number = Math.abs(candleX - cursorDataX);
-            if (distance < nearestDistance) {
-                nearestDistance = distance;
-                nearestCandleIndex = candleIndex;
+        const candle: CandleData | null = this.crosshairCandle;
+        if (candle) {
+            const panelX: number = 10;
+            const panelY: number = 10;
+            const panelWidth: number = 158;
+            const panelHeight: number = 58;
+            const open: number = candle.open;
+            const close: number = candle.close;
+            const timeLabel: string = `T ${this.formatTimeAtTimestamp(candle.time)}`;
+            const valueLabels: string[] = [
+                `O ${this.formatAxisValue(open)}`,
+                `H ${this.formatAxisValue(candle.high)}`,
+                `L ${this.formatAxisValue(candle.low)}`,
+                `C ${this.formatAxisValue(close)}`,
+            ];
+            const bullish: boolean = close >= open;
+
+            this.ctx.save();
+            this.ctx.font = '11px sans-serif';
+            this.ctx.textBaseline = 'middle';
+            this.ctx.fillStyle = this.withAlpha(this.colors.background, 0.96);
+            this.ctx.fillRect(panelX, panelY, panelWidth, panelHeight);
+            this.ctx.strokeStyle = this.withAlpha(bullish ? this.colors.up : this.colors.down, 0.95);
+            this.ctx.strokeRect(panelX + 0.5, panelY + 0.5, panelWidth - 1, panelHeight - 1);
+            this.ctx.fillStyle = this.options.layout.textColor;
+            this.ctx.fillText(timeLabel, panelX + 8, panelY + 10);
+            for (let valueIndex: number = 0; valueIndex < valueLabels.length; valueIndex++) {
+                const columnX: number = panelX + 8 + (valueIndex % 2) * 76;
+                const rowY: number = panelY + 29 + Math.floor(valueIndex / 2) * 16;
+                this.ctx.fillText(valueLabels[valueIndex], columnX, rowY);
             }
+            this.ctx.restore();
         }
 
-        const dataIndex: number = nearestCandleIndex * 6;
-        const candleX: number = this.ohlcData[dataIndex];
-        const open: number = this.ohlcData[dataIndex + 1];
-        const high: number = this.ohlcData[dataIndex + 2];
-        const low: number = this.ohlcData[dataIndex + 3];
-        const close: number = this.ohlcData[dataIndex + 4];
-        const panelX: number = 10;
-        const panelY: number = 10;
-        const panelWidth: number = 158;
-        const panelHeight: number = 58;
-        const timeLabel: string = `T ${this.formatTimeAtIndex(candleX)}`;
-        const valueLabels: string[] = [
-            `O ${this.formatAxisValue(open)}`,
-            `H ${this.formatAxisValue(high)}`,
-            `L ${this.formatAxisValue(low)}`,
-            `C ${this.formatAxisValue(close)}`,
-        ];
-
-        this.ctx.save();
-        this.ctx.font = '11px sans-serif';
-        this.ctx.textBaseline = 'middle';
-        this.ctx.fillStyle = this.theme === 'dark' ? 'rgba(13, 17, 23, 0.96)' : 'rgba(250, 248, 241, 0.97)';
-        this.ctx.fillRect(panelX, panelY, panelWidth, panelHeight);
-        this.ctx.strokeStyle = close >= open
-            ? (this.theme === 'dark' ? 'rgba(26, 218, 145, 0.95)' : 'rgba(0, 112, 75, 0.95)')
-            : (this.theme === 'dark' ? 'rgba(245, 72, 90, 0.95)' : 'rgba(184, 43, 55, 0.95)');
-        this.ctx.strokeRect(panelX + 0.5, panelY + 0.5, panelWidth - 1, panelHeight - 1);
-        this.ctx.fillStyle = this.theme === 'dark' ? '#d8e0eb' : '#252c32';
-        this.ctx.fillText(timeLabel, panelX + 8, panelY + 10);
-        for (let valueIndex: number = 0; valueIndex < valueLabels.length; valueIndex++) {
-            const columnX: number = panelX + 8 + (valueIndex % 2) * 76;
-            const rowY: number = panelY + 29 + Math.floor(valueIndex / 2) * 16;
-            this.ctx.fillText(valueLabels[valueIndex], columnX, rowY);
-        }
-
-        const currentPrice: number = (this.crosshairY - this.offsetY) / this.scaleY;
+        const currentPrice: number = coordinateToPrice(viewport, this.crosshairY);
         this.drawLabel(this.formatAxisValue(currentPrice), cssWidth - 6, this.crosshairY, 'right');
-        this.drawLabel(this.formatTimeAtIndex(candleX), this.crosshairX + 6, cssHeight - 10, 'left');
-        this.ctx.restore();
+        const timeTag: string = this.crosshairTime === null
+            ? this.formatAxisValue(this.crosshairX)
+            : this.formatTimeAtTimestamp(this.crosshairTime);
+        this.drawLabel(timeTag, this.crosshairX + 6, cssHeight - 10, 'left');
     }
 
     private renderAxes(
-        cssWidth: number,
-        cssHeight: number,
+        viewport: ChartViewport,
         priceTickStep: number,
         timeTickStep: number,
         firstTimeTick: number,
     ): void {
+        const cssWidth: number = viewport.cssWidth;
+        const cssHeight: number = viewport.cssHeight;
         this.ctx.save();
         this.ctx.font = '11px sans-serif';
         this.ctx.textBaseline = 'middle';
-        this.ctx.fillStyle = this.theme === 'dark' ? '#c6d0df' : '#343b41';
-        this.ctx.strokeStyle = this.theme === 'dark' ? 'rgba(184, 198, 218, 0.38)' : 'rgba(54, 62, 70, 0.42)';
+        this.ctx.fillStyle = this.options.layout.textColor;
+        this.ctx.strokeStyle = this.withAlpha(this.colors.grid, 0.38 / Math.max(this.colors.grid[3], 0.01));
         this.ctx.lineWidth = 1;
 
         this.ctx.beginPath();
@@ -254,15 +293,15 @@ public init(canvas: HTMLCanvasElement, emitter: EventEmitter<ChartEvents>): void
         this.ctx.lineTo(cssWidth, cssHeight - 0.5);
         this.ctx.stroke();
 
-        const [minimumVisiblePrice, maximumVisiblePrice]: [number, number] = this.getVisiblePriceRange(cssHeight);
+        const [minimumVisiblePrice, maximumVisiblePrice]: [number, number] = visiblePriceRange(viewport);
         const firstPriceTick: number = Math.ceil(minimumVisiblePrice / priceTickStep) * priceTickStep;
         for (let price: number = firstPriceTick; price <= maximumVisiblePrice + priceTickStep * 1e-9; price += priceTickStep) {
-            const y: number = this.offsetY + price * this.scaleY;
+            const y: number = priceToCoordinate(viewport, price);
             if (y >= 0 && y <= cssHeight) this.drawLabel(this.formatAxisValue(price), 6, y, 'left');
         }
 
         for (let time: number = firstTimeTick; ; time += timeTickStep) {
-            const x: number = this.offsetX + time * this.scaleX;
+            const x: number = indexToCoordinate(viewport, time);
             if (x > cssWidth) break;
             if (x >= 0) this.drawLabel(this.formatTimeAtIndex(time), x + 4, cssHeight - 10, 'left');
         }
@@ -281,38 +320,66 @@ public init(canvas: HTMLCanvasElement, emitter: EventEmitter<ChartEvents>): void
             : alignment === 'center'
                 ? x - textWidth / 2
                 : x - padding;
-        this.ctx.fillStyle = this.theme === 'dark' ? 'rgba(11, 15, 23, 0.92)' : 'rgba(244, 241, 232, 0.94)';
+        this.ctx.fillStyle = this.withAlpha(this.colors.background, 0.92);
         this.ctx.fillRect(boxLeft, y - textHeight / 2, textWidth, textHeight);
-        this.ctx.fillStyle = this.theme === 'dark' ? '#c6d0df' : '#343b41';
+        this.ctx.fillStyle = this.options.layout.textColor;
         this.ctx.fillText(text, x, y);
     }
 
+    /** Price labels honour `priceFormat.precision` and the configured locale. */
     private formatAxisValue(value: number): string {
-        if (Math.abs(value) >= 1000) return `${(value / 1000).toFixed(1)}k`;
-        if (Number.isInteger(value)) return value.toString();
-        return value.toFixed(1);
+        if (!Number.isFinite(value)) return '';
+        return this.priceFormatter.format(value);
+    }
+
+    /**
+     * Price tick step, rounded up so every tick is a whole multiple of
+     * `priceFormat.minMove` and therefore a price the instrument can actually
+     * trade at.
+     */
+    private priceTickStep(): number {
+        const { minMove } = this.options.priceFormat;
+        const target: number = this.niceStep(56 / Math.abs(this.scaleY));
+        if (!(minMove > 0)) return target;
+        const steps: number = Math.ceil(target / minMove - 1e-9);
+        return Math.max(minMove, steps * minMove);
     }
 
     private formatTimeAtIndex(index: number): string {
         if (this.timeValues.length === 0) return this.formatAxisValue(index);
-
         const candleIndex: number = this.nearestCandleIndex(index);
-        const timestamp: number = this.timeValues[candleIndex];
+        return this.formatTimeAtTimestamp(this.timeValues[candleIndex]);
+    }
+
+    /** Formats a real candle timestamp, choosing detail from the visible span. */
+    private formatTimeAtTimestamp(timestamp: number): string {
         const date: Date = new Date(timestamp);
-        const cssWidth: number = this.canvas.width / this.devicePixelRatio;
-        const firstVisibleIndex: number = this.nearestCandleIndex(-this.offsetX / this.scaleX);
-        const lastVisibleIndex: number = this.nearestCandleIndex((cssWidth - this.offsetX) / this.scaleX);
+        const { locale, timeZone } = this.options;
+        // Detail level depends on the visible span, so cache per span bucket.
+        const viewport: ChartViewport = this.viewport;
+        const firstVisibleIndex: number = this.nearestCandleIndex(coordinateToIndex(viewport, 0));
+        const lastVisibleIndex: number = this.nearestCandleIndex(coordinateToIndex(viewport, viewport.cssWidth));
         const visibleSpan: number = Math.abs(this.timeValues[lastVisibleIndex] - this.timeValues[firstVisibleIndex]);
-        const options: Intl.DateTimeFormatOptions = visibleSpan < 2 * 24 * 60 * 60 * 1000
-            ? { month: 'short', day: '2-digit', hour: '2-digit', minute: '2-digit' }
+        const detail: 'minute' | 'day' | 'month' = visibleSpan < 2 * 24 * 60 * 60 * 1000
+            ? 'minute'
             : visibleSpan < 365 * 24 * 60 * 60 * 1000
-                ? { month: 'short', day: '2-digit' }
-                : { year: 'numeric', month: 'short' };
-        return new Intl.DateTimeFormat(undefined, options).format(date);
+                ? 'day'
+                : 'month';
+        const key: string = `${locale}|${timeZone}|${detail}`;
+        if (this.timeFormatter === null || this.timeFormatterKey !== key) {
+            const options: Intl.DateTimeFormatOptions = detail === 'minute'
+                ? { month: 'short', day: '2-digit', hour: '2-digit', minute: '2-digit', timeZone }
+                : detail === 'day'
+                    ? { month: 'short', day: '2-digit', timeZone }
+                    : { year: 'numeric', month: 'short', timeZone };
+            this.timeFormatter = new Intl.DateTimeFormat(locale, options);
+            this.timeFormatterKey = key;
+        }
+        return this.timeFormatter.format(date);
     }
 
     private nearestCandleIndex(index: number): number {
-        return Math.max(0, Math.min(this.timeValues.length - 1, Math.round(index)));
+        return clampCandleIndex(index, this.timeValues.length);
     }
 
     private niceStep(targetStep: number): number {
@@ -321,11 +388,5 @@ public init(canvas: HTMLCanvasElement, emitter: EventEmitter<ChartEvents>): void
         const normalized: number = targetStep / magnitude;
         const factor: number = normalized <= 1 ? 1 : normalized <= 2 ? 2 : normalized <= 5 ? 5 : 10;
         return factor * magnitude;
-    }
-
-    private getVisiblePriceRange(cssHeight: number): [number, number] {
-        const priceAtTop: number = -this.offsetY / this.scaleY;
-        const priceAtBottom: number = (cssHeight - this.offsetY) / this.scaleY;
-        return [Math.min(priceAtTop, priceAtBottom), Math.max(priceAtTop, priceAtBottom)];
     }
 }

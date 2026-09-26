@@ -1,4 +1,4 @@
-import { LTTBDownsampler } from './LTTBDownsampler';
+import { LTTBDownsampler } from './LTTBDownsampler.js';
 
 export class OHLCPyramid {
     private levels: Float32Array[] = [];

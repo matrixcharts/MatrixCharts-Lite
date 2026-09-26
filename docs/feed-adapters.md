@@ -1,5 +1,7 @@
 # Candle Feed Adapters
 
+This is the **v1** wire protocol. See [v1-contract.md](v1-contract.md) for the frozen client surface.
+
 `CandleSource` is the transport boundary. A source exposes `state`, `subscribe()`, `start()`, and `stop()`. `ChartFeedController` binds source messages to `Chart.replaceData()`, `Chart.appendBatch()`, and `Chart.updateLast()` and disposes both the subscription and source.
 
 ## WebSocket Message Format

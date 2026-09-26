@@ -63,11 +63,36 @@
         .feed-controls button:hover {
             border-color: var(--accent);
         }
+        .feed-controls input[type="color"] {
+            width: 34px;
+            min-height: 34px;
+            padding: 2px;
+        }
+        .swatch {
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            font-size: 13px;
+            color: #8b949e;
+        }
         #feed-status {
             margin-left: auto;
             color: #8b949e;
             font-size: 13px;
         }
+        /* Phase 2 read API: OHLC for the bar under the pointer, read from the
+           public API only. No private field access. */
+        #readout {
+            width: min(800px, 100%);
+            margin-bottom: 12px;
+            padding: 10px 12px;
+            border: 1px solid var(--control-border);
+            border-radius: 4px;
+            background: var(--control-bg);
+            font: 13px ui-monospace, SFMono-Regular, Menlo, monospace;
+            white-space: pre-wrap;
+        }
+        #readout .muted { color: #8b949e; }
         /* This is the target container we pass to the library */
         #chart-container {
             width: 800px;
@@ -88,6 +113,41 @@
             <option value="dark">Dark</option>
             <option value="paper">Paper</option>
         </select>
+        <label class="swatch">Up <input id="candle-up" type="color" value="#1ad98c" aria-label="Up candle colour"></label>
+        <label class="swatch">Down <input id="candle-down" type="color" value="#f24059" aria-label="Down candle colour"></label>
+        <label class="swatch">Wicks
+            <select id="candle-wicks" aria-label="Wick visibility">
+                <option value="true">on</option>
+                <option value="false">off</option>
+            </select>
+        </label>
+        <label class="swatch">Borders
+            <select id="candle-borders" aria-label="Body border visibility">
+                <option value="false">off</option>
+                <option value="true">on</option>
+            </select>
+        </label>
+        <label class="swatch">Cross
+            <select id="crosshair-visible" aria-label="Crosshair visibility">
+                <option value="true">on</option>
+                <option value="false">off</option>
+            </select>
+        </label>
+        <label class="swatch">Grid
+            <select id="grid-mode" aria-label="Grid lines">
+                <option value="both">both</option>
+                <option value="vert">vertical</option>
+                <option value="horz">horizontal</option>
+                <option value="none">none</option>
+            </select>
+        </label>
+        <label class="swatch">Dp
+            <select id="price-precision" aria-label="Price precision">
+                <option value="0">0</option>
+                <option value="2" selected>2</option>
+                <option value="4">4</option>
+            </select>
+        </label>
         <select id="feed-kind" aria-label="Feed type">
             <option value="mock">Mock feed</option>
             <option value="websocket">WebSocket</option>
@@ -97,7 +157,8 @@
         <button id="feed-disconnect" type="button" disabled>Disconnect</button>
         <span id="feed-status" role="status">disconnected</span>
     </div>
-    
+    <div id="readout">move the pointer over the chart</div>
+
     <!-- The Empty Container -->
     <div id="chart-container"></div>
 
@@ -111,18 +172,122 @@
         } from './src/index.ts';
 
         const theme = document.querySelector('#chart-theme');
-        const chart = new Chart('chart-container', { theme: theme.value });
+        const container = document.getElementById('chart-container');
+        const chart = new Chart(container, { theme: theme.value });
         const kind = document.querySelector('#feed-kind');
         const url = document.querySelector('#feed-url');
         const connectButton = document.querySelector('#feed-connect');
         const disconnectButton = document.querySelector('#feed-disconnect');
         const status = document.querySelector('#feed-status');
+        const readout = document.querySelector('#readout');
         let feedController = null;
 
-        theme.addEventListener('change', () => {
-            chart.setTheme(theme.value);
-            document.body.dataset.theme = theme.value;
+        // Everything below is public API from the v1 contract: the demo never
+        // reaches into offsetX, scaleX, or the candle store, and it does not
+        // re-implement hit-testing to find the bar under the pointer.
+        const formatPrice = (value) => value.toFixed(2);
+        const formatIndex = (value) => Number.isInteger(value) ? String(value) : value.toFixed(2);
+        const paintReadout = () => {
+            const count = chart.getCandleCount();
+            const range = chart.getVisibleLogicalRange();
+            const times = chart.getVisibleTimeRange();
+            if (count === 0) {
+                readout.innerHTML = '<span class="muted">no data</span>';
+                return;
+            }
+            const spacing = formatIndex(chart.getBarSpacing());
+            const visible = `${formatIndex(range.from)}..${formatIndex(range.to)} of ${count}`;
+            const window_ = times
+                ? `${new Date(times.from).toISOString().slice(0, 16).replace('T', ' ')} .. ${new Date(times.to).toISOString().slice(0, 16).replace('T', ' ')}`
+                : 'off screen';
+            readout.textContent = `barSpacing ${spacing}px   visible ${visible}   time ${window_}`;
+        };
+
+        chart.subscribeCrosshairMove((event) => {
+            if (!event.candle) {
+                paintReadout();
+                return;
+            }
+            const candle = event.candle;
+            readout.textContent = [
+                `index ${event.index}   x ${event.x.toFixed(1)}   y ${event.y.toFixed(1)}   t ${new Date(event.time).toISOString()}`,
+                `O ${formatPrice(candle.open)}  H ${formatPrice(candle.high)}  L ${formatPrice(candle.low)}  C ${formatPrice(candle.close)}`,
+                `price at pointer ${formatPrice(event.price)}   round trip x ${chart.indexToCoordinate(event.index).toFixed(1)}`,
+            ].join('\n');
         });
+
+        chart.subscribeClick((event) => {
+            status.textContent = event.candle
+                ? `clicked index ${event.index} @ ${new Date(event.time).toISOString().slice(11, 19)}`
+                : `clicked empty space (button ${event.button})`;
+        });
+
+        chart.subscribeVisibleRangeChange((event) => {
+            const from = event.logical.from;
+            const to = event.logical.to;
+            const span = event.time
+                ? `${new Date(event.time.from).toISOString().slice(5, 16).replace('T', ' ')} .. ${new Date(event.time.to).toISOString().slice(5, 16).replace('T', ' ')}`
+                : 'off screen';
+            status.title = `visible ${formatIndex(from)}..${formatIndex(to)} at ${formatIndex(event.barSpacing)}px/bar  ${span}`;
+        });
+
+        theme.addEventListener('change', () => {
+            // Phase 4: the theme toggle is just an applyOptions call. Colours the
+            // user set explicitly below survive the preset switch.
+            chart.applyOptions({ theme: theme.value });
+            document.body.dataset.theme = theme.value;
+            syncSwatchesToOptions();
+        });
+
+        const upInput = document.querySelector('#candle-up');
+        const downInput = document.querySelector('#candle-down');
+        const wicksInput = document.querySelector('#candle-wicks');
+        const bordersInput = document.querySelector('#candle-borders');
+        const crosshairInput = document.querySelector('#crosshair-visible');
+        const gridInput = document.querySelector('#grid-mode');
+        const precisionInput = document.querySelector('#price-precision');
+
+        upInput.addEventListener('input', () => {
+            chart.applyOptions({ candlestick: { upColor: upInput.value } });
+        });
+        downInput.addEventListener('input', () => {
+            chart.applyOptions({ candlestick: { downColor: downInput.value } });
+        });
+        wicksInput.addEventListener('change', () => {
+            chart.applyOptions({ candlestick: { wickVisible: wicksInput.value === 'true' } });
+        });
+        bordersInput.addEventListener('change', () => {
+            chart.applyOptions({ candlestick: { borderVisible: bordersInput.value === 'true' } });
+        });
+        crosshairInput.addEventListener('change', () => {
+            chart.applyOptions({ crosshair: { visible: crosshairInput.value === 'true' } });
+        });
+        gridInput.addEventListener('change', () => {
+            chart.applyOptions({
+                grid: {
+                    vertLines: gridInput.value === 'both' || gridInput.value === 'vert',
+                    horzLines: gridInput.value === 'both' || gridInput.value === 'horz',
+                },
+            });
+        });
+        precisionInput.addEventListener('change', () => {
+            const precision = Number(precisionInput.value);
+            chart.applyOptions({ priceFormat: { precision } });
+        });
+
+        /** Reflects the resolved snapshot back into the controls after a theme change. */
+        const syncSwatchesToOptions = () => {
+            const options = chart.options();
+            upInput.value = options.candlestick.upColor;
+            downInput.value = options.candlestick.downColor;
+            wicksInput.value = String(options.candlestick.wickVisible);
+            bordersInput.value = String(options.candlestick.borderVisible);
+            crosshairInput.value = String(options.crosshair.visible);
+            gridInput.value = options.grid.vertLines && options.grid.horzLines
+                ? 'both'
+                : options.grid.vertLines ? 'vert' : options.grid.horzLines ? 'horz' : 'none';
+            precisionInput.value = String(options.priceFormat.precision);
+        };
 
         kind.addEventListener('change', () => {
             url.hidden = kind.value !== 'websocket';
@@ -131,6 +296,7 @@
         connectButton.addEventListener('click', () => {
             if (feedController) feedController.dispose();
             chart.setData([]);
+            paintReadout();
             const source = kind.value === 'mock'
                 ? new MockCandleSource()
                 : new WebSocketCandleSource(url.value);
@@ -151,6 +317,7 @@
             if (feedController) feedController.dispose();
             feedController = null;
             chart.setData([]);
+            paintReadout();
             status.textContent = 'disconnected';
             connectButton.disabled = false;
             disconnectButton.disabled = true;
@@ -162,6 +329,8 @@
         });
 
         connectButton.click();
+        // Keep the idle readout in step with a live feed that appends on its own.
+        setInterval(paintReadout, 500);
     </script>
 </body>
 </html>

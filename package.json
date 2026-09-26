@@ -1,18 +1,46 @@
 {
   "name": "matrixcharts",
   "version": "1.0.0",
-  "description": "",
-  "main": "index.js",
-"scripts": {
-  "dev": "vite",
-  "build": "tsc",
-    "test": "tsc --module commonjs --outDir .test-build && node --test tests/OHLCPyramid.test.cjs tests/CandleFeed.test.cjs tests/StreamingIntegration.test.cjs tests/CandlestickLayout.test.cjs",
-  "benchmark": "tsc --module commonjs --outDir .test-build && node benchmarks/sustained-feed.cjs"
-},
-  "keywords": [],
-  "author": "",
+  "description": "WebGL2 candlestick chart with a sequenced live candle feed.",
   "license": "ISC",
-  "type": "commonjs",
+  "type": "module",
+  "main": "./dist/cjs/index.js",
+  "module": "./dist/esm/index.js",
+  "types": "./dist/esm/index.d.ts",
+  "exports": {
+    ".": {
+      "import": {
+        "types": "./dist/esm/index.d.ts",
+        "default": "./dist/esm/index.js"
+      },
+      "require": {
+        "types": "./dist/cjs/index.d.ts",
+        "default": "./dist/cjs/index.js"
+      }
+    }
+  },
+  "files": [
+    "dist",
+    "docs"
+  ],
+  "sideEffects": false,
+  "scripts": {
+    "dev": "vite",
+    "build": "npm run build:esm && npm run build:cjs",
+    "build:esm": "tsc -p tsconfig.json",
+    "build:cjs": "tsc -p tsconfig.cjs.json && node scripts/write-dual-package-json.cjs",
+    "prepack": "npm run build",
+    "test": "tsc -p tsconfig.test.json && node scripts/write-dual-package-json.cjs && node --test tests/OHLCPyramid.test.cjs tests/CandleFeed.test.cjs tests/StreamingIntegration.test.cjs tests/CandlestickLayout.test.cjs tests/Coordinates.test.cjs tests/Options.test.cjs tests/PublicApi.test.cjs tests/ChartContainer.test.cjs",
+    "verify:package": "npm run build && node scripts/verify-package.mjs",
+    "verify": "npm test && npm run verify:package",
+    "benchmark": "tsc -p tsconfig.test.json && node scripts/write-dual-package-json.cjs && node benchmarks/sustained-feed.cjs"
+  },
+  "keywords": [
+    "candlestick",
+    "chart",
+    "webgl2",
+    "ohlc"
+  ],
   "devDependencies": {
     "typescript": "^7.0.2",
     "vite": "^8.3.1"

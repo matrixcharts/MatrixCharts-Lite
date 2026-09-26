@@ -1,5 +1,5 @@
-import type { CandleData } from '../core/CandleData';
-import type { CandleFeedMessage, CandleSource, CandleSourceState, CandleTarget } from './CandleSource';
+import type { CandleData } from '../core/CandleData.js';
+import type { CandleFeedMessage, CandleSource, CandleSourceState, CandleTarget } from './CandleSource.js';
 
 export class ChartFeedController {
     private readonly unsubscribe: () => void;

@@ -1,5 +1,5 @@
-import type { CandleData } from '../core/CandleData';
-import type { CandleFeedMessage, CandleSource, CandleSourceState } from './CandleSource';
+import type { CandleData } from '../core/CandleData.js';
+import type { CandleFeedMessage, CandleSource, CandleSourceState } from './CandleSource.js';
 
 type FeedListener = (message: CandleFeedMessage) => void;
 type StateListener = (state: CandleSourceState) => void;

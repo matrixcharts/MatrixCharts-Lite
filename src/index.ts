@@ -1,20 +1,34 @@
-// src/index.ts
-
-export { Chart } from './core/Chart';
-export type { CandleData } from './core/CandleData';
-export type { ChartOptions, ChartTheme } from './core/ChartOptions';
-export type { IRenderer } from './core/IRenderer';
-export { WebGL2Renderer } from './renderers/WebGL2Renderer';
-export { LTTBDownsampler } from './math/LTTBDownsampler';
+export { Chart } from './core/Chart.js';
+export type { CandleData } from './core/CandleData.js';
 export type {
-	CandleFeedMessage,
-	CandleSource,
-	CandleSourceState,
-	CandleTarget,
-	WebSocketCandleSourceOptions,
-} from './feed';
+    CandlestickOptions,
+    ChartOptions,
+    ChartTheme,
+    CrosshairOptions,
+    GridOptions,
+    LayoutOptions,
+    PriceFormatOptions,
+    ResolvedChartOptions,
+    TimeScaleOptions,
+} from './core/options.js';
+export type { LogicalRange, TimeRange } from './core/coordinates.js';
+export type {
+    ChartClickEvent,
+    CrosshairCleared,
+    CrosshairData,
+    CrosshairMoveEvent,
+    Unsubscribe,
+    VisibleRangeEvent,
+} from './core/ChartEvents.js';
+export type {
+    CandleFeedMessage,
+    CandleSource,
+    CandleSourceState,
+    CandleTarget,
+    WebSocketCandleSourceOptions,
+} from './feed/index.js';
 export {
-	ChartFeedController,
-	MockCandleSource,
-	WebSocketCandleSource,
-} from './feed';
+    ChartFeedController,
+    MockCandleSource,
+    WebSocketCandleSource,
+} from './feed/index.js';

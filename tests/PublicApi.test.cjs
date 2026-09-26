@@ -1,0 +1,45 @@
+const assert = require('node:assert/strict');
+const { test } = require('node:test');
+const publicApi = require('../.test-build/index.js');
+
+const VALUE_EXPORTS = [
+    'Chart',
+    'ChartFeedController',
+    'MockCandleSource',
+    'WebSocketCandleSource',
+];
+
+test('package entry exports only the v1 public surface', () => {
+    const exportedNames = Object.keys(publicApi).filter((name) => name !== '__esModule').sort();
+    assert.deepEqual(exportedNames, VALUE_EXPORTS.slice().sort());
+    for (const name of VALUE_EXPORTS) {
+        assert.equal(typeof publicApi[name], 'function');
+    }
+});
+
+test('internal renderers, math, and test hooks stay unexported', () => {
+    for (const internal of [
+        'IRenderer',
+        'WebGL2Renderer',
+        'Canvas2DRenderer',
+        'OHLCPyramid',
+        'LTTBDownsampler',
+        'candlestickBodyEdgesData',
+        'EventEmitter',
+        'resolveChartContainer',
+    ]) {
+        assert.equal(internal in publicApi, false, `${internal} must not be exported`);
+    }
+    for (const hook of ['testDrawWebGLData', 'testDrawWebGLCandlesticks']) {
+        assert.equal(typeof publicApi.Chart.prototype[hook], 'undefined');
+    }
+});
+
+test('no public export is reachable only through a deep path', () => {
+    // A leaked deep import means the barrel in src/index.ts is incomplete.
+    for (const name of VALUE_EXPORTS) {
+        assert.equal(typeof publicApi[name].name, 'string');
+    }
+    assert.equal(publicApi.Chart.prototype.constructor, publicApi.Chart);
+});
+

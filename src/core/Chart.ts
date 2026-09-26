@@ -1,12 +1,43 @@
 // src/core/Chart.ts
-import type { IRenderer } from './IRenderer';
-import { WebGL2Renderer } from '../renderers/WebGL2Renderer';
-import { Canvas2DRenderer } from '../renderers/Canvas2DRenderer';
-import { OHLCPyramid } from '../math/OHLCPyramid';
-import { DEFAULT_CANDLE_SPACING_PX } from '../math/candlestickBodyWidth';
-import { EventEmitter, ChartEvents } from './EventEmitter';
-import type { CandleData } from './CandleData';
-import type { ChartOptions, ChartTheme } from './ChartOptions';
+import type { IRenderer } from './IRenderer.js';
+import { WebGL2Renderer } from '../renderers/WebGL2Renderer.js';
+import { Canvas2DRenderer } from '../renderers/Canvas2DRenderer.js';
+import { OHLCPyramid } from '../math/OHLCPyramid.js';
+import { DEFAULT_CANDLE_SPACING_PX } from '../math/candlestickBodyWidth.js';
+import { EventEmitter, ChartEvents } from './EventEmitter.js';
+import type { CandleData } from './CandleData.js';
+import type { ChartOptions, ChartTheme, ResolvedCandleColors, ResolvedChartOptions } from './options.js';
+import { mergeOptionPartials, resolveCandleColors, resolveOptions } from './options.js';
+import { resolveChartContainer } from './resolveChartContainer.js';
+import type {
+    ChartClickEvent,
+    CrosshairMoveEvent,
+    Unsubscribe,
+    VisibleRangeEvent,
+} from './ChartEvents.js';
+import {
+    type ChartViewport,
+    type LogicalRange,
+    type TimeRange,
+    type VisibleRangeSnapshot,
+    coordinateToIndex,
+    coordinateToPrice,
+    indexToCoordinate,
+    isAtLiveEdgeOffset,
+    isSameVisibleRange,
+    liveEdgeOffsetX,
+    nearestCandleIndex,
+    nearestCandleIndexByTime,
+    priceToCoordinate,
+    visibleLogicalRange,
+} from './coordinates.js';
+
+/** Container size assumed before the first layout pass. */
+const FALLBACK_CSS_WIDTH = 800;
+const FALLBACK_CSS_HEIGHT = 500;
+
+/** Pointer travel, in CSS pixels, that turns a press into a pan rather than a click. */
+const CLICK_SLOP_PX = 4;
 
 export class Chart {
     private container: HTMLElement;
@@ -34,28 +65,63 @@ export class Chart {
     private pendingAppends: CandleData[] = [];
     private pendingLastUpdate: CandleData | null = null;
     private pendingReplace: boolean = false;
-    private theme: ChartTheme;
 
-    constructor(containerId: string, options: ChartOptions = {}) {
-        const maxRetainedCandles: number = options.maxRetainedCandles ?? 1_000_000;
-        if (!Number.isSafeInteger(maxRetainedCandles) || maxRetainedCandles < 1) {
-            throw new Error('MatrixCharts: maxRetainedCandles must be a positive safe integer.');
-        }
-        this.maxRetainedCandles = maxRetainedCandles;
-        this.theme = options.theme ?? 'dark';
-        if (this.theme !== 'dark' && this.theme !== 'paper') {
-            throw new Error('MatrixCharts: theme must be either dark or paper.');
-        }
+    /**
+     * Caller-supplied partials, accumulated across every applyOptions. Kept so a
+     * theme change can re-seed from the new preset and still re-apply these.
+     */
+    private explicitOptions: ChartOptions;
+    private resolvedOptions: ResolvedChartOptions;
+    /** CSS colours parsed to vec4 once per apply, never per candle. */
+    private candleColors: ResolvedCandleColors;
 
-        const el = document.getElementById(containerId);
-        if (!el) throw new Error(`MatrixCharts: Container '${containerId}' not found.`);
-        this.container = el;
+    // Crosshair state is owned by Chart, not by the UI layer, so the drawn
+    // crosshair and the public crosshairMove event always agree.
+    private crosshairX: number | null = null;
+    private crosshairY: number | null = null;
+    private crosshairIndex: number = -1;
+    private crosshairCandle: CandleData | null = null;
+
+    private crosshairHandlers: Set<(event: CrosshairMoveEvent) => void> = new Set();
+    private clickHandlers: Set<(event: ChartClickEvent) => void> = new Set();
+    private visibleRangeHandlers: Set<(event: VisibleRangeEvent) => void> = new Set();
+
+    // Distinguishes a click from the end of a pan or pinch.
+    private pressX: number = 0;
+    private pressY: number = 0;
+    private pressButton: number = 0;
+    private pressMoved: boolean = false;
+    /** Last raw pointer position in client coordinates, for viewport changes. */
+    private pointerClientX: number = 0;
+    private pointerClientY: number = 0;
+
+    private lastReportedRange: VisibleRangeSnapshot | null = null;
+    private scheduledRangeFrame: number | null = null;
+
+    /**
+     * Mounts a chart into an existing element, or into `document.getElementById(container)`.
+     * WebGL2 is required.
+     *
+     * Constructor options are the initial `applyOptions`. `maxRetainedCandles` is
+     * accepted here only; every other field may be changed later.
+     */
+    constructor(container: HTMLElement | string, options: ChartOptions = {}) {
+        // Resolved up front so a bad colour or precision throws before any DOM
+        // or GPU resource is created.
+        const initial: ResolvedChartOptions = resolveOptions(options);
+        this.explicitOptions = mergeOptionPartials({}, options, 'constructor');
+        this.resolvedOptions = initial;
+        this.candleColors = resolveCandleColors(initial);
+        this.maxRetainedCandles = initial.maxRetainedCandles;
+
+        this.container = resolveChartContainer(container);
 
         this.canvasWrapper = document.createElement('div');
         this.canvasWrapper.style.position = 'relative';
         this.canvasWrapper.style.width = '100%';
         this.canvasWrapper.style.height = '100%';
         this.canvasWrapper.style.touchAction = 'none';
+        this.canvasWrapper.style.backgroundColor = initial.layout.background;
         this.container.appendChild(this.canvasWrapper);
 
         // Initialize layers
@@ -69,7 +135,7 @@ export class Chart {
         this.renderers.push(gridRenderer);
 
         // Layer 1: GPU Data
-        const dataRenderer = new WebGL2Renderer(); 
+        const dataRenderer = new WebGL2Renderer();
         dataRenderer.init(dataCanvas, this.emitter);
         this.renderers.push(dataRenderer);
 
@@ -77,7 +143,7 @@ export class Chart {
         const uiRenderer = new Canvas2DRenderer(false);
         uiRenderer.init(uiCanvas, this.emitter);
         this.renderers.push(uiRenderer);
-        this.emitter.emit('theme', this.theme);
+        this.emitter.emit('options', initial);
 
         // Bind the resize observer to the wrapper
         this.resizeObserver = new ResizeObserver((entries) => {
@@ -99,7 +165,10 @@ export class Chart {
         canvas.style.top = '0';
         canvas.style.left = '0';
         canvas.style.transformOrigin = 'top left';
-        canvas.style.pointerEvents = zIndex === 2 ? 'auto' : 'none'; // Top layer catches mouse events
+        // Every layer is transparent to the pointer. The wrapper is the single
+        // input surface, so hit-testing lives in one place instead of being
+        // duplicated per canvas.
+        canvas.style.pointerEvents = 'none';
         canvas.style.zIndex = zIndex.toString();
         this.canvasWrapper.appendChild(canvas);
         return canvas;
@@ -132,26 +201,63 @@ export class Chart {
         this.canvasWrapper.addEventListener('pointerup', this.handlePointerEnd);
         this.canvasWrapper.addEventListener('pointercancel', this.handlePointerEnd);
         this.canvasWrapper.addEventListener('lostpointercapture', this.handlePointerEnd);
+        this.canvasWrapper.addEventListener('pointerleave', this.handlePointerLeave);
         this.canvasWrapper.addEventListener('wheel', this.handleWheel, { passive: false });
     }
 
     private handlePointerDown = (event: PointerEvent): void => {
         if (event.pointerType === 'mouse' && event.button !== 0) return;
-        this.canvasWrapper.setPointerCapture(event.pointerId);
+        // Record the press before capturing. Capture is best effort, so a stale
+        // pointer id must not stop the chart from tracking press and pan.
         this.activePointers.set(event.pointerId, { x: event.clientX, y: event.clientY });
+        this.pressX = event.clientX;
+        this.pressY = event.clientY;
+        this.pressButton = event.button;
+        this.pressMoved = false;
+        this.capturePointer(event.pointerId);
 
         if (this.activePointers.size === 1) {
             this.isDragging = true;
             this.lastPointerX = event.clientX;
         } else if (this.activePointers.size === 2) {
             this.isDragging = false;
+            this.pressMoved = true;
             this.resetPinchBaseline();
         }
     };
 
+    /**
+     * Pointer capture keeps a drag alive when the pointer leaves the chart. It
+     * throws for a pointer the browser no longer considers active, and that must
+     * degrade to "no capture" rather than break the gesture, because the events
+     * still reach the wrapper by bubbling.
+     */
+    private capturePointer(pointerId: number): void {
+        try {
+            this.canvasWrapper.setPointerCapture(pointerId);
+        } catch {
+            // Intentionally ignored; bubbling still delivers pointerup here.
+        }
+    }
+
     private handlePointerMove = (event: PointerEvent): void => {
+        this.pointerClientX = event.clientX;
+        this.pointerClientY = event.clientY;
+        // Hover tracking is independent of the buttons: the crosshair has to
+        // follow the pointer before any press, which is the common case.
+        if (!this.isInteracting()) {
+            this.updateCrosshair(event.clientX, event.clientY);
+        }
+
         if (!this.activePointers.has(event.pointerId)) return;
         this.activePointers.set(event.pointerId, { x: event.clientX, y: event.clientY });
+
+        if (
+            Math.abs(event.clientX - this.pressX) > CLICK_SLOP_PX ||
+            Math.abs(event.clientY - this.pressY) > CLICK_SLOP_PX
+        ) {
+            this.pressMoved = true;
+        }
 
         if (this.activePointers.size >= 2) {
             this.handlePinchMove();
@@ -167,6 +273,7 @@ export class Chart {
     };
 
     private handlePointerEnd = (event: PointerEvent): void => {
+        const wasSinglePointer: boolean = this.activePointers.size === 1;
         this.activePointers.delete(event.pointerId);
 
         if (this.activePointers.size === 1) {
@@ -174,13 +281,37 @@ export class Chart {
             this.isDragging = true;
             this.lastPointerX = remainingPointer?.x ?? 0;
             this.lastPinchDistance = 0;
+            this.pressMoved = true;
         } else if (this.activePointers.size === 0) {
             this.isDragging = false;
             this.lastPinchDistance = 0;
+            // A press that never travelled is a click; one that travelled was a pan.
+            if (wasSinglePointer && !this.pressMoved) {
+                this.emitClick(event.clientX, event.clientY, this.pressButton);
+            }
+            this.pressMoved = false;
         } else {
             this.resetPinchBaseline();
         }
+
+        // Touch and pen have no hover state, so the crosshair must not linger
+        // after the contact lifts.
+        if (event.pointerType === 'mouse') {
+            this.updateCrosshair(event.clientX, event.clientY);
+        } else {
+            this.clearCrosshair();
+        }
     };
+
+    private handlePointerLeave = (): void => {
+        if (this.isInteracting()) return;
+        this.clearCrosshair();
+    };
+
+    /** A drag or pinch is under way, so pointer movement is not hover. */
+    private isInteracting(): boolean {
+        return this.isDragging || this.activePointers.size >= 2;
+    }
 
     private handleWheel = (event: WheelEvent): void => {
         event.preventDefault();
@@ -193,8 +324,10 @@ export class Chart {
 
     private zoomAt(requestedFactor: number, anchorX: number): void {
         const previousScale: number = this.scaleX;
-        this.scaleX = Math.max(1e-4, Math.min(1e4, previousScale * requestedFactor));
-        const appliedFactor: number = this.scaleX / previousScale;
+        const nextScale: number = this.clampBarSpacing(previousScale * requestedFactor);
+        if (nextScale === previousScale) return;
+        const appliedFactor: number = nextScale / previousScale;
+        this.scaleX = nextScale;
         this.offsetX = anchorX - (anchorX - this.offsetX) * appliedFactor;
         this.followsLiveEdge = this.isAtLiveEdge();
         this.updateViewport();
@@ -205,14 +338,311 @@ export class Chart {
     }
 
     public setTheme(theme: ChartTheme): void {
-        if (theme !== 'dark' && theme !== 'paper') {
-            throw new Error('MatrixCharts: theme must be either dark or paper.');
+        this.applyOptions({ theme });
+    }
+
+    // --- Runtime options --------------------------------------------------------
+
+    /**
+     * Merges a partial over the current options and re-resolves. Throws
+     * `MatrixCharts: ...` before mutating anything if a value is invalid.
+     *
+     * A `theme` change re-seeds every color from that theme's preset and then
+     * re-applies any colour or setting the caller set explicitly, so an override
+     * survives a theme switch. `maxRetainedCandles` is rejected here; it is
+     * constructor-only in v1 because changing it rebuilds the retained pyramid
+     * under a live viewport.
+     */
+    public applyOptions(partial: ChartOptions): void {
+        if (partial === null || typeof partial !== 'object' || Array.isArray(partial)) {
+            throw new Error(`MatrixCharts: applyOptions expects an options object, received ${String(partial)}.`);
         }
-        if (this.theme === theme) return;
-        this.theme = theme;
-        this.canvasWrapper.style.backgroundColor = theme === 'dark' ? '#0b0f17' : '#f4f1e8';
-        this.emitter.emit('theme', theme);
+        // Resolve before mutating so a throw leaves the chart untouched.
+        const nextExplicit: ChartOptions = mergeOptionPartials(this.explicitOptions, partial);
+        const nextResolved: ResolvedChartOptions = resolveOptions(nextExplicit, this.resolvedOptions.theme);
+        const nextColors: ResolvedCandleColors = resolveCandleColors(nextResolved);
+
+        const previous: ResolvedChartOptions = this.resolvedOptions;
+        const previousSpacing: number = this.scaleX;
+        this.explicitOptions = nextExplicit;
+        this.resolvedOptions = nextResolved;
+        this.candleColors = nextColors;
+
+        this.canvasWrapper.style.backgroundColor = nextResolved.layout.background;
+
+        if (nextResolved.timeScale.barSpacing !== previous.timeScale.barSpacing) {
+            this.applyBarSpacing(nextResolved.timeScale.barSpacing, previousSpacing);
+        }
+        if (
+            nextResolved.timeScale.minBarSpacing !== previous.timeScale.minBarSpacing ||
+            nextResolved.timeScale.maxBarSpacing !== previous.timeScale.maxBarSpacing
+        ) {
+            // Re-clamp against the new bounds in case the current zoom is now illegal.
+            this.scaleX = this.clampBarSpacing(this.scaleX);
+        }
+
+        this.emitter.emit('options', nextResolved);
         this.updateViewport();
+    }
+
+    /** Fully resolved options. The returned object is a fresh, immutable snapshot. */
+    public options(): Readonly<ResolvedChartOptions> {
+        return this.resolvedOptions;
+    }
+
+    private clampBarSpacing(spacing: number): number {
+        const { minBarSpacing, maxBarSpacing } = this.resolvedOptions.timeScale;
+        return Math.max(minBarSpacing, Math.min(maxBarSpacing, spacing));
+    }
+
+    /**
+     * Sets bar spacing while holding the view still: a live-following chart stays
+     * pinned to the newest bar, anything else keeps the bar under the viewport
+     * centre where it was.
+     */
+    private applyBarSpacing(nextSpacing: number, previousSpacing: number): void {
+        const clamped: number = this.clampBarSpacing(nextSpacing);
+        if (previousSpacing <= 0 || clamped === previousSpacing) {
+            this.scaleX = clamped;
+            return;
+        }
+
+        if (this.followsLiveEdge) {
+            this.scaleX = clamped;
+            this.offsetX = liveEdgeOffsetX(this.viewport.cssWidth, this.candlePyramid.candleCount, clamped);
+            return;
+        }
+
+        const centreIndex: number = coordinateToIndex(this.viewport, this.viewport.cssWidth / 2);
+        this.scaleX = clamped;
+        this.offsetX = this.viewport.cssWidth / 2 - centreIndex * clamped;
+        this.followsLiveEdge = this.isAtLiveEdge();
+    }
+
+    // --- User events ------------------------------------------------------------
+    // Handlers are held in Sets and iterated over a copy, so subscribing or
+    // unsubscribing from inside a handler is safe and cannot skip a listener.
+
+    /** Fires as the pointer moves over the chart, and once when it leaves. */
+    public subscribeCrosshairMove(handler: (event: CrosshairMoveEvent) => void): Unsubscribe {
+        this.crosshairHandlers.add(handler);
+        return () => { this.crosshairHandlers.delete(handler); };
+    }
+
+    /** Fires on a press and release that did not turn into a pan or pinch. */
+    public subscribeClick(handler: (event: ChartClickEvent) => void): Unsubscribe {
+        this.clickHandlers.add(handler);
+        return () => { this.clickHandlers.delete(handler); };
+    }
+
+    /**
+     * Fires when the visible candle range or bar spacing changes, at most once
+     * per animation frame. A drag that stays inside one bar's width is silent.
+     */
+    public subscribeVisibleRangeChange(handler: (event: VisibleRangeEvent) => void): Unsubscribe {
+        this.visibleRangeHandlers.add(handler);
+        return () => { this.visibleRangeHandlers.delete(handler); };
+    }
+
+    private emitCrosshair(): void {
+        const payload: ChartEvents['crosshair'] = {
+            x: this.crosshairX,
+            y: this.crosshairY,
+            time: this.crosshairCandle ? this.crosshairCandle.time : null,
+            candle: this.crosshairCandle,
+        };
+        this.emitter.emit('crosshair', payload);
+        if (this.crosshairHandlers.size === 0) return;
+        const event: CrosshairMoveEvent = this.crosshairCandle
+            ? {
+                x: this.crosshairX as number,
+                y: this.crosshairY as number,
+                index: this.crosshairIndex,
+                time: this.crosshairCandle.time,
+                price: coordinateToPrice(this.viewport, this.crosshairY as number),
+                candle: this.crosshairCandle,
+            }
+            : { x: null, y: null, index: -1, time: null, price: null, candle: null };
+        for (const handler of Array.from(this.crosshairHandlers)) handler(event);
+    }
+
+    private updateCrosshair(clientX: number, clientY: number): void {
+        const rect: DOMRect = this.canvasWrapper.getBoundingClientRect();
+        const x: number = clientX - rect.left;
+        const y: number = clientY - rect.top;
+        const index: number = this.coordinateToNearestIndex(x);
+        const candle: CandleData | null = index < 0 ? null : this.getCandleAt(index);
+
+        if (!candle) {
+            this.clearCrosshair();
+            return;
+        }
+
+        // The crosshair snaps to the bar it points at; the price line keeps
+        // following the pointer so the price readout tracks the cursor.
+        const snappedX: number = this.indexToCoordinate(index);
+        if (this.crosshairX === snappedX && this.crosshairY === y && this.crosshairIndex === index) {
+            return;
+        }
+        this.crosshairX = snappedX;
+        this.crosshairY = y;
+        this.crosshairIndex = index;
+        this.crosshairCandle = candle;
+        this.emitCrosshair();
+    }
+
+    private clearCrosshair(): void {
+        if (this.crosshairX === null && this.crosshairY === null && this.crosshairCandle === null) return;
+        this.crosshairX = null;
+        this.crosshairY = null;
+        this.crosshairIndex = -1;
+        this.crosshairCandle = null;
+        this.emitCrosshair();
+    }
+
+    private emitClick(clientX: number, clientY: number, button: number): void {
+        if (this.clickHandlers.size === 0) return;
+        const rect: DOMRect = this.canvasWrapper.getBoundingClientRect();
+        const x: number = clientX - rect.left;
+        const y: number = clientY - rect.top;
+        const index: number = this.coordinateToNearestIndex(x);
+        const candle: CandleData | null = index < 0 ? null : this.getCandleAt(index);
+        const event: ChartClickEvent = candle
+            ? {
+                x: this.indexToCoordinate(index),
+                y,
+                index,
+                time: candle.time,
+                price: coordinateToPrice(this.viewport, y),
+                candle,
+                button,
+            }
+            : { x: null, y: null, index: -1, time: null, price: null, candle: null, button };
+        for (const handler of Array.from(this.clickHandlers)) handler(event);
+    }
+
+    // --- Public read API -------------------------------------------------------
+    // All synchronous, all CSS pixels relative to the container's top-left, and
+    // none of them copy the series. They read the same geometry the renderer
+    // draws with, so a value here always matches what is on screen.
+
+    /** Current plot geometry. Internal; exposed for the renderer and tests. */
+    private get viewport(): ChartViewport {
+        return {
+            offsetX: this.offsetX,
+            offsetY: this.offsetY,
+            scaleX: this.scaleX,
+            scaleY: this.scaleY,
+            cssWidth: this.canvasWrapper.clientWidth || FALLBACK_CSS_WIDTH,
+            cssHeight: this.canvasWrapper.clientHeight || FALLBACK_CSS_HEIGHT,
+        };
+    }
+
+    /** CSS pixels per candle index. */
+    public getBarSpacing(): number {
+        return this.scaleX;
+    }
+
+    /**
+     * Visible candle indices as a half-open range: `from` through `to - 1`.
+     * Partial bars at either edge are included, and `from === to` means the
+     * series is empty or fully scrolled out of view.
+     */
+    public getVisibleLogicalRange(): LogicalRange {
+        return visibleLogicalRange(this.viewport, this.candlePyramid.candleCount);
+    }
+
+    /**
+     * Epoch milliseconds of the first and last visible candles, both inclusive,
+     * or `null` when no candle is visible. Closed sessions are not interpolated,
+     * so the span can be wider than the elapsed visible time.
+     */
+    public getVisibleTimeRange(): TimeRange | null {
+        const { from, to } = this.getVisibleLogicalRange();
+        if (to <= from) return null;
+        const first: CandleData | null = this.getCandleAt(from);
+        const last: CandleData | null = this.getCandleAt(to - 1);
+        if (!first || !last) return null;
+        return { from: first.time, to: last.time };
+    }
+
+    /** Number of candles retained in chart memory. */
+    public getCandleCount(): number {
+        return this.candlePyramid.candleCount;
+    }
+
+    /**
+     * Retained candle at a zero-based ordinal index, or `null` when the index is
+     * out of range. Prices come back at float32 precision, matching what the
+     * renderer draws, so they may differ from the doubles that were passed in.
+     */
+    public getCandleAt(index: number): CandleData | null {
+        const candleCount: number = this.candlePyramid.candleCount;
+        if (!Number.isInteger(index) || index < 0 || index >= candleCount) return null;
+        const time: number | undefined = this.candleTimes[index];
+        if (time === undefined) return null;
+
+        const level: Float32Array = this.candlePyramid.getLevelData(0);
+        const offset: number = index * 6;
+        return {
+            time,
+            open: level[offset + 1],
+            high: level[offset + 2],
+            low: level[offset + 3],
+            close: level[offset + 4],
+        };
+    }
+
+    /** Newest retained candle, or `null` when the chart has no data. */
+    public getLastCandle(): CandleData | null {
+        return this.getCandleAt(this.candlePyramid.candleCount - 1);
+    }
+
+    /** Screen x of a candle index. */
+    public indexToCoordinate(index: number): number {
+        return indexToCoordinate(this.viewport, index);
+    }
+
+    /** Fractional candle index at a screen x. Not clamped to the series. */
+    public coordinateToIndex(coordinateX: number): number {
+        return coordinateToIndex(this.viewport, coordinateX);
+    }
+
+    /** Index of the candle nearest a screen x, or -1 when the chart has no data. */
+    public coordinateToNearestIndex(coordinateX: number): number {
+        return nearestCandleIndex(this.viewport, coordinateX, this.candlePyramid.candleCount);
+    }
+
+    /**
+     * Timestamp of the candle nearest a screen x, or `null` when the chart has no
+     * data. Snaps to a real candle time and never interpolates through a gap.
+     */
+    public coordinateToTime(coordinateX: number): number | null {
+        const index: number = this.coordinateToNearestIndex(coordinateX);
+        return index < 0 ? null : this.getCandleAt(index)?.time ?? null;
+    }
+
+    /**
+     * Screen x of the candle whose timestamp is nearest `time`, or `null` when
+     * the chart has no data. Inverse of `coordinateToTime` up to snapping.
+     */
+    public timeToCoordinate(time: number): number | null {
+        const index: number = nearestCandleIndexByTime(
+            this.candleTimes.length,
+            time,
+            (candidate: number): number => this.candleTimes[candidate],
+        );
+        return index < 0 ? null : this.indexToCoordinate(index);
+    }
+
+    /** Screen y of a price. */
+    public priceToCoordinate(price: number): number {
+        return priceToCoordinate(this.viewport, price);
+    }
+
+    /** Price at a screen y, using the current auto-fitted vertical scale. */
+    public coordinateToPrice(coordinateY: number): number {
+        return coordinateToPrice(this.viewport, coordinateY);
     }
 
     /** Replaces authoritative feed history while retaining the current time anchor when available. */
@@ -224,7 +654,7 @@ export class Chart {
         const previousCount: number = this.candlePyramid.candleCount;
         const previousFollowing: boolean = this.followsLiveEdge;
         const previousScale: number = this.scaleX;
-        const anchorScreenX: number = (this.canvasWrapper.clientWidth || 800) / 2;
+        const anchorScreenX: number = this.viewport.cssWidth / 2;
         const previousAnchorIndex: number = previousCount > 0
             ? Math.max(0, Math.min(previousCount - 1, Math.round((anchorScreenX - this.offsetX) / this.scaleX)))
             : 0;
@@ -266,8 +696,7 @@ export class Chart {
         if (preserveViewport && retainedLength > 0 && previousCount > 0) {
             this.scaleX = previousScale;
             if (previousFollowing) {
-                const cssWidth: number = this.canvasWrapper.clientWidth || 800;
-                this.offsetX = cssWidth - (retainedLength - 0.5) * this.scaleX;
+                this.offsetX = liveEdgeOffsetX(this.viewport.cssWidth, retainedLength, this.scaleX);
                 this.followsLiveEdge = true;
             } else if (anchorTime !== null) {
                 const retainedIndex: number = this.findNearestDataIndex(candles, retainedStart, anchorTime);
@@ -278,28 +707,19 @@ export class Chart {
             this.offsetX = 0;
             this.scaleX = 1;
         } else {
-            const cssWidth: number = this.canvasWrapper.clientWidth || 800;
             this.scaleX = DEFAULT_CANDLE_SPACING_PX;
-            this.offsetX = cssWidth - (retainedLength - 0.5) * this.scaleX;
+            this.offsetX = liveEdgeOffsetX(this.viewport.cssWidth, retainedLength, this.scaleX);
         }
         this.updateViewport();
     }
 
     private findNearestDataIndex(candles: readonly CandleData[], retainedStart: number, time: number): number {
-        let low: number = retainedStart;
-        let high: number = candles.length - 1;
-        while (low < high) {
-            const middle: number = Math.floor((low + high) / 2);
-            if (candles[middle].time < time) low = middle + 1;
-            else high = middle;
-        }
-
-        const upperIndex: number = low;
-        const lowerIndex: number = Math.max(retainedStart, upperIndex - 1);
-        const nearestIndex: number = Math.abs(candles[upperIndex].time - time) < Math.abs(candles[lowerIndex].time - time)
-            ? upperIndex
-            : lowerIndex;
-        return nearestIndex - retainedStart;
+        return nearestCandleIndexByTime(
+            candles.length,
+            time,
+            (index: number): number => candles[index].time,
+            retainedStart,
+        ) - retainedStart;
     }
 
     public appendData(candle: CandleData): void {
@@ -384,12 +804,12 @@ export class Chart {
     }
 
     private isAtLiveEdge(): boolean {
-        const candleCount: number = this.candlePyramid.candleCount;
-        if (candleCount === 0) return true;
-        const cssWidth: number = this.canvasWrapper.clientWidth || 800;
-        const lastCandleScreenX: number = this.offsetX + (candleCount - 1) * this.scaleX;
-        const edgeTolerance: number = Math.max(24, this.scaleX * 1.5);
-        return lastCandleScreenX >= cssWidth - edgeTolerance && lastCandleScreenX <= cssWidth + edgeTolerance;
+        return isAtLiveEdgeOffset(
+            this.offsetX,
+            this.scaleX,
+            this.candlePyramid.candleCount,
+            this.viewport.cssWidth,
+        );
     }
 
     private scheduleViewportUpdate(): void {
@@ -442,8 +862,11 @@ export class Chart {
             this.candlePyramid.reset(rawCandles);
             this.candleTimes = times;
             if (this.followsLiveEdge) {
-                const cssWidth: number = this.canvasWrapper.clientWidth || 800;
-                this.offsetX = cssWidth - (replacement.length - 0.5) * this.scaleX;
+                this.offsetX = liveEdgeOffsetX(
+                    this.viewport.cssWidth,
+                    replacement.length,
+                    this.scaleX,
+                );
             } else {
                 this.offsetX = 0;
             }
@@ -494,8 +917,11 @@ export class Chart {
         }
         if (shouldFollow && appends.length > 0) {
             if (overflow > 0) {
-                const cssWidth: number = this.canvasWrapper.clientWidth || 800;
-                this.offsetX = cssWidth - (this.candlePyramid.candleCount - 0.5) * this.scaleX;
+                this.offsetX = liveEdgeOffsetX(
+                    this.viewport.cssWidth,
+                    this.candlePyramid.candleCount,
+                    this.scaleX,
+                );
             } else {
                 this.offsetX -= this.scaleX * appends.length;
             }
@@ -535,7 +961,7 @@ export class Chart {
     private autoScaleY(): void {
         if (this.displayedCandles.length === 0) return;
 
-        const cssHeight = this.canvasWrapper.clientHeight || 500;
+        const cssHeight: number = this.viewport.cssHeight;
 
         let maxHigh = Number.NEGATIVE_INFINITY;
         let minLow = Number.POSITIVE_INFINITY;
@@ -564,17 +990,62 @@ export class Chart {
         this.updateVisibleCandles();
         this.autoScaleY();
         // Broadcast the spatial update to all subscribed renderers without coupling
-        this.emitter.emit('viewport', { 
-            offsetX: this.offsetX, 
-            offsetY: this.offsetY, 
-            scaleX: this.scaleX, 
-            scaleY: this.scaleY 
+        this.emitter.emit('viewport', {
+            offsetX: this.offsetX,
+            offsetY: this.offsetY,
+            scaleX: this.scaleX,
+            scaleY: this.scaleY
         });
         this.uploadVisibleCandles();
+        // A pan, zoom, or feed append moves the bars under a stationary pointer,
+        // so the crosshair has to be recomputed before the redraw that shows it.
+        this.refreshCrosshairAfterViewportChange();
         this.redraw();
+        this.scheduleVisibleRangeChange();
+    }
+
+    private refreshCrosshairAfterViewportChange(): void {
+        if (this.crosshairCandle === null) return;
+        if (this.isInteracting()) return;
+        this.updateCrosshair(this.pointerClientX, this.pointerClientY);
+    }
+
+    /**
+     * Coalesces range notifications to one per frame. updateViewport runs from
+     * pointer handlers that can fire faster than the display, and from a rAF
+     * callback during feed flushes; both collapse to a single event.
+     */
+    private scheduleVisibleRangeChange(): void {
+        if (this.visibleRangeHandlers.size === 0) return;
+        if (this.scheduledRangeFrame !== null) return;
+        this.scheduledRangeFrame = requestAnimationFrame(() => {
+            this.scheduledRangeFrame = null;
+            this.emitVisibleRangeChange();
+        });
+    }
+
+    private cancelScheduledVisibleRangeChange(): void {
+        if (this.scheduledRangeFrame === null) return;
+        cancelAnimationFrame(this.scheduledRangeFrame);
+        this.scheduledRangeFrame = null;
+    }
+
+    private emitVisibleRangeChange(): void {
+        if (this.visibleRangeHandlers.size === 0) return;
+        const logical: LogicalRange = this.getVisibleLogicalRange();
+        const barSpacing: number = this.scaleX;
+        if (isSameVisibleRange(this.lastReportedRange, logical, barSpacing)) return;
+        this.lastReportedRange = { logical, barSpacing };
+        const event: VisibleRangeEvent = {
+            logical,
+            time: this.getVisibleTimeRange(),
+            barSpacing,
+        };
+        for (const handler of Array.from(this.visibleRangeHandlers)) handler(event);
     }
 
     private updateVisibleCandles(): void {
+        const viewport: ChartViewport = this.viewport;
         if (this.candlePyramid.candleCount === 0) {
             this.displayedCandles = new Float32Array(0);
         } else {
@@ -589,8 +1060,8 @@ export class Chart {
             const aggregationFactor: number = Math.pow(2, levelIndex);
             const level: Float32Array = this.candlePyramid.getLevelData(levelIndex);
             const levelCount: number = this.candlePyramid.getLevelCount(levelIndex);
-            const visibleMinX: number = -this.offsetX / this.scaleX;
-            const visibleMaxX: number = (this.canvasWrapper.clientWidth - this.offsetX) / this.scaleX;
+            const visibleMinX: number = coordinateToIndex(viewport, 0);
+            const visibleMaxX: number = coordinateToIndex(viewport, viewport.cssWidth);
             const startBucket: number = Math.max(0, Math.floor(visibleMinX / aggregationFactor) - 1);
             const endBucket: number = Math.min(
                 levelCount,
@@ -605,79 +1076,38 @@ export class Chart {
 
     private uploadVisibleCandles(): void {
         const dataRenderer: WebGL2Renderer = this.renderers[1] as WebGL2Renderer;
-        const bullishColor: [number, number, number, number] = this.theme === 'dark'
-            ? [0.1, 0.85, 0.55, 1]
-            : [0.02, 0.48, 0.32, 1];
-        const bearishColor: [number, number, number, number] = this.theme === 'dark'
-            ? [0.95, 0.25, 0.35, 1]
-            : [0.76, 0.15, 0.2, 1];
+        // Colours were parsed to vec4 when the options were applied, so this
+        // per-frame path only copies four precomputed channels.
         dataRenderer.drawCandlesticks(
             this.displayedCandles,
-            bullishColor,
-            bearishColor,
+            this.candleColors,
+            this.resolvedOptions.candlestick.wickVisible,
+            this.resolvedOptions.candlestick.borderVisible,
         );
-        this.emitter.emit('data', { ohlc: this.displayedCandles, times: this.candleTimes });
+        this.emitter.emit('data', { times: this.candleTimes });
     }
 
     public destroy(): void {
         this.cancelScheduledViewportUpdate();
+        this.cancelScheduledVisibleRangeChange();
         document.removeEventListener('visibilitychange', this.handleVisibilityChange);
         this.canvasWrapper.removeEventListener('pointerdown', this.handlePointerDown);
         this.canvasWrapper.removeEventListener('pointermove', this.handlePointerMove);
         this.canvasWrapper.removeEventListener('pointerup', this.handlePointerEnd);
         this.canvasWrapper.removeEventListener('pointercancel', this.handlePointerEnd);
         this.canvasWrapper.removeEventListener('lostpointercapture', this.handlePointerEnd);
+        this.canvasWrapper.removeEventListener('pointerleave', this.handlePointerLeave);
         this.canvasWrapper.removeEventListener('wheel', this.handleWheel);
+        // Drop every subscriber so a destroyed chart cannot call back into
+        // application code, and so handlers are not retained by this instance.
+        this.crosshairHandlers.clear();
+        this.clickHandlers.clear();
+        this.visibleRangeHandlers.clear();
+        this.lastReportedRange = null;
         this.resizeObserver.disconnect();
         for (const renderer of this.renderers) {
             renderer.destroy();
         }
         this.container.innerHTML = ''; // Clean up DOM
-    }
-
-    public testDrawWebGLData(): void {
-        const dataRenderer = this.renderers[1] as WebGL2Renderer;
-        
-        const points = new Float32Array(20000); 
-        for (let i = 0; i < 10000; i++) {
-            const x = (i / 10000) * 800;
-            const y = 250 + Math.sin(i * 0.05) * 100;
-            points[i * 2] = x;
-            points[i * 2 + 1] = y;
-        }
-        
-        dataRenderer.drawLine(points, [0.0, 1.0, 1.0, 1.0]);
-        this.redraw();
-    }
-
-    public testDrawWebGLCandlesticks(): void {
-        const candleCount: number = 70;
-        const candles: CandleData[] = new Array<CandleData>(candleCount);
-        let randomState: number = 0x6d2b79f5;
-        let previousClose: number = 250;
-        const nextRandom = (): number => {
-            randomState = (randomState * 1664525 + 1013904223) >>> 0;
-            return randomState / 4294967296;
-        };
-
-        for (let candleIndex: number = 0; candleIndex < candleCount; candleIndex++) {
-            const gap: number = (nextRandom() - 0.5) * 10;
-            const open: number = Math.max(60, Math.min(440, previousClose + gap));
-            const directionalMove: number = (nextRandom() - 0.48) * 22;
-            const close: number = Math.max(60, Math.min(440, open + directionalMove));
-            const upperWick: number = 5 + nextRandom() * 14;
-            const lowerWick: number = 5 + nextRandom() * 14;
-            const high: number = Math.min(470, Math.max(open, close) + upperWick);
-            const low: number = Math.max(30, Math.min(open, close) - lowerWick);
-            candles[candleIndex] = {
-                time: Date.UTC(2025, 0, 1) + candleIndex * 60_000,
-                open,
-                high,
-                low,
-                close,
-            };
-            previousClose = close;
-        }
-        this.setData(candles);
     }
 }

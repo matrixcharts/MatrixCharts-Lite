@@ -1,9 +1,28 @@
 // src/core/EventEmitter.ts
+import type { CandleData } from './CandleData.js';
+import type { ResolvedChartOptions } from './options.js';
 
 export interface ChartEvents {
     'viewport': { offsetX: number; offsetY: number; scaleX: number; scaleY: number };
-    'data': { ohlc: Float32Array; times: readonly number[] };
-    'theme': 'dark' | 'paper';
+    /**
+     * Retained candle timestamps, used by the axis renderer to label ticks. The
+     * candle buffer itself is passed straight to the WebGL renderer rather than
+     * broadcast, so it is not copied per frame here.
+     */
+    'data': { times: readonly number[] };
+    /** Fully resolved options. Emitted once on construction and on every apply. */
+    'options': ResolvedChartOptions;
+    /**
+     * Crosshair state owned by Chart. The UI layer only draws from this; it never
+     * hit-tests the pointer itself, so the drawn crosshair and the public
+     * crosshairMove event cannot disagree.
+     */
+    'crosshair': {
+        x: number | null;
+        y: number | null;
+        time: number | null;
+        candle: CandleData | null;
+    };
 }
 
 type Listener<T> = (data: T) => void;
