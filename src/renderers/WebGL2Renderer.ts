@@ -29,9 +29,11 @@ export class WebGL2Renderer implements IRenderer {
     private candleResolutionLocation: WebGLUniformLocation | null = null;
     private candleOffsetLocation: WebGLUniformLocation | null = null;
     private candleScaleLocation: WebGLUniformLocation | null = null;
+    private candlePixelRatioLocation: WebGLUniformLocation | null = null;
 
     private currentOffset: [number, number] = [0, 0];
     private currentScale: [number, number] = [1, 1];
+    private devicePixelRatio: number = 1;
     private lineVertexCount: number = 0;
     private candleWickVertexCount: number = 0;
     private candleBodyVertexCount: number = 0;
@@ -73,9 +75,11 @@ export class WebGL2Renderer implements IRenderer {
             uniform vec2 u_resolution;
             uniform vec2 u_offset;
             uniform vec2 u_scale;
+            uniform float u_pixelRatio;
             out vec4 v_color;
             void main() {
-                vec2 transformedPosition = (a_position * u_scale) + u_offset;
+                vec2 transformedPosition = ((a_position * u_scale) + u_offset) * u_pixelRatio;
+                transformedPosition = floor(transformedPosition) + vec2(0.5);
                 vec2 zeroToOne = transformedPosition / u_resolution;
                 vec2 clipSpace = (zeroToOne * 2.0) - 1.0;
                 gl_Position = vec4(clipSpace * vec2(1.0, -1.0), 0.0, 1.0);
@@ -147,12 +151,14 @@ export class WebGL2Renderer implements IRenderer {
             this.candleResolutionLocation = gl.getUniformLocation(this.candleProgram, 'u_resolution');
             this.candleOffsetLocation = gl.getUniformLocation(this.candleProgram, 'u_offset');
             this.candleScaleLocation = gl.getUniformLocation(this.candleProgram, 'u_scale');
+            this.candlePixelRatioLocation = gl.getUniformLocation(this.candleProgram, 'u_pixelRatio');
             if (
                 this.candlePositionLocation < 0 ||
                 this.candleColorLocation < 0 ||
                 !this.candleResolutionLocation ||
                 !this.candleOffsetLocation ||
-                !this.candleScaleLocation
+                !this.candleScaleLocation ||
+                !this.candlePixelRatioLocation
             ) {
                 throw new Error('MatrixCharts: Required candlestick shader inputs were not found.');
             }
@@ -176,6 +182,7 @@ export class WebGL2Renderer implements IRenderer {
         if (width < 0 || height < 0 || dpr <= 0) return;
         
         if (this.canvas) {
+            this.devicePixelRatio = dpr;
             this.canvas.width = Math.round(width * dpr);
             this.canvas.height = Math.round(height * dpr);
             this.canvas.style.width = `${width}px`;
@@ -217,6 +224,11 @@ export class WebGL2Renderer implements IRenderer {
 
         const candleCount: number = candles.length / 6;
         const vertexStride: number = 6; // x, y, r, g, b, a
+        const scaleX: number = Math.abs(this.currentScale[0]);
+        const scaleY: number = Math.abs(this.currentScale[1]);
+        if (scaleX === 0 || scaleY === 0) {
+            throw new Error('MatrixCharts: Candlestick viewport scales must be non-zero.');
+        }
         
         // Wicks = 2 vertices per candle. Bodies = 6 vertices per candle (2 triangles).
         const totalVertices: number = candleCount * 8;
@@ -240,10 +252,36 @@ export class WebGL2Renderer implements IRenderer {
             }
 
             const color: [number, number, number, number] = close >= open ? bullishColor : bearishColor;
-            const halfWidth: number = width / 2;
-            const bodyTop: number = Math.max(open, close);
-            const bodyBottom: number = Math.min(open, close);
-            const bodyHeight: number = bodyTop === bodyBottom ? 1 : bodyTop - bodyBottom;
+            let neighborSpacing: number = Number.POSITIVE_INFINITY;
+            if (candleIndex > 0) {
+                const previousSpacing: number = Math.abs(x - candles[inputIndex - 6]);
+                if (previousSpacing > 0) neighborSpacing = Math.min(neighborSpacing, previousSpacing);
+            }
+            if (candleIndex + 1 < candleCount) {
+                const nextSpacing: number = Math.abs(candles[inputIndex + 6] - x);
+                if (nextSpacing > 0) neighborSpacing = Math.min(neighborSpacing, nextSpacing);
+            }
+            if (!Number.isFinite(neighborSpacing)) neighborSpacing = width;
+
+            const spacingPixels: number = neighborSpacing * scaleX * this.devicePixelRatio;
+            const maximumBodyPixels: number = Math.max(1, spacingPixels * 0.78);
+            const minimumBodyPixels: number = Math.min(2, maximumBodyPixels);
+            const requestedBodyPixels: number = width * scaleX * this.devicePixelRatio;
+            const bodyWidthData: number = Math.min(
+                maximumBodyPixels,
+                Math.max(minimumBodyPixels, requestedBodyPixels),
+            ) / (scaleX * this.devicePixelRatio);
+            const halfWidth: number = bodyWidthData / 2;
+
+            let bodyTop: number = Math.max(open, close);
+            let bodyBottom: number = Math.min(open, close);
+            const bodyHeightPixels: number = (bodyTop - bodyBottom) * scaleY * this.devicePixelRatio;
+            if (bodyHeightPixels < 1) {
+                const halfPixelHeight: number = 0.5 / (scaleY * this.devicePixelRatio);
+                const bodyCenter: number = (bodyTop + bodyBottom) / 2;
+                bodyTop = bodyCenter + halfPixelHeight;
+                bodyBottom = bodyCenter - halfPixelHeight;
+            }
 
             // 1. Write Wick Vertices
             vertices[wickIndex++] = x; vertices[wickIndex++] = low;
@@ -259,17 +297,17 @@ export class WebGL2Renderer implements IRenderer {
             vertices[bodyIndex++] = x + halfWidth; vertices[bodyIndex++] = bodyBottom;
             vertices[bodyIndex++] = color[0]; vertices[bodyIndex++] = color[1]; vertices[bodyIndex++] = color[2]; vertices[bodyIndex++] = color[3];
 
-            vertices[bodyIndex++] = x + halfWidth; vertices[bodyIndex++] = bodyTop + (bodyHeight === 1 ? 1 : 0);
+            vertices[bodyIndex++] = x + halfWidth; vertices[bodyIndex++] = bodyTop;
             vertices[bodyIndex++] = color[0]; vertices[bodyIndex++] = color[1]; vertices[bodyIndex++] = color[2]; vertices[bodyIndex++] = color[3];
 
             // 3. Write Body Vertices (Triangle 2)
             vertices[bodyIndex++] = x - halfWidth; vertices[bodyIndex++] = bodyBottom;
             vertices[bodyIndex++] = color[0]; vertices[bodyIndex++] = color[1]; vertices[bodyIndex++] = color[2]; vertices[bodyIndex++] = color[3];
 
-            vertices[bodyIndex++] = x + halfWidth; vertices[bodyIndex++] = bodyTop + (bodyHeight === 1 ? 1 : 0);
+            vertices[bodyIndex++] = x + halfWidth; vertices[bodyIndex++] = bodyTop;
             vertices[bodyIndex++] = color[0]; vertices[bodyIndex++] = color[1]; vertices[bodyIndex++] = color[2]; vertices[bodyIndex++] = color[3];
 
-            vertices[bodyIndex++] = x - halfWidth; vertices[bodyIndex++] = bodyTop + (bodyHeight === 1 ? 1 : 0);
+            vertices[bodyIndex++] = x - halfWidth; vertices[bodyIndex++] = bodyTop;
             vertices[bodyIndex++] = color[0]; vertices[bodyIndex++] = color[1]; vertices[bodyIndex++] = color[2]; vertices[bodyIndex++] = color[3];
         }
 
@@ -286,8 +324,8 @@ export class WebGL2Renderer implements IRenderer {
         gl.viewport(0, 0, this.canvas.width, this.canvas.height);
         gl.useProgram(this.program);
 
-        const cssWidth = this.canvas.width / window.devicePixelRatio;
-        const cssHeight = this.canvas.height / window.devicePixelRatio;
+        const cssWidth = this.canvas.width / this.devicePixelRatio;
+        const cssHeight = this.canvas.height / this.devicePixelRatio;
 
         gl.uniform2f(this.resolutionLocation, cssWidth, cssHeight);
         gl.uniform2f(this.offsetLocation, this.currentOffset[0], this.currentOffset[1]);
@@ -304,9 +342,10 @@ export class WebGL2Renderer implements IRenderer {
         }
         if (this.candleBodyVertexCount > 0) {
             gl.useProgram(this.candleProgram);
-            gl.uniform2f(this.candleResolutionLocation, cssWidth, cssHeight);
+            gl.uniform2f(this.candleResolutionLocation, this.canvas.width, this.canvas.height);
             gl.uniform2f(this.candleOffsetLocation, this.currentOffset[0], this.currentOffset[1]);
             gl.uniform2f(this.candleScaleLocation, this.currentScale[0], this.currentScale[1]);
+            gl.uniform1f(this.candlePixelRatioLocation, this.devicePixelRatio);
             gl.bindVertexArray(this.candleVao);
             gl.drawArrays(gl.LINES, 0, this.candleWickVertexCount);
             gl.drawArrays(gl.TRIANGLES, this.candleWickVertexCount, this.candleBodyVertexCount);
@@ -347,6 +386,7 @@ export class WebGL2Renderer implements IRenderer {
         this.candleResolutionLocation = null;
         this.candleOffsetLocation = null;
         this.candleScaleLocation = null;
+        this.candlePixelRatioLocation = null;
         this.lineVertexCount = 0;
         this.candleWickVertexCount = 0;
         this.candleBodyVertexCount = 0;

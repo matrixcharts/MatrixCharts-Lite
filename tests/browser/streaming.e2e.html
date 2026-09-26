@@ -17,6 +17,11 @@
     <script type="module">
         import { Chart, ChartFeedController, WebSocketCandleSource } from '../../src/index.ts';
 
+        window.requestAnimationFrame = (callback) => window.setTimeout(() => callback(performance.now()), 16);
+        window.cancelAnimationFrame = (frameId) => window.clearTimeout(frameId);
+        Object.defineProperty(document, 'visibilityState', { configurable: true, value: 'visible' });
+        Object.defineProperty(window, 'devicePixelRatio', { configurable: true, value: 2 });
+
         class TestSocket extends EventTarget {
             readyState = 0;
             sent = [];
@@ -48,10 +53,36 @@
         });
         const errors = [];
         window.__matrixChartsDrawCalls = 0;
+        window.__matrixChartsBodyPixels = 0;
+        window.__matrixChartsWidestBodyRun = 0;
         const originalDrawArrays = WebGL2RenderingContext.prototype.drawArrays;
         WebGL2RenderingContext.prototype.drawArrays = function (...args) {
             window.__matrixChartsDrawCalls++;
-            return originalDrawArrays.apply(this, args);
+            const result = originalDrawArrays.apply(this, args);
+            if (args[0] === this.TRIANGLES) {
+                const pixels = new Uint8Array(this.drawingBufferWidth * this.drawingBufferHeight * 4);
+                this.readPixels(0, 0, this.drawingBufferWidth, this.drawingBufferHeight, this.RGBA, this.UNSIGNED_BYTE, pixels);
+                let bodyPixels = 0;
+                for (let index = 3; index < pixels.length; index += 4) {
+                    if (pixels[index] > 0) bodyPixels++;
+                }
+                window.__matrixChartsBodyPixels = bodyPixels;
+
+                const rowStride = this.drawingBufferWidth * 4;
+                for (let row = 0; row < this.drawingBufferHeight; row++) {
+                    let runLength = 0;
+                    for (let column = 0; column < this.drawingBufferWidth; column++) {
+                        const pixelIndex = row * rowStride + column * 4;
+                        const red = pixels[pixelIndex];
+                        const green = pixels[pixelIndex + 1];
+                        const alpha = pixels[pixelIndex + 3];
+                        const isCandleColor = alpha > 0 && (green > red * 1.4 || red > green * 1.7);
+                        runLength = isCandleColor ? runLength + 1 : 0;
+                        window.__matrixChartsWidestBodyRun = Math.max(window.__matrixChartsWidestBodyRun, runLength);
+                    }
+                }
+            }
+            return result;
         };
         const controller = new ChartFeedController(chart, source, () => {}, (error) => errors.push(String(error)));
         const baseTime = Date.UTC(2025, 0, 1);
@@ -120,6 +151,12 @@
             const gl = document.querySelectorAll('#chart canvas')[1].getContext('webgl2');
             if (!gl || gl.getError() !== gl.NO_ERROR) throw new Error('WebGL renderer reported an error.');
             if (window.__matrixChartsDrawCalls === 0) throw new Error('Candlestick renderer issued no draw calls.');
+            if (window.__matrixChartsBodyPixels === 0) throw new Error('Candle bodies produced no filled pixels.');
+            if (window.__matrixChartsWidestBodyRun < 2) throw new Error('Candle bodies did not cover at least two adjacent physical pixels.');
+            const dataCanvas = document.querySelectorAll('#chart canvas')[1];
+            if (dataCanvas.width !== Math.round(dataCanvas.clientWidth * window.devicePixelRatio)) {
+                throw new Error('WebGL canvas backing resolution does not match DPR.');
+            }
             if (errors.length > 0) throw new Error(errors.join('\n'));
 
             resultNode.textContent = JSON.stringify({
@@ -128,6 +165,9 @@
                 anchorPreserved: true,
                 sourceState: source.state,
                 webglDrawCalls: window.__matrixChartsDrawCalls,
+                dpr: window.devicePixelRatio,
+                filledBodyPixels: window.__matrixChartsBodyPixels,
+                widestBodyPixelRun: window.__matrixChartsWidestBodyRun,
             }, null, 2);
             document.documentElement.dataset.testResult = 'pass';
         } catch (error) {

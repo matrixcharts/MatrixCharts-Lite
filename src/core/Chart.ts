@@ -81,6 +81,7 @@ export class Chart {
         });
         
         this.resizeObserver.observe(this.canvasWrapper);
+        this.handleResize(this.canvasWrapper.clientWidth, this.canvasWrapper.clientHeight);
         this.bindEvents();
         document.addEventListener('visibilitychange', this.handleVisibilityChange);
     }
@@ -551,6 +552,7 @@ export class Chart {
             scaleX: this.scaleX, 
             scaleY: this.scaleY 
         });
+        this.uploadVisibleCandles();
         this.redraw();
     }
 
@@ -561,7 +563,7 @@ export class Chart {
             let levelIndex: number = 0;
             while (
                 levelIndex + 1 < this.candlePyramid.levelCount &&
-                this.scaleX * Math.pow(2, levelIndex + 1) <= 2
+                this.scaleX * Math.pow(2, levelIndex + 1) <= 3
             ) {
                 levelIndex++;
             }
@@ -581,6 +583,9 @@ export class Chart {
                 : new Float32Array(0);
         }
 
+    }
+
+    private uploadVisibleCandles(): void {
         const dataRenderer: WebGL2Renderer = this.renderers[1] as WebGL2Renderer;
         dataRenderer.drawCandlesticks(
             this.displayedCandles,
