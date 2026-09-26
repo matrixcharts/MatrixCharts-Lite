@@ -1815,6 +1815,89 @@
                     throw new Error(`Price line pixels survived removal: ${leftover} left.`);
                 }
 
+                // Zones. A live zone is a filled box that extends right; a mitigated
+                // one is a faint dashed outline with no fill and a bounded right edge.
+                // Both are drawn on the grid layer, beneath the candles, which is what
+                // keeps the candles crisp instead of tinted.
+                const zoneBar = series[count - 30];
+                chart.setZones([
+                    { id: 'live', time: zoneBar.time, color: '#00ff9f', top: 205, bottom: 201, label: 'live' },
+                    { id: 'gone', time: series[count - 25].time, color: '#ff9f0a', state: 'mitigated', to: series[count - 20].time },
+                ]);
+                if (chart.getZoneIds().join(',') !== 'live,gone') {
+                    throw new Error(`Zone ids are ${chart.getZoneIds().join(',')}, expected live,gone.`);
+                }
+                // A zone time between candles is refused, unlike a marker.
+                let zoneError = '';
+                try {
+                    chart.setZones([{ id: 'bad', time: zoneBar.time + 30_000 }]);
+                } catch (error) {
+                    zoneError = error instanceof Error ? error.message : String(error);
+                }
+                if (!zoneError.includes('is not a candle')) {
+                    throw new Error(`A zone between candles was not refused: ${zoneError || 'no error'}`);
+                }
+                if (chart.getZoneIds().join(',') !== 'live,gone') {
+                    throw new Error('A refused zone replaced the existing set.');
+                }
+
+                // The live zone's fill must exist under the candles and its border
+                // must be a crisp line, so both are measured on the grid layer.
+                const zoneLeft = chart.indexToCoordinate(count - 30);
+                if (zoneLeft <= 0 || zoneLeft >= host.clientWidth) {
+                    throw new Error(`The live zone's bar is off screen at x=${zoneLeft}.`);
+                }
+                const layer = host.querySelectorAll('canvas')[0].getContext('2d');
+                const layerBuf = layer.getImageData(0, 0, layer.canvas.width, layer.canvas.height);
+                const LW = layer.canvas.width;
+                const gutterPx = Math.round(layout.priceAxisWidth * 2);
+                // The zone's own pixels, isolated by diffing the grid layer with and
+                // without it. Colour matching is fragile here: a fill is the same hue
+                // as its border at a lower alpha, and a colour shared with another
+                // decoration would let that decoration satisfy the zone's checks. A
+                // diff attributes every changed pixel to the zone and nothing else.
+                const withZones = layerBuf;
+                chart.clearZones();
+                await waitFrame();
+                const withoutBuf = layer.getImageData(0, 0, LW, layer.canvas.height);
+                chart.setZones([
+                    { id: 'live', time: zoneBar.time, color: '#00ff9f', top: 205, bottom: 201, label: 'live' },
+                    { id: 'gone', time: series[count - 25].time, color: '#ff9f0a', state: 'mitigated', to: series[count - 20].time },
+                ]);
+                await waitFrame();
+
+                let fillPixels = 0, brightPixels = 0, overGutter = 0, minX = Infinity, maxX = -1;
+                for (let p = 0; p < LW * layer.canvas.height; p++) {
+                    const i = p * 4;
+                    const delta = Math.abs(withZones.data[i] - withoutBuf.data[i])
+                        + Math.abs(withZones.data[i + 1] - withoutBuf.data[i + 1])
+                        + Math.abs(withZones.data[i + 2] - withoutBuf.data[i + 2]);
+                    if (delta < 6) continue;
+                    const x = p % LW;
+                    if (x < minX) minX = x;
+                    if (x > maxX) maxX = x;
+                    if (delta > 90) brightPixels++;
+                    else fillPixels++;
+                    if (x < gutterPx) overGutter++;
+                }
+                if (fillPixels === 0) throw new Error('The live zone drew no fill.');
+                if (brightPixels === 0) throw new Error('The live zone drew no border.');
+                if (overGutter > 0) {
+                    throw new Error(`The live zone painted ${overGutter} pixels inside the ${gutterPx}px price gutter `
+                        + `(x from ${minX} to ${maxX}).`);
+                }
+
+                // The mitigated zone must be narrower than the live one: it stops at
+                // its right edge instead of running to the live edge.
+                const mitigatedRight = chart.indexToCoordinate(count - 20);
+                const liveRight = chart.indexToCoordinate(count - 1) + 14 / 2;
+                if (!(mitigatedRight < liveRight)) {
+                    throw new Error('A mitigated zone extends as far as a live one.');
+                }
+
+                chart.clearZones();
+                if (chart.getZoneIds().length !== 0) throw new Error('Zones were not removed.');
+
                 decorationReport = {
                     lastPrice: beforeTrack,
                     trackedTo: afterTrack,
@@ -1822,6 +1905,9 @@
                     markerIndex: placed[0].index,
                     markerOnScreenX: Math.round(markerX),
                     markerPixels,
+                    zoneFillPixels: fillPixels,
+                    zoneBorderPixels: brightPixels,
+                    zonePixelsInGutter: overGutter,
                 };
                 chart.destroy();
                 host.remove();

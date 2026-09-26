@@ -146,9 +146,10 @@
         <label class="swatch">Decorations
             <select id="decorations" aria-label="Price lines and markers">
                 <option value="none">none</option>
+                <option value="zones">order block zones</option>
                 <option value="lines">price lines</option>
                 <option value="trades">trade markers</option>
-                <option value="both">both</option>
+                <option value="both">zones + markers</option>
             </select>
         </label>
         <label class="swatch">Panes
@@ -600,24 +601,90 @@
             if (count === 0 || kind === 'none') {
                 chart.setPriceLines([]);
                 chart.clearMarkers();
+                chart.clearZones();
                 return;
             }
+
+            // The actual order-block rule, so the demo's output is what the concept
+            // means rather than a decorative approximation: find a displacement, then
+            // take the last bar that closed against it. That bar's range is the zone.
+            const bars = [];
+            for (let i = 0; i < count; i++) {
+                const candle = chart.getCandleAt(i);
+                if (candle) bars.push(candle);
+            }
+            const findOrderBlocks = (bars) => {
+                const blocks = [];
+                for (let i = 2; i < bars.length - 1; i++) {
+                    const bar = bars[i];
+                    const range = bar.high - bar.low;
+                    if (range <= 0) continue;
+                    const body = (bar.close - bar.open) / range;
+                    if (body < 0.55) continue;
+                    const up = body > 0;
+                    // Walk back to the last bar that closed the other way.
+                    for (let j = i - 1; j >= 0; j--) {
+                        const back = bars[j];
+                        const backUp = back.close >= back.open;
+                        if (backUp !== up) {
+                            blocks.push({ index: j, up, size: (bar.close - bar.open) / range });
+                            break;
+                        }
+                    }
+                }
+                return blocks;
+            };
+
+            const blocks = findOrderBlocks(bars);
+            // Only the most recent blocks. A zone extends right indefinitely, so on a
+            // long series every zone has eventually been traded back through and
+            // almost all of them end up mitigated — which is correct, and useless as
+            // a demonstration. Real indicators show the recent ones, and that is also
+            // what makes the chart readable.
+            const recent = blocks.filter((b) => b.index > bars.length - 16);
+            // A zone is mitigated once price has traded back into it, and
+            // invalidated once it has closed through. Both are the caller's
+            // judgement, which is why the library only renders what it is told.
+            const zones = recent.map((block, n) => {
+                const bar = bars[block.index];
+                const later = bars.slice(block.index + 1);
+                let state = 'live';
+                let endedAt = null;
+                if (!block.up) {
+                    const through = later.findIndex((b) => b.high < bar.low);
+                    const back = later.findIndex((b) => b.high > bar.low);
+                    if (through >= 0) { state = 'invalidated'; endedAt = through; }
+                    else if (back >= 0) { state = 'mitigated'; endedAt = back; }
+                } else {
+                    const through = later.findIndex((b) => b.low > bar.high);
+                    const back = later.findIndex((b) => b.low < bar.high);
+                    if (through >= 0) { state = 'invalidated'; endedAt = through; }
+                    else if (back >= 0) { state = 'mitigated'; endedAt = back; }
+                }
+                return {
+                    id: `ob-${n}`,
+                    time: bar.time,
+                    // A zone that has stopped being live also stops being drawn: there
+                    // is nothing in "this was violated thirty bars ago" that needs
+                    // thirty bars of width. A live zone extends right to the edge,
+                    // which is what makes it read as still in effect.
+                    to: endedAt === null ? null : bars[block.index + endedAt].time,
+                    color: block.up ? '#3b82f6' : '#f0503a',
+                    state,
+                    label: state === 'live' ? (block.up ? 'demand' : 'supply') : '',
+                };
+            });
+
             const last = chart.getLastPrice();
             const lines = last === null ? [] : [
                 { id: 'last-known', price: last.price, color: '#ff9f0a', lineStyle: 'solid', title: 'last' },
-                { id: 'round', price: Math.round(last.price), color: '#5ac8fa', title: 'round' },
-                // Deliberately close to the line above, so the collision handling
-                // between two caller tags and the axis ticks is visible.
-                { id: 'nearby', price: Math.round(last.price) + 0.5, color: '#30d158' },
+                { id: 'round', price: Math.round(last.price), color: '#5ac8fa' },
             ];
             const markers = [];
             if (kind === 'trades' || kind === 'both') {
-                // Every seventh bar, alternating sides, standing in for a feed's
-                // fills. The last one is deliberately off-centre in time to show
-                // that a marker snaps to its nearest bar.
                 for (let i = 4; i < count; i += 7) {
                     markers.push({
-                        time: chart.getCandleAt(i).time,
+                        time: bars[i].time,
                         position: i % 14 === 4 ? 'aboveBar' : 'belowBar',
                         shape: i % 14 === 4 ? 'arrowDown' : 'arrowUp',
                         color: i % 14 === 4 ? '#ff453a' : '#30d158',
@@ -626,6 +693,28 @@
             }
             chart.setPriceLines(lines);
             chart.setMarkers(markers);
+            if (kind === 'lines' || kind === 'trades') chart.clearZones();
+            else {
+                // The mock feed oscillates on an eleven-bar period, so price revisits
+                // any level within a few bars and every order block it finds is
+                // mitigated almost at once. That is a property of the synthetic data
+                // rather than of zones, so this one is placed by hand and left live,
+                // to keep the filled rendering visible beside the faded ones.
+                const anchor = bars[Math.max(0, bars.length - 45)];
+                zones.push({
+                    id: 'live-demand',
+                    time: anchor.time,
+                    // The bar's own range, widened slightly. An offset from the high
+                    // can land the zone above the visible price range, and a zone off
+                    // the top of the pane is correctly not drawn at all.
+                    top: anchor.high + 0.3,
+                    bottom: anchor.low - 0.3,
+                    color: '#3b82f6',
+                    state: 'live',
+                    label: 'demand',
+                });
+                chart.setZones(zones);
+            }
         };
         decorationInput.addEventListener('change', () => setDecorations(decorationInput.value));
         setInterval(() => {

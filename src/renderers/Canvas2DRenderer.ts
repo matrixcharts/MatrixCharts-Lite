@@ -22,8 +22,10 @@ import {
     LABEL_PRIORITY,
     layoutLabels,
     shouldDrawMarkers,
+    zonesWithinBudget,
     type LabelCandidate,
     type PlacedMarker,
+    type PlacedZone,
     type ResolvedPriceLine,
 } from '../core/decorations.js';
 import type { VerticalTransform } from './WebGLSeries.js';
@@ -114,6 +116,17 @@ export class Canvas2DRenderer implements IRenderer {
      */
     private priceLines: readonly ResolvedPriceLine[] = [];
     private markers: readonly PlacedMarker[] = [];
+    /**
+     * Zones, drawn first and on the *grid* layer.
+     *
+     * The grid layer is z-index 0, beneath the data layer, so a translucent zone
+     * painted here composites against the background only and the candles composite
+     * on top at full opacity. A zone on the data layer would multiply over the candle
+     * pixels and tint them, which is the washed-out look every order-block indicator
+     * is trying to avoid — and the reason the fill and border weights are decoupled
+     * in the first place.
+     */
+    private zones: readonly PlacedZone[] = [];
     private lastPrice: { price: number; direction: 'up' | 'down' } | null = null;
     
     private isGridLayer: boolean;
@@ -204,6 +217,7 @@ public init(canvas: HTMLCanvasElement, emitter: EventEmitter<ChartEvents>): void
         if (!this.isGridLayer) return;
         this.priceLines = payload.priceLines;
         this.markers = payload.markers;
+        this.zones = payload.zones;
         this.lastPrice = payload.lastPrice;
     };
 
@@ -255,6 +269,11 @@ public init(canvas: HTMLCanvasElement, emitter: EventEmitter<ChartEvents>): void
         this.ctx.save();
         this.ctx.strokeStyle = this.options.grid.color;
         this.ctx.lineWidth = 1;
+
+        // Zones first, so they sit under the grid as well as under the candles.
+        // Everything after this point draws on top of them.
+        this.renderZones(viewport);
+
         this.ctx.beginPath();
 
         const timeTickStep: number = this.niceStep(96 / this.scaleX);
@@ -668,6 +687,80 @@ public init(canvas: HTMLCanvasElement, emitter: EventEmitter<ChartEvents>): void
             this.ctx.stroke();
             this.ctx.restore();
             this.drawTag(this.formatAxisValue(this.lastPrice.price), plot.x - 6, crispY, color);
+        }
+    }
+
+    /**
+     * Zones: a low-alpha fill and a firmer border, the border dashed once the zone
+     * has stopped being live.
+     *
+     * Everything here is in CSS pixels and confined to the plot rect, so a zone
+     * never paints over the price gutter. The left edge is the anchor candle's left
+     * boundary and the right edge is the live edge of the plot, which is what makes a
+     * zone read as "this happened at that bar and is still in effect" rather than as
+     * a band floating over the chart.
+     */
+    private renderZones(viewport: ChartViewport): void {
+        if (this.zones.length === 0) return;
+        const plot: PlotRect = viewport.plot;
+        const drawn: PlacedZone[] = zonesWithinBudget(this.zones);
+
+        for (const zone of drawn) {
+            const x0: number = zone.extendLeft
+                ? plot.x
+                : indexToCoordinate(viewport, zone.fromIndex) - viewport.scaleX / 2;
+            const x1: number = zone.toIndex === null
+                ? plot.x + plot.width
+                : indexToCoordinate(viewport, zone.toIndex) + viewport.scaleX / 2;
+            const yTop: number = priceToCoordinate(viewport, zone.top);
+            const yBottom: number = priceToCoordinate(viewport, zone.bottom);
+            if (yTop === yBottom) continue;
+
+            // A zone entirely above or below the pane is not drawn at all. Clipping a
+            // partially visible one is right; drawing a whole off-screen one is not.
+            if (yTop < plot.y || yBottom > plot.y + plot.height) continue;
+
+            const left: number = Math.max(x0, plot.x);
+            const right: number = Math.min(x1, plot.x + plot.width);
+            if (right <= left) continue;
+
+            this.ctx.save();
+            this.ctx.beginPath();
+            this.ctx.rect(left, Math.min(yTop, yBottom), right - left, Math.abs(yBottom - yTop));
+            this.ctx.clip();
+            if (zone.fill[3] > 0) {
+                this.ctx.fillStyle = this.cssColor(zone.fill);
+                this.ctx.fill();
+            }
+            this.ctx.restore();
+
+            this.ctx.save();
+            this.ctx.strokeStyle = this.cssColor(zone.border);
+            // One CSS pixel, snapped to a device boundary. A 2px border is the
+            // clearest tell that something is a web control rather than an
+            // instrument.
+            this.ctx.lineWidth = 1;
+            if (zone.borderStyle === 'dashed') this.ctx.setLineDash([3, 3]);
+            const leftEdge: number = Math.floor(left) + 0.5;
+            const rightEdge: number = Math.round(right) - 0.5;
+            const topEdge: number = Math.round(Math.min(yTop, yBottom)) + 0.5;
+            const bottomEdge: number = Math.round(Math.max(yTop, yBottom)) - 0.5;
+            this.ctx.beginPath();
+            this.ctx.moveTo(leftEdge, topEdge);
+            this.ctx.lineTo(rightEdge, topEdge);
+            this.ctx.moveTo(leftEdge, bottomEdge);
+            this.ctx.lineTo(rightEdge, bottomEdge);
+            this.ctx.moveTo(leftEdge, topEdge);
+            this.ctx.lineTo(leftEdge, bottomEdge);
+            if (zone.toIndex !== null) this.ctx.lineTo(rightEdge, bottomEdge);
+            this.ctx.stroke();
+            this.ctx.restore();
+
+            if (zone.label.length > 0) {
+                // Above the zone, not inside it: a label inside a 6px zone is
+                // unreadable, which is the same reason zone labels are off by default.
+                this.drawLabel(zone.label, left + 4, topEdge - 8, 'left');
+            }
         }
     }
 

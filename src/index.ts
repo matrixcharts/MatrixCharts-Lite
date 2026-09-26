@@ -18,6 +18,8 @@ export type {
     MarkerShape,
     MarkerSpec,
     PriceLineSpec,
+    ZoneSpec,
+    ZoneState,
 } from './core/decorations.js';
 export type {
     ChartClickEvent,

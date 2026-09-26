@@ -74,6 +74,12 @@ The last-price tracking assertion is the one worth keeping an eye on, because a 
 
 Label collision is tested purely, on the decision rather than the drawing: the priority order, the both-halves overlap rule, and the run-of-crowded-labels case. Keeping by position order instead of priority fails it.
 
+Zones are asserted by **diffing** the grid layer with and without them, not by colour matching. A zone's fill and its border are the same hue at different alphas, and a colour shared with another decoration in the same test block lets that decoration satisfy the zone's checks — which is exactly what happened twice while writing this, first with a price line's gutter tag and then with an axis label. A diff attributes every changed pixel to the zone and nothing else, and gives a bounding box for free, so "does the zone paint over the gutter" becomes a comparison rather than a colour judgement. The e2e reports 65k fill pixels and 4.3k border pixels with zero in the gutter.
+
+Two things about zones were found by looking rather than by a failing test. A hand-placed live zone rendered nothing at all: it was placed at `bar.high + 2.5`, which put its top edge above the auto-fitted price range, and a zone entirely off the top of the pane is correctly not drawn. And a first version left mitigated zones extending to the live edge, which is both why every zone on a long series eventually reads as mitigated and why a chart of them is unreadable — the fix is that a zone which is no longer live also stops being extended, via the same `to` a caller uses for any bounded zone.
+
+The zone rules are also pinned purely: the fill/border weights and their ratio, the fade weights per state, the exact-time rejection, the paint order, and the budget keeping every live zone over the most recent history.
+
 Axis gutters are asserted by reading both layers at once, because neither layer alone can show the defect. The data layer must have **zero** pixels inside either gutter, which is what proves the scissor box is actually applied rather than merely configured, and the axis layer must have ink inside both gutters, which proves the labels moved out of the plot. Introducing the gutters without clipping passes every unit test and fails only this check: a bar scrolled part-way past the left edge keeps painting over the price labels. That was a real defect found this way, and the same measurement caught a units bug in the check itself, where a CSS-pixel threshold was compared against device pixels and so silently halved at `dpr 2`.
 
 ## Known coverage limits

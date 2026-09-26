@@ -391,6 +391,30 @@ The last-price rule and tag are **derived, not supplied**. Chart already knows t
 
 When two labels want the same strip of the price gutter, the resolution is **by priority, not by position**: the last-price tag outranks a price-line tag, which outranks an axis tick, and a kept label displaces anything within its own height of it. Sorting by y and thinning out what collides would drop whichever happened to be drawn first, which is not something a reader can predict; dropping the axis tick instead keeps the annotations the caller asked for. A price line scrolled off the price pane is not drawn at all, tag included, because a tag for a price that is not on screen reads as a price that is.
 
+### Zones
+
+A zone is a fixed price rectangle anchored to one candle and extending right — an order block, a breaker, a fair-value gap, a session range. It is candle-anchored rather than a band between two moving lines, because that is what these are: a zone belongs to a specific bar and does not move with price.
+
+`setZones(zones)` replaces the whole set, validated before any of it is applied, so a rejected zone leaves the existing set untouched. `getZoneIds()` reads it back, including any zone left undrawn by the budget below. `clearZones()` removes them all.
+
+A zone's `time` must match a candle **exactly**, unlike a marker's. A marker is a point, so being a bar out is invisible; a zone's left edge is a boundary, so snapping would displace the whole zone by a bar and quietly change which bar it claims to be. A timestamp is taken rather than an ordinal because ordinals shift under retention trimming and timestamps do not.
+
+`top` and `bottom` default to the anchor candle's high and low, so a caller holding a bar and nothing else gets the conventional zone for it. Omitting `to` extends the zone to the right edge of the plot.
+
+**One `color` gives the conventional fill and border pairing**: a low-alpha fill and a firmer border in the same hue. The ratio is the point — a border that fades along with the fill has no definition, which is the washed-out look the decoupling exists to fix. Override `fill` or `border` to change either, including their alpha. Borders are one CSS pixel with square corners, snapped to a device boundary; a 2px border or a rounded corner reads as a web control rather than an instrument.
+
+A zone's `state` is **the caller's to decide**, because when a zone stops mattering is an analytical judgement about their own indicator. `live` is a filled box with a solid border. `mitigated` and `invalidated` fade to a faint dashed outline with no fill — the chart keeps its own history instead of resetting as the session runs, which is the alternative to hiding them, and a caller who wants them hidden can drop them from the set. The state is carried by the **border**, not by swapping the fill colour, so a zone that has stopped mattering recedes rather than raising a colour alarm.
+
+**A zone that is no longer live should also stop being extended.** There is nothing in "this was violated thirty bars ago" that needs thirty bars of width, and a mitigated zone that still runs to the live edge is the single biggest source of clutter on a chart of zones. Set `to` to the candle it was violated at.
+
+Zones are drawn on the **grid layer**, beneath the data layer, and painted before the grid lines. That is deliberate: a translucent fill there composites against the background only, and the candles composite on top at full opacity. A zone on the data layer would multiply over the candle pixels and tint them — the very look the fill and border decoupling exists to avoid.
+
+Zones paint invalidated first, then mitigated, then live, each oldest first. A mitigated zone must sit *under* the live ones: a faint dashed outline drawn on top of a live fill puts the quietest thing in the chart over the loudest.
+
+Drawing is capped, because translucent fills compound where they overlap and a few hundred stacked zones turn the plot into mud. Over the cap, **every live zone is kept** and the remaining budget goes to the most recent mitigated ones — dropping the oldest *live* zone would drop the most visually dominant thing on the chart, since a live zone extends right across everything.
+
+A zone scrolled off the top or bottom of the price pane is not drawn at all. A zone partly off screen is clipped to the plot rect and never paints over the price gutter.
+
 ## Feed v1
 
 Use `WebSocketCandleSource` + `ChartFeedController` against a `CandleTarget` (`Chart` implements this). Do not open sockets inside renderers.

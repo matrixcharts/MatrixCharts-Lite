@@ -3,7 +3,7 @@ import type { CandleData } from './CandleData.js';
 import type { PlotRect } from './coordinates.js';
 import type { ResolvedChartOptions } from './options.js';
 import type { PaneLayout } from './panes.js';
-import type { PlacedMarker, ResolvedPriceLine } from './decorations.js';
+import type { PlacedMarker, PlacedZone, ResolvedPriceLine } from './decorations.js';
 
 export interface ChartEvents {
     'viewport': {
@@ -41,6 +41,12 @@ export interface ChartEvents {
     'decorations': {
         priceLines: readonly ResolvedPriceLine[];
         markers: readonly PlacedMarker[];
+        /**
+         * Zones, in the order the caller supplied them. The renderer reorders these
+         * for painting; the event reports what was given, so a read of the chart's
+         * state is not the renderer's presentation order.
+         */
+        zones: readonly PlacedZone[];
         /**
          * The newest candle's close and direction, or `null` with no data. Derived
          * by Chart rather than supplied, so the tag cannot disagree with the

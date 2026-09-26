@@ -39,11 +39,15 @@ import {
     markerAnchorPrice,
     resolveMarkers,
     resolvePriceLines,
+    resolveZones,
+    type AnchorCandle,
     type MarkerSpec,
     type PlacedMarker,
+    type PlacedZone,
     type PriceLineSpec,
     type ResolvedMarker,
     type ResolvedPriceLine,
+    type ZoneSpec,
 } from './decorations.js';
 import type { VerticalTransform } from '../renderers/WebGLSeries.js';
 import {
@@ -134,6 +138,7 @@ export class Chart {
     /** Decorations, drawn on the UI layer rather than as series. */
     private priceLines: ResolvedPriceLine[] = [];
     private markers: ResolvedMarker[] = [];
+    private zones: PlacedZone[] = [];
     /**
      * Pane rects and vertical transforms for the current frame, in CSS pixels.
      * Recomputed with the viewport, because both depend on it.
@@ -935,6 +940,62 @@ export class Chart {
         return this.markersWithPrices();
     }
 
+    /**
+     * Replaces the chart's zones.
+     *
+     * A zone is a fixed price rectangle anchored to one candle and extending
+     * right — an order block, a breaker, a fair-value gap, a session range. It is
+     * candle-anchored rather than a band between two moving lines, because that is
+     * what these are: a zone belongs to a specific bar and does not move with price.
+     *
+     * Supplying one `color` gives the conventional pairing: a low-alpha fill and a
+     * firmer border in the same hue, decoupled so the zone has definition without
+     * competing with the candles. Override `fill` or `border` to change either.
+     *
+     * A zone's `state` is the caller's to decide. When a zone stops mattering is an
+     * analytical judgement about their own indicator, so the library renders what it
+     * is told: `live` is a filled box with a solid border, and `mitigated` or
+     * `invalidated` fade to a faint dashed outline rather than disappearing, so the
+     * chart keeps its own history instead of resetting as the session runs.
+     *
+     * The zone's timestamp must match a candle **exactly**, unlike a marker's. A
+     * marker is a point, so off by one bar is invisible; a zone's left edge is a
+     * boundary, so snapping would displace the whole zone by a bar and quietly
+     * change which bar it claims to be. A timestamp is taken rather than an ordinal
+     * because ordinals shift under retention trimming and timestamps do not.
+     */
+    public setZones(zones: readonly ZoneSpec[]): void {
+        this.assertAlive();
+        this.zones = resolveZones(
+            zones,
+            this.candleTimes,
+            (index: number): AnchorCandle => {
+                const candle: CandleData | null = this.getCandleAt(index);
+                return { high: candle?.high ?? 0, low: candle?.low ?? 0, close: candle?.close ?? 0 };
+            },
+            this.resolvedOptions.candlestick.lineColor,
+            (cssColor: string, label: string): Rgba => parseCssColor(cssColor, label),
+        );
+        this.emitDecorations();
+    }
+
+    /**
+     * The zone ids currently supplied, in the order they were given.
+     *
+     * This reports every zone, including any left undrawn because the chart was over
+     * its drawing budget, so a caller can tell what is on the chart from what is not
+     * rather than inferring it from a missing rectangle.
+     */
+    public getZoneIds(): string[] {
+        this.assertAlive();
+        return this.zones.map((zone: PlacedZone): string => zone.id);
+    }
+
+    /** Removes every zone. */
+    public clearZones(): void {
+        this.setZones([]);
+    }
+
     /** Removes every marker. */
     public clearMarkers(): void {
         this.setMarkers([]);
@@ -959,6 +1020,7 @@ export class Chart {
         this.emitter.emit('decorations', {
             priceLines: this.priceLines,
             markers: this.markersWithPrices(),
+            zones: this.zones,
             lastPrice: this.lastPrice(),
         });
         // Decorations do not affect layout, so this repaints without redoing the

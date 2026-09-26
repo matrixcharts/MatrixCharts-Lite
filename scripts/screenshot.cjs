@@ -86,7 +86,7 @@ async function main() {
         const problems = [];
         page.on('pageerror', (error) => problems.push('pageerror: ' + error.message));
         page.on('console', (message) => {
-            if (message.type() === 'error') problems.push('console: ' + message.text().slice(0, 200));
+            if (message.type() === 'error' || message.text().startsWith('DBG')) problems.push(message.text().slice(0, 220));
         });
 
         await page.goto(url, { waitUntil: 'networkidle2', timeout: 60000 });

@@ -287,3 +287,264 @@ export function markerAnchorPrice(candle: AnchorCandle, position: MarkerPosition
     if (position === 'belowBar') return candle.low;
     return candle.close;
 }
+
+// --- zones -------------------------------------------------------------------
+
+/**
+ * A zone's lifecycle. It is the caller's to decide: when a zone stops mattering is
+ * an analytical judgement about their own indicator, not something this library
+ * should infer from price.
+ */
+export type ZoneState = 'live' | 'mitigated' | 'invalidated';
+
+export const ZONE_STATES: readonly ZoneState[] = ['live', 'mitigated', 'invalidated'];
+
+/**
+ * A fixed price zone anchored to one candle and extending right — an order block,
+ * a breaker, a fair-value gap, a session range.
+ *
+ * Candle-anchored rather than a band between two moving lines, because that is
+ * what these are: a zone belongs to a specific bar and does not move with price.
+ */
+export interface ZoneSpec {
+    /** Stable identifier, unique within a chart. */
+    id: string;
+    /**
+     * Timestamp of the candle the zone is anchored to. Its left edge and, unless
+     * `top`/`bottom` say otherwise, its extent come from that bar.
+     *
+     * Must match a candle **exactly**. A marker snaps to the nearest bar because a
+     * marker is a point and off-by-one-bar is invisible; a zone's left edge is a
+     * boundary, so snapping would displace the whole zone by a bar and quietly
+     * change which bar it is claiming to be. And the timestamp is taken rather than
+     * an ordinal because ordinals shift under retention trimming while timestamps
+     * do not.
+     */
+    time: number;
+    /** Upper price bound. Defaults to the anchor candle's high. */
+    top?: number;
+    /** Lower price bound. Defaults to the anchor candle's low. */
+    bottom?: number;
+    /**
+     * Timestamp of the candle at the zone's right edge, or `null`/absent to extend
+     * to the right edge of the plot. A zone runs forward from where it was created
+     * and never backward past it; `extendLeft` is the one way to go left, and only
+     * for zones that genuinely span the whole chart.
+     */
+    to?: number | null;
+    /**
+     * One colour for the zone. The fill and the border are derived from it at
+     * standard weights, so a caller who supplies only this gets the conventional
+     * pairing rather than two numbers to invent.
+     */
+    color?: string;
+    /** Fill colour including its alpha, overriding the derived fill. */
+    fill?: string;
+    /** Border colour including its alpha, overriding the derived border. */
+    border?: string;
+    /** Defaults to `live`. */
+    state?: ZoneState;
+    /**
+     * Whether the zone runs left to the plot's edge as well. For premium/discount
+     * bands and session ranges, which are not anchored to a candle at all.
+     */
+    extendLeft?: boolean;
+    /** Small label drawn above the zone's left edge. Off by default. */
+    label?: string;
+}
+
+export interface ResolvedZone {
+    id: string;
+    /** Ordinal of the anchor candle. */
+    fromIndex: number;
+    /** Ordinal of the right edge, or null to extend right. */
+    toIndex: number | null;
+    /** Price bounds, taken from the anchor candle where not given. */
+    top: number;
+    bottom: number;
+    fill: Rgba;
+    border: Rgba;
+    borderStyle: 'solid' | 'dashed';
+    extendLeft: boolean;
+    label: string;
+    state: ZoneState;
+}
+
+/** A zone with its geometry resolved against the current candles. */
+export type PlacedZone = ResolvedZone;
+
+/** Standard weights, so a caller supplying one colour gets the conventional look. */
+export const ZONE_WEIGHTS = {
+    live: { fill: 0.12, border: 0.55 },
+    // A mitigated zone is a faint dashed outline with no fill: the chart keeps its
+    // own history without a wall of pale rectangles over the price action.
+    mitigated: { fill: 0, border: 0.25 },
+    invalidated: { fill: 0, border: 0.14 },
+} as const;
+
+/**
+ * Most zones drawn at once.
+ *
+ * Translucent fills compound where they overlap, so a few hundred stacked zones
+ * turn the plot into mud. Over the cap, live zones are kept in full and the
+ * remaining budget goes to the most recent mitigated ones: a live zone is
+ * tradeable, a mitigated one is history, and dropping the oldest *live* zone would
+ * drop the most visually dominant thing on the chart.
+ */
+export const MAX_DRAWN_ZONES = 200;
+
+function withWeight(color: Rgba, alpha: number): Rgba {
+    return [color[0], color[1], color[2], alpha];
+}
+
+/**
+ * Zones in the order they should be painted.
+ *
+ * Invalidated, then mitigated, then live, each oldest first. A zone that has been
+ * mitigated must sit *under* the live ones: a faint dashed outline drawn on top of
+ * a live fill would put the quietest thing in the chart over the loudest.
+ */
+export function zoneStackingOrder(zones: readonly ResolvedZone[]): ResolvedZone[] {
+    const rank = (state: ZoneState): number => (
+        state === 'invalidated' ? 0 : state === 'mitigated' ? 1 : 2
+    );
+    return [...zones].sort((a, b): number => (
+        rank(a.state) - rank(b.state) || a.fromIndex - b.fromIndex
+    ));
+}
+
+/**
+ * The zones to actually draw, within the budget. Live zones first, then the most
+ * recent mitigated ones.
+ */
+export function zonesWithinBudget(
+    zones: readonly ResolvedZone[],
+    limit: number = MAX_DRAWN_ZONES,
+): ResolvedZone[] {
+    // A limit of zero means draw none. The default already covers "unlimited", so
+    // reading zero as unlimited too would be a second spelling of the same thing
+    // with a third meaning.
+    if (limit <= 0) return [];
+    if (zones.length <= limit) return [...zones];
+    const live: ResolvedZone[] = [];
+    const history: ResolvedZone[] = [];
+    for (const zone of zones) {
+        if (zone.state === 'live') live.push(zone);
+        else history.push(zone);
+    }
+    if (live.length >= limit) {
+        return zoneStackingOrder(live.slice(0, limit));
+    }
+    // Most recent first, so the ones kept are the ones nearest the live edge.
+    const byRecency: ResolvedZone[] = [...history].sort(
+        (a, b): number => b.fromIndex - a.fromIndex,
+    );
+    return zoneStackingOrder([...live, ...byRecency.slice(0, limit - live.length)]);
+}
+
+/** Validates zones. Candle OHLC is supplied by the caller, which has it. */
+export function resolveZones(
+    specs: readonly ZoneSpec[],
+    candleTimes: readonly number[],
+    candleAt: (index: number) => AnchorCandle,
+    defaultColor: Rgba,
+    parseColor: (cssColor: string, label: string) => Rgba,
+): ResolvedZone[] {
+    if (specs.length === 0) return [];
+
+    const seen = new Set<string>();
+    const resolved: ResolvedZone[] = [];
+    for (const spec of specs) {
+        if (typeof spec.id !== 'string' || spec.id.trim().length === 0) {
+            fail('Each zone needs a non-empty string id.');
+        }
+        if (seen.has(spec.id)) {
+            fail(`Zone id ${JSON.stringify(spec.id)} is used more than once.`);
+        }
+        seen.add(spec.id);
+
+        const fromIndex: number = exactIndexOfTime(candleTimes, spec.time);
+        if (fromIndex < 0) {
+            fail(
+                `Zone ${JSON.stringify(spec.id)} is anchored to ${new Date(spec.time).toISOString()}, `
+                + 'which is not a candle. A zone is a candle and its boundaries, so its '
+                + 'timestamp has to match one exactly rather than be snapped to the nearest.',
+            );
+        }
+
+        let toIndex: number | null = null;
+        if (spec.to !== undefined && spec.to !== null) {
+            toIndex = exactIndexOfTime(candleTimes, spec.to);
+            if (toIndex < 0) {
+                fail(`Zone ${JSON.stringify(spec.id)} ends at ${new Date(spec.to).toISOString()}, which is not a candle.`);
+            }
+            if (toIndex < fromIndex) {
+                fail(`Zone ${JSON.stringify(spec.id)} ends before it starts.`);
+            }
+        }
+
+        const state: ZoneState = spec.state ?? 'live';
+        if (!ZONE_STATES.includes(state)) {
+            fail(`Zone ${JSON.stringify(spec.id)} has state ${JSON.stringify(spec.state)}; expected one of ${ZONE_STATES.join(', ')}.`);
+        }
+        if (spec.label !== undefined && typeof spec.label !== 'string') {
+            fail(`Zone ${JSON.stringify(spec.id)} must have a string label.`);
+        }
+
+        const candle: AnchorCandle = candleAt(fromIndex);
+        // Bounds default to the anchor candle, so a caller that has a bar and
+        // nothing else still gets the conventional zone for it.
+        const top: number = spec.top === undefined ? candle.high : spec.top;
+        const bottom: number = spec.bottom === undefined ? candle.low : spec.bottom;
+        if (!Number.isFinite(top) || !Number.isFinite(bottom)) {
+            fail(`Zone ${JSON.stringify(spec.id)} must have finite top and bottom bounds.`);
+        }
+        if (top < bottom) {
+            fail(`Zone ${JSON.stringify(spec.id)} has top ${top} below its bottom ${bottom}.`);
+        }
+
+        const base: Rgba = spec.color === undefined
+            ? defaultColor
+            : parseColor(spec.color, `zone ${spec.id} colour`);
+        const weights = ZONE_WEIGHTS[state];
+        const fill: Rgba = spec.fill === undefined
+            ? withWeight(base, weights.fill)
+            : parseColor(spec.fill, `zone ${spec.id} fill`);
+        const border: Rgba = spec.border === undefined
+            ? withWeight(base, weights.border)
+            : parseColor(spec.border, `zone ${spec.id} border`);
+
+        resolved.push({
+            id: spec.id,
+            fromIndex,
+            toIndex,
+            top,
+            bottom,
+            fill,
+            border,
+            // The border is what carries the state: solid while live, dashed once
+            // the zone has stopped mattering. Swapping the fill colour instead would
+            // put a colour alarm over a chart that has merely moved on.
+            borderStyle: state === 'live' ? 'solid' : 'dashed',
+            extendLeft: spec.extendLeft === true,
+            label: spec.label ?? '',
+            state,
+        });
+    }
+    return resolved;
+}
+
+/** Ordinal of an exact timestamp, or -1. */
+function exactIndexOfTime(candleTimes: readonly number[], time: number): number {
+    if (!Number.isFinite(time)) return -1;
+    let low = 0;
+    let high = candleTimes.length - 1;
+    while (low <= high) {
+        const middle = (low + high) >>> 1;
+        if (candleTimes[middle] === time) return middle;
+        if (candleTimes[middle] < time) low = middle + 1;
+        else high = middle - 1;
+    }
+    return -1;
+}
+

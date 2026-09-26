@@ -9,7 +9,11 @@ const {
     layoutLabels,
     resolveMarkers,
     resolvePriceLines,
+    resolveZones,
     shouldDrawMarkers,
+    ZONE_WEIGHTS,
+    zonesWithinBudget,
+    zoneStackingOrder,
 } = require('../.test-build/core/decorations.js');
 
 const color = () => [0, 0, 0, 1];
@@ -184,9 +188,167 @@ test('markers are dropped below a few pixels per bar', () => {
     // A marker is a fixed number of pixels wide, so a screen full of them at 2px
     // per bar is a smear. Dropped rather than shrunk: an unreadable marker is worse
     // than an absent one.
+    // A marker is a fixed number of pixels wide, so a screen full of them at 2px
+    // per bar is a smear. Dropped rather than shrunk: an unreadable marker is worse
+    // than an absent one.
     assert.equal(shouldDrawMarkers(12), true);
     assert.equal(shouldDrawMarkers(4), true);
     assert.equal(shouldDrawMarkers(3.9), false);
     assert.equal(shouldDrawMarkers(0), false);
     assert.equal(shouldDrawMarkers(Number.NaN), false);
+});
+
+// --- zones -------------------------------------------------------------------
+
+// Anchor candles with distinguishable bounds, so a test can tell which bar a zone
+// took its extent from.
+const ohlc = new Map(times.map((time, index) => [time, {
+    high: 100 + index,
+    low: 90 + index,
+    close: 95 + index,
+}]));
+const candleAt = (index) => ohlc.get(times[index]);
+// A stand-in for the library's CSS parser that reports *which* string it was given,
+// so a test can tell an override from a default. The real parser is exercised in
+// Options.test.cjs.
+const PARSED = {
+    '#3b82f6': [1, 0.5, 0.2, 1],
+    'rgba(1, 2, 3, 0.4)': [1, 2, 3, 0.4],
+    'rgba(4, 5, 6, 0.9)': [4, 5, 6, 0.9],
+};
+const parse = (css) => {
+    const found = PARSED[css];
+    if (found === undefined) throw new Error(`test parser has no entry for ${css}`);
+    return found;
+};
+const zone = (extra) => resolveZones(
+    [{ id: 'z', time: times[4], ...extra }],
+    times, candleAt, [0.5, 0.5, 0.5, 1], parse,
+);
+
+test('a zone takes its extent from the candle it is anchored to', () => {
+    // The caller had a bar and nothing else, and should still get the conventional
+    // zone for it rather than being asked for numbers it does not have.
+    const resolved = zone({});
+    assert.equal(resolved[0].fromIndex, 4);
+    assert.equal(resolved[0].top, 104, 'top did not come from the anchor candle high');
+    assert.equal(resolved[0].bottom, 94, 'bottom did not come from the anchor candle low');
+    assert.equal(resolved[0].toIndex, null, 'a zone without an end should extend right');
+    assert.equal(resolved[0].state, 'live');
+    assert.equal(resolved[0].borderStyle, 'solid');
+    assert.equal(resolved[0].extendLeft, false);
+    assert.equal(resolved[0].label, '');
+});
+
+test('one colour gives the conventional fill and border pairing', () => {
+    // The point of supplying a single colour: the caller should not have to invent
+    // two alphas, and the result should be a zone with definition that does not
+    // compete with the candles.
+    const resolved = zone({ color: '#3b82f6' });
+    assert.deepEqual(resolved[0].fill, [1, 0.5, 0.2, ZONE_WEIGHTS.live.fill]);
+    assert.deepEqual(resolved[0].border, [1, 0.5, 0.2, ZONE_WEIGHTS.live.border]);
+    // The ratio is the whole point: a border that fades with the fill has no
+    // definition, which is the washed-out look this decoupling exists to fix.
+    assert.ok(
+        resolved[0].border[3] > resolved[0].fill[3] * 3,
+        `border alpha ${resolved[0].border[3]} is not clearly above fill alpha ${resolved[0].fill[3]}`,
+    );
+    assert.ok(resolved[0].fill[3] > 0 && resolved[0].fill[3] < 0.2, 'the default fill is not a faint tint');
+});
+
+test('fill and border can be overridden independently', () => {
+    const resolved = zone({ fill: 'rgba(1, 2, 3, 0.4)', border: 'rgba(4, 5, 6, 0.9)' });
+    assert.deepEqual(resolved[0].fill, [1, 2, 3, 0.4]);
+    assert.deepEqual(resolved[0].border, [4, 5, 6, 0.9]);
+});
+
+test('a mitigated zone fades to a faint dashed outline rather than disappearing', () => {
+    const live = zone({})[0];
+    const mitigated = zone({ state: 'mitigated' })[0];
+    assert.equal(mitigated.fill[3], 0, 'a mitigated zone should have no fill at all');
+    assert.equal(mitigated.borderStyle, 'dashed', 'the border, not the hue, carries the state');
+    assert.ok(mitigated.border[3] < live.border[3], 'a mitigated zone is not fainter than a live one');
+    assert.ok(mitigated.border[3] > 0, 'a mitigated zone still has a visible outline');
+    assert.equal(zone({ state: 'invalidated' })[0].borderStyle, 'dashed');
+    assert.ok(zone({ state: 'invalidated' })[0].border[3] <= ZONE_WEIGHTS.mitigated.border);
+});
+
+test('a zone time between two candles is rejected rather than snapped', () => {
+    // The deliberate difference from a marker. A marker is a point, so a bar's
+    // error is invisible; a zone's left edge is a boundary, so snapping would move
+    // the whole zone by a bar and change which bar it claims to be.
+    assert.throws(
+        () => resolveZones([{ id: 'z', time: times[4] + 30_000 }], times, candleAt, [1, 1, 1, 1], parse),
+        /is not a candle/,
+    );
+});
+
+test('zone bounds are validated, including an inverted range', () => {
+    assert.throws(() => zone({ top: Number.NaN }), /finite top and bottom/);
+    assert.throws(() => zone({ top: 90, bottom: 110 }), /below its bottom/);
+    assert.doesNotThrow(() => zone({ top: 110, bottom: 110 }));
+    assert.doesNotThrow(() => zone({ top: 104, bottom: 100 }));
+});
+
+test('a zone may end at a candle, and may not end before it starts', () => {
+    assert.equal(zone({ to: times[9] })[0].toIndex, 9);
+    assert.throws(() => zone({ to: times[1] }), /ends before it starts/);
+    assert.throws(() => zone({ to: times[9] + 30_000 }), /which is not a candle/);
+    assert.equal(zone({ to: null })[0].toIndex, null, 'an explicit null still extends right');
+});
+
+test('zone ids must be present and unique, and state must be known', () => {
+    assert.throws(() => zone({ id: '' }), /non-empty string id/);
+    assert.throws(
+        () => resolveZones([
+            { id: 'a', time: times[1] },
+            { id: 'a', time: times[2] },
+        ], times, candleAt, [1, 1, 1, 1], parse),
+        /used more than once/,
+    );
+    assert.throws(() => zone({ state: 'stale' }), /expected one of/);
+});
+
+test('zones paint invalidated, then mitigated, then live', () => {
+    // A mitigated zone must sit under the live ones. A faint dashed outline drawn
+    // on top of a live fill puts the quietest thing in the chart over the loudest.
+    const built = resolveZones([
+        { id: 'live-early', time: times[2] },
+        { id: 'mitigated-late', time: times[9], state: 'mitigated' },
+        { id: 'invalidated', time: times[1], state: 'invalidated' },
+        { id: 'live-late', time: times[8] },
+    ], times, candleAt, [1, 1, 1, 1], parse);
+    assert.deepEqual(zoneStackingOrder(built).map((z) => z.id), [
+        'invalidated', 'mitigated-late', 'live-early', 'live-late',
+    ]);
+});
+
+test('the drawing budget keeps every live zone and the most recent history', () => {
+    // Dropping the oldest *live* zone would drop the most visually dominant thing
+    // on the chart, since a live zone extends right across everything.
+    const built = resolveZones([
+        ...Array.from({ length: 6 }, (_, i) => ({ id: `live-${i}`, time: times[i] })),
+        ...Array.from({ length: 6 }, (_, i) => ({
+            id: `mit-${i}`, time: times[6 + i], state: 'mitigated',
+        })),
+    ], times, candleAt, [1, 1, 1, 1], parse);
+    const kept = zonesWithinBudget(built, 8);
+    const keptIds = kept.map((z) => z.id);
+    assert.equal(kept.length, 8);
+    for (let i = 0; i < 6; i++) {
+        assert.ok(keptIds.includes(`live-${i}`), `live zone live-${i} was dropped`);
+    }
+    // The two most recent mitigated ones, not the two oldest.
+    assert.ok(keptIds.includes('mit-5'), 'the most recent mitigated zone was dropped');
+    assert.ok(!keptIds.includes('mit-0'), 'the oldest mitigated zone was kept over a newer one');
+    // And the result is still in paint order.
+    const firstLive = keptIds.indexOf('live-0');
+    const lastMitigated = keptIds.lastIndexOf('mit-5');
+    assert.ok(lastMitigated < firstLive, 'a mitigated zone is painting over a live one');
+});
+
+test('a chart within budget keeps everything, and a limit of zero keeps nothing', () => {
+    const built = zone({});
+    assert.deepEqual(zonesWithinBudget(built, 200), built);
+    assert.equal(zonesWithinBudget(built, 0).length, 0);
 });
