@@ -121,7 +121,31 @@ Historical corrections that are not the current last candle require `replaceData
 After `destroy()` the chart is unusable: every public method, including the read API and the subscriptions, throws exactly `MatrixCharts: This chart has been destroyed.` No method quietly serves stale state. `destroy()` is idempotent, so it is safe to call from more than one teardown path.
 
 
-The horizontal coordinate is the candle **ordinal index**, not wall-clock time. Closed sessions (nights, weekends, holidays) are compressed. Axis and crosshair labels snap to real candle timestamps.
+The horizontal coordinate is the candle **ordinal index**, not wall-clock time. Axis and crosshair labels snap to real candle timestamps.
+
+## Session breaks
+
+A traditional equity feed has overnight and weekend gaps that are not missing data, and drawing a series as though time ran continuously through them is wrong twice over: it asserts the market was trading, and on 1-minute bars a 17-hour break drawn honestly is a thousand bars wide while a weekend is thirty screens of white.
+
+So a break is shown as a break, and sized in **slots** rather than in hours. Every bar is one slot wide. A bar after a break is given extra slots, so the x transform stays affine — `x = offsetX + slot * scaleX` — and the shader, the vertex format, the vertex generators and every existing series are untouched. It is the same trick the log price scale uses on the other axis, and for the same reason: a non-affine transform would have to be reimplemented on both sides of the GPU boundary.
+
+| Option | Default | Meaning |
+|---|---|---|
+| `timeScale.sessionBreaks.enabled` | `true` | Whether closed sessions are shown as breaks. `false` is the exact transform that shipped before the feature. |
+| `timeScale.sessionBreaks.mode` | `'collapsed'` | `'collapsed'` gives every break half a bar. `'proportional'` gives each break width in proportion to its duration, up to the cap. |
+| `timeScale.sessionBreaks.maxWhitespaceRatio` | `0.25` | Cap on the **total** whitespace, as a fraction of the series' bar count. |
+
+Three properties are worth stating because they are the ones a caller is likely to depend on:
+
+**The index API is unchanged in meaning.** The ordinal is still the identity of the series. `getVisibleLogicalRange()`, `getCandleAt(i)` and `indexToCoordinate(i)` all work exactly as before, and `getCandleAt` is unaffected by where gaps are. What changed is that the ordinal is no longer the *axis*: `indexToCoordinate` is no longer linear in `i`, and any caller that was treating a difference in indices as a distance in pixels must go through the coordinate methods instead.
+
+**The wall-clock API is additive.** `timeToCoordinate(time)` and `coordinateToTime(x)` sit beside the index methods, and a time inside a break resolves to the bar on the nearer side — the only defensible answer for an instant the market was shut.
+
+**Breaks are found from the data, not from a calendar.** The threshold is the *modal* interval times three. A mean would be the obvious choice and is wrong: one weekend in a week of 1-minute bars moves the mean to nearly ten minutes, and a chart that believed it was drawing 10-minute bars would draw a 17-hour gap as barely one of them. A session calendar is the more principled answer and is not used, because it is the thing that has to be per-exchange and per-holiday and is wrong the day a holiday moves.
+
+The cap is on the total rather than per break, because the failure mode is cumulative: thirty individually reasonable breaks are still a chart of nothing. It is expressed in slots rather than pixels so it survives a resize instead of quietly changing meaning when the window does.
+
+`priceScale` is a separate axis and shares only the tick generator.
 
 ## Reading the viewport
 
@@ -427,6 +451,6 @@ A candle field that is not a finite number is rejected at the transport boundary
 
 ## Breaking vs additive
 
-**Breaking:** changing `CandleData` field units; adding required fields; new required feed message types for a working live chart; removing any export in the table above; changing the package entry or its `exports` conditions; changing mutation ordering rules; changing the half-open index range or inclusive time range conventions; making a conversion depend on `devicePixelRatio`; changing when an event fires or what a `null` field means; making `maxRetainedCandles` settable at runtime; changing a resolved default or a validation rule; changing the WebGL2 or post-destroy error strings, or what `destroy()` removes; requiring wall-clock X; dropping the WebGL2 requirement without a replacement renderer.
+**Breaking:** changing `CandleData` field units; adding required fields; new required feed message types for a working live chart; removing any export in the table above; changing the package entry or its `exports` conditions; changing mutation ordering rules; changing the half-open index range or inclusive time range conventions; making a conversion depend on `devicePixelRatio`; changing when an event fires or what a `null` field means; making `maxRetainedCandles` settable at runtime; changing a resolved default or a validation rule; changing the WebGL2 or post-destroy error strings, or what `destroy()` removes; removing or reinterpreting the index-space read API; dropping the WebGL2 requirement without a replacement renderer.
 
 **Additive (allowed in 1.x):** extra optional `ChartOptions`; new `Chart` methods; optional feed fields the v1 client ignores; extra exports.

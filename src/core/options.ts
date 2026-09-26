@@ -8,6 +8,7 @@
 
 import { DEFAULT_CANDLE_SPACING_PX } from '../math/candlestickBodyWidth.js';
 import { resolvePaneOptions } from './panes.js';
+import { DEFAULT_MAX_WHITESPACE_RATIO } from './sessionScale.js';
 
 export type ChartTheme = 'dark' | 'paper';
 
@@ -137,6 +138,40 @@ export interface CrosshairOptions {
     color?: string;
 }
 
+/**
+ * How closed sessions are drawn.
+ *
+ * On by default. A traditional equity feed has overnight and weekend gaps that are
+ * not missing data, and drawing the series as though time ran continuously through
+ * them is simply wrong: a 17-hour break in a chart of 1-minute bars is about a
+ * thousand bars wide, and honest about it produces a chart that is thirty screens of
+ * white. A break is therefore shown as a break — the series is not drawn across it —
+ * but sized in slots rather than in hours.
+ *
+ * Additive in 1.x: no sessionBreaks block, or enabled false, is the transform that
+ * shipped before this existed.
+ */
+export interface SessionGapOptions {
+    /** Whether closed sessions are shown as breaks. Defaults to true. */
+    enabled?: boolean;
+    /**
+     * `collapsed` gives every break the same half-bar width, and is the default.
+     * `proportional` gives each break width in proportion to its duration, up to
+     * the cap. Proportional is the more honest picture and the less usable one, which
+     * is why it is not the default.
+     */
+    mode?: 'collapsed' | 'proportional';
+    /**
+     * Cap on the *total* whitespace, as a fraction of the series' bar count.
+     *
+     * A total rather than a per-break limit, because the failure mode is cumulative:
+     * thirty individually reasonable breaks are still a chart of nothing. Expressed in
+     * slots rather than pixels so it survives a resize instead of quietly changing
+     * meaning when the window does.
+     */
+    maxWhitespaceRatio?: number;
+}
+
 export interface TimeScaleOptions {
     /** CSS px per candle index. */
     barSpacing?: number;
@@ -144,6 +179,8 @@ export interface TimeScaleOptions {
     minBarSpacing?: number;
     /** Upper clamp applied to wheel and pinch zoom. */
     maxBarSpacing?: number;
+    /** How closed sessions are drawn. */
+    sessionBreaks?: SessionGapOptions;
 }
 
 /**
@@ -243,7 +280,18 @@ export interface ResolvedPanes {
     separatorColor: string;
 }
 export interface ResolvedCrosshair { visible: boolean; color: string }
-export interface ResolvedTimeScale { barSpacing: number; minBarSpacing: number; maxBarSpacing: number }
+export interface ResolvedSessionBreaks {
+    enabled: boolean;
+    mode: 'collapsed' | 'proportional';
+    maxWhitespaceRatio: number;
+}
+
+export interface ResolvedTimeScale {
+    barSpacing: number;
+    minBarSpacing: number;
+    maxBarSpacing: number;
+    sessionBreaks: ResolvedSessionBreaks;
+}
 export interface ResolvedCandlestick {
     upColor: string;
     downColor: string;
@@ -296,6 +344,11 @@ const BASE_DEFAULTS: Omit<ResolvedChartOptions, 'theme' | 'locale' | 'candlestic
         barSpacing: DEFAULT_CANDLE_SPACING_PX,
         minBarSpacing: DEFAULT_MIN_BAR_SPACING,
         maxBarSpacing: DEFAULT_MAX_BAR_SPACING,
+        sessionBreaks: {
+            enabled: true,
+            mode: 'collapsed',
+            maxWhitespaceRatio: DEFAULT_MAX_WHITESPACE_RATIO,
+        },
     },
 };
 
@@ -630,6 +683,29 @@ export function resolveOptions(partial: ChartOptions, fallbackTheme: ChartTheme 
         }
         if (scale.autoScale !== undefined) {
             resolved.priceScale.autoScale = requireBoolean(scale.autoScale, 'priceScale.autoScale');
+        }
+    }
+
+    if (partial.timeScale?.sessionBreaks !== undefined) {
+        const gaps = requirePlainObject(partial.timeScale.sessionBreaks, 'timeScale.sessionBreaks');
+        const target = resolved.timeScale.sessionBreaks;
+        if (gaps.enabled !== undefined) target.enabled = requireBoolean(gaps.enabled, 'timeScale.sessionBreaks.enabled');
+        if (gaps.mode !== undefined) {
+            if (gaps.mode !== 'collapsed' && gaps.mode !== 'proportional') {
+                fail('timeScale.sessionBreaks.mode must be \'collapsed\' or \'proportional\'.');
+            }
+            target.mode = gaps.mode;
+        }
+        if (gaps.maxWhitespaceRatio !== undefined) {
+            const ratio = requireNonNegativeNumber(
+                gaps.maxWhitespaceRatio,
+                'timeScale.sessionBreaks.maxWhitespaceRatio',
+            );
+            // A negative cap is not a tight cap, it is a sign error, and it would make
+            // the sizing maths return negative slots — bars drawn inside each other.
+            if (ratio < 0) fail('timeScale.sessionBreaks.maxWhitespaceRatio cannot be negative.');
+            if (!Number.isFinite(ratio)) fail('timeScale.sessionBreaks.maxWhitespaceRatio must be finite.');
+            target.maxWhitespaceRatio = ratio;
         }
     }
 

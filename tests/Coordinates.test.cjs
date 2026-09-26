@@ -28,6 +28,11 @@ const {
 // override, because that is the chart's default layout: nothing is reserved for
 // the axes. A test that narrows the canvas must narrow the plot with it, or it is
 // no longer describing a chart that exists.
+// `slots: null` is the identity — an unbroken series — and is stated rather than
+// left out, so a literal that forgets the field is a missing table rather than an
+// absent one. The two read the same at runtime; the distinction is worth keeping in
+// the test source, because the runtime cannot tell them apart and can therefore not
+// defend against getting it wrong.
 const viewport = (overrides = {}) => {
     const base = {
         offsetX: 0,
@@ -36,6 +41,7 @@ const viewport = (overrides = {}) => {
         scaleY: -2,
         cssWidth: 800,
         cssHeight: 500,
+        slots: null,
         ...overrides,
     };
     return {
@@ -91,7 +97,7 @@ test('the default plot rect is the whole canvas', () => {
     assert.deepEqual(visibleLogicalRange(view, 100), { from: 0, to: 100 });
     // offsetY 1000 at -2 px per unit puts price 500 at the top and 250 at the bottom.
     assert.deepEqual(visiblePriceRange(viewport({ offsetY: 1000 })), [250, 500]);
-    assert.equal(liveEdgeOffsetX(plotRight(view), 10, 8), 800 - 9.5 * 8);
+    assert.equal(liveEdgeOffsetX(plotRight(view), null, 10, 8), 800 - 9.5 * 8);
 });
 
 test('an inset plot rect narrows the visible range without moving the transform', () => {
@@ -100,6 +106,11 @@ test('an inset plot rect narrows the visible range without moving the transform'
     const plain = viewport({ offsetX: 0, scaleX: 10 });
     const inset = insetViewport({ offsetX: 0, scaleX: 10 });
 
+    // `to` is 80, and the boundary is the whole reason. The plot's right edge sits at
+    // exactly slot 80, and bars are positioned by their left edge, so bar 80 starts
+    // where the plot ends and has no width on screen. It is excluded, and 79 is the
+    // last bar drawn. The two ends of the range round differently for this reason:
+    // a bar clipped on the left counts, a bar starting on the right does not.
     assert.deepEqual(visibleLogicalRange(plain, 200), { from: 0, to: 80 });
     // Plot x 70 at 10px per bar starts at index 7; plot right 800 still ends at 80.
     assert.deepEqual(visibleLogicalRange(inset, 200), { from: 7, to: 80 });
@@ -139,13 +150,13 @@ test('the live edge is an absolute plot edge, not a width', () => {
     const scaleX = 8;
     const count = 20;
     const right = 70 + 730;
-    const offset = liveEdgeOffsetX(right, count, scaleX);
+    const offset = liveEdgeOffsetX(right, null, count, scaleX);
     assert.equal(indexToCoordinate(insetViewport({ offsetX: offset, scaleX }), count - 1), right - 4);
-    assert.equal(isAtLiveEdgeOffset(offset, scaleX, count, right), true);
+    assert.equal(isAtLiveEdgeOffset(offset, scaleX, null, count, right), true);
     // The stale width-based value is genuinely short, and is not at the edge.
-    const widthBased = liveEdgeOffsetX(730, count, scaleX);
+    const widthBased = liveEdgeOffsetX(730, null, count, scaleX);
     assert.equal(indexToCoordinate(insetViewport({ offsetX: widthBased, scaleX }), count - 1), right - 4 - 70);
-    assert.equal(isAtLiveEdgeOffset(widthBased, scaleX, count, right), false);
+    assert.equal(isAtLiveEdgeOffset(widthBased, scaleX, null, count, right), false);
 });
 
 test('conversions are identical at dpr 1 and dpr 2', () => {
@@ -208,7 +219,7 @@ test('visible range is half-open and includes partial bars', () => {
 test('visible range includes the newest candle at the live edge', () => {
     const count = 120;
     const scaleX = 7;
-    const offsetX = liveEdgeOffsetX(800, count, scaleX);
+    const offsetX = liveEdgeOffsetX(800, null, count, scaleX);
 
     // The live edge insets the last bar by half a bar, so it is fully on screen.
     closeTo(offsetX, 800 - (count - LIVE_EDGE_INSET) * scaleX, 'live edge offset');
@@ -241,7 +252,7 @@ test('visible range covers a single candle from either side', () => {
     // Scrolled so the only candle is just off the left edge.
     assert.deepEqual(visibleLogicalRange(viewport({ offsetX: -20, scaleX: 8 }), 1), { from: 1, to: 1 });
     // Pinned at the live edge.
-    const edge = viewport({ offsetX: liveEdgeOffsetX(800, 1, 8), scaleX: 8 });
+    const edge = viewport({ offsetX: liveEdgeOffsetX(800, null, 1, 8), scaleX: 8 });
     assert.deepEqual(visibleLogicalRange(edge, 1), { from: 0, to: 1 });
 });
 
@@ -271,25 +282,25 @@ test('live edge detection tolerates a drag but not a real pan', () => {
     const count = 100;
     const scaleX = 8;
     const cssWidth = 800;
-    const edgeOffset = liveEdgeOffsetX(cssWidth, count, scaleX);
+    const edgeOffset = liveEdgeOffsetX(cssWidth, null, count, scaleX);
 
-    assert.equal(isAtLiveEdgeOffset(edgeOffset, scaleX, count, cssWidth), true);
+    assert.equal(isAtLiveEdgeOffset(edgeOffset, scaleX, null, count, cssWidth), true);
     // Dragging the last bar anywhere within the tolerance still counts as live.
-    assert.equal(isAtLiveEdgeOffset(edgeOffset - 20, scaleX, count, cssWidth), true);
-    assert.equal(isAtLiveEdgeOffset(edgeOffset + 20, scaleX, count, cssWidth), true);
+    assert.equal(isAtLiveEdgeOffset(edgeOffset - 20, scaleX, null, count, cssWidth), true);
+    assert.equal(isAtLiveEdgeOffset(edgeOffset + 20, scaleX, null, count, cssWidth), true);
     // A real pan out of the tolerance does not.
-    assert.equal(isAtLiveEdgeOffset(edgeOffset - 200, scaleX, count, cssWidth), false);
-    assert.equal(isAtLiveEdgeOffset(edgeOffset + 400, scaleX, count, cssWidth), false);
+    assert.equal(isAtLiveEdgeOffset(edgeOffset - 200, scaleX, null, count, cssWidth), false);
+    assert.equal(isAtLiveEdgeOffset(edgeOffset + 400, scaleX, null, count, cssWidth), false);
     // An empty series is trivially at the live edge.
-    assert.equal(isAtLiveEdgeOffset(12345, scaleX, 0, cssWidth), true);
+    assert.equal(isAtLiveEdgeOffset(12345, scaleX, null, 0, cssWidth), true);
 });
 
 test('live edge offset is monotonic in bar count and spacing', () => {
-    const base = liveEdgeOffsetX(800, 100, 8);
+    const base = liveEdgeOffsetX(800, null, 100, 8);
     // Appending a bar while following keeps the last bar parked at the edge.
-    const appended = liveEdgeOffsetX(800, 101, 8);
+    const appended = liveEdgeOffsetX(800, null, 101, 8);
     assert.equal(base - appended, 8, 'one bar of spacing per appended candle');
-    assert.ok(liveEdgeOffsetX(800, 100, 16) < base, 'wider bars park further left');
+    assert.ok(liveEdgeOffsetX(800, null, 100, 16) < base, 'wider bars park further left');
 });
 
 test('time lookup picks the nearest timestamp without interpolating a gap', () => {
@@ -372,7 +383,7 @@ test('panning inside one bar can leave the visible range untouched', () => {
     // an edge across a bar boundary, which is sticky because the left edge floors
     // and the right edge ceils. Between boundaries a multi-pixel drag is silent.
     const viewport = (offsetX) => ({
-        offsetX, offsetY: 0, scaleX: 8, scaleY: -2, cssWidth: 128, cssHeight: 400,
+        offsetX, offsetY: 0, scaleX: 8, scaleY: -2, slots: null, cssWidth: 128, cssHeight: 400,
         plot: { x: 0, y: 0, width: 128, height: 400 },
     });
     assert.deepEqual(visibleLogicalRange(viewport(-35), 100), { from: 4, to: 21 });

@@ -1,5 +1,11 @@
 // src/core/coordinates.ts
 //
+// Slot helpers come from the session model. They are null-tolerant: a null slot
+// array means the identity, so an unbroken chart takes the path it always took.
+import { barsBeforeSlot, indexAtSlot, slotAtIndex } from './sessionScale.js';
+
+// src/core/coordinates.ts
+//
 // Pure chart geometry in CSS pixels, shared by Chart, the axis renderer, and the
 // public read API so those three can never disagree about what is on screen.
 //
@@ -43,11 +49,19 @@ export function plotCentreX(viewport: ChartViewport): number {
 
 /** Spherical transform of the plot area, all values in CSS pixels. */
 export interface ChartViewport {
-    /** Screen x of logical index 0. */
+    /** Screen x of slot 0. */
     offsetX: number;
     /** Screen y of price 0. */
     offsetY: number;
-    /** CSS pixels per candle index. */
+    /**
+     * CSS pixels per slot.
+     *
+     * A bar is one slot wide, so for an unbroken series this is the pixels per bar
+     * and every number in the API keeps its meaning. Where a session break adds
+     * slots, it is still the bar spacing; the break occupies slots of its own rather
+     * than pushing later bars along, so panning and zooming stay in the units the
+     * caller configured them in.
+     */
     scaleX: number;
     /** CSS pixels per price unit. Negative: price grows upward. */
     scaleY: number;
@@ -57,6 +71,14 @@ export interface ChartViewport {
     cssHeight: number;
     /** Region series occupy, inside the container. */
     plot: PlotRect;
+    /**
+     * Slot offset of every bar, or null when the series has no session breaks.
+     *
+     * Null is the identity rather than a special case, so an unbroken chart is
+     * bit-for-bit the transform that shipped for six phases and no existing caller
+     * has to know slots exist.
+     */
+    slots: Float64Array | null;
 }
 
 /**
@@ -86,11 +108,31 @@ export interface TimeRange {
 export const LIVE_EDGE_INSET = 0.5;
 
 export function indexToCoordinate(viewport: ChartViewport, index: number): number {
-    return viewport.offsetX + index * viewport.scaleX;
+    return viewport.offsetX + slotAtIndex(viewport.slots, index) * viewport.scaleX;
 }
 
-export function coordinateToIndex(viewport: ChartViewport, coordinateX: number): number {
+/**
+ * Fractional slot position at a screen x.
+ *
+ * Slot rather than index, and that is the whole reason the axis has two units. A
+ * fractional index is only meaningful while bars are evenly spaced; with a break in
+ * the series, "index 20.4" names no position at all, whereas slot 20.4 is exactly
+ * where the pixel is.
+ */
+export function coordinateToSlot(viewport: ChartViewport, coordinateX: number): number {
     return (coordinateX - viewport.offsetX) / viewport.scaleX;
+}
+
+/**
+ * Index of the bar at a screen x.
+ *
+ * A whole index, not a fraction. With session breaks there is no such thing as a
+ * fractional index — the gap between bar 20 and bar 21 is not a number of bars — so
+ * every caller that used to read a fraction here wanted a bar, and the two that did
+ * not have been relying on it to pick a bucket, which the draw range gives directly.
+ */
+export function coordinateToIndex(viewport: ChartViewport, coordinateX: number): number {
+    return indexAtSlot(viewport.slots, coordinateToSlot(viewport, coordinateX));
 }
 
 export function priceToCoordinate(viewport: ChartViewport, price: number): number {
@@ -108,8 +150,8 @@ export function clampCandleIndex(index: number, candleCount: number): number {
 
 /**
  * Index of the candle nearest a screen x. Returns -1 for an empty series.
- * Selection is by index distance, so a bar is picked the same way whether or not
- * the series has gaps.
+ * Selection is by distance along the axis, so a bar is picked the same way whether or
+ * not the series has gaps.
  */
 export function nearestCandleIndex(
     viewport: ChartViewport,
@@ -117,20 +159,50 @@ export function nearestCandleIndex(
     candleCount: number,
 ): number {
     if (candleCount <= 0) return -1;
-    return clampCandleIndex(coordinateToIndex(viewport, coordinateX), candleCount);
+    // Rounded here rather than left to the lookup, because "nearest" is a rounding
+    // and the axis a bar sits on is not a uniform index spacing once gaps are in it.
+    return clampCandleIndex(
+        Math.round(indexAtSlot(viewport.slots, coordinateToSlot(viewport, coordinateX))),
+        candleCount,
+    );
 }
 
 /** Visible candle indices, partial bars included, clamped to the series. */
 export function visibleLogicalRange(viewport: ChartViewport, candleCount: number): LogicalRange {
     if (candleCount <= 0) return { from: 0, to: 0 };
 
-    const firstPartial: number = coordinateToIndex(viewport, viewport.plot.x);
-    const lastPartial: number = coordinateToIndex(
-        viewport,
-        viewport.plot.x + viewport.plot.width,
+    // Both ends are clamped in *slot* space and the fully-off cases are named
+    // separately, because clamping an index throws away the one thing that matters
+    // here: a plot scrolled off the left of the series and a plot whose left edge
+    // rests on the first bar both clamp to index 0, and only one of them has a
+    // visible bar. Clamping after the conversion makes the first report one.
+    // Bars are positioned by their left edge and are one slot wide, so the last one
+    // ends a slot after its own position. Comparing the left edge of the plot against
+    // the last bar's *centre* instead would declare the series off-screen while that
+    // bar was still fully visible.
+    const lastSlot: number = slotAtIndex(viewport.slots, candleCount - 1);
+    const lastRightSlot: number = lastSlot + 1;
+    const leftSlot: number = coordinateToSlot(viewport, viewport.plot.x);
+    const rightSlot: number = coordinateToSlot(viewport, viewport.plot.x + viewport.plot.width);
+    if (rightSlot <= 0) return { from: 0, to: 0 };
+    if (leftSlot >= lastRightSlot) return { from: candleCount, to: candleCount };
+
+    // `from` is the last bar whose left edge is at or before the plot's left edge, so
+    // a bar clipped in half still counts. `to` is the count of bars whose left edge is
+    // at or before the right edge, so a bar ending exactly *on* the right edge is not
+    // counted — it has no width on screen. The two ends genuinely want different
+    // roundings, which is why one is an index and the other a count.
+    const from: number = Math.max(
+        0,
+        Math.min(
+            candleCount,
+            Math.floor(indexAtSlot(viewport.slots, Math.max(0, leftSlot))),
+        ),
     );
-    const from: number = Math.max(0, Math.min(candleCount, Math.floor(firstPartial)));
-    const to: number = Math.max(from, Math.min(candleCount, Math.ceil(lastPartial)));
+    const to: number = Math.max(
+        from,
+        Math.min(candleCount, barsBeforeSlot(viewport.slots, Math.min(rightSlot, lastRightSlot))),
+    );
     return { from, to };
 }
 
@@ -176,19 +248,31 @@ export function isSameVisibleRange(
  * rather than a width: a left gutter shifts the whole plot right, so passing a
  * width here would park the newest bar that many pixels short of the edge.
  */
-export function liveEdgeOffsetX(plotRightEdge: number, candleCount: number, scaleX: number): number {
-    return plotRightEdge - (candleCount - LIVE_EDGE_INSET) * scaleX;
+export function liveEdgeOffsetX(
+    plotRightEdge: number,
+    slots: Float64Array | null,
+    candleCount: number,
+    scaleX: number,
+): number {
+    // The last bar's *slot*, not its index. On an unbroken series those are the same
+    // number and this is the expression that shipped before slots; with a break in
+    // the series, using the index would park the newest bar short of the edge by the
+    // whole of the gap before it, which on a week of 1-minute bars is most of a
+    // screen.
+    const lastSlot: number = slotAtIndex(slots, candleCount - 1);
+    return plotRightEdge - (lastSlot + LIVE_EDGE_INSET) * scaleX;
 }
 
 /** Whether a viewport is close enough to the live edge to keep following it. */
 export function isAtLiveEdgeOffset(
     offsetX: number,
     scaleX: number,
+    slots: Float64Array | null,
     candleCount: number,
     plotRightEdge: number,
 ): boolean {
     if (candleCount === 0) return true;
-    const lastCandleX: number = offsetX + (candleCount - 1) * scaleX;
+    const lastCandleX: number = offsetX + slotAtIndex(slots, candleCount - 1) * scaleX;
     const tolerance: number = Math.max(24, scaleX * 1.5);
     return lastCandleX >= plotRightEdge - tolerance && lastCandleX <= plotRightEdge + tolerance;
 }

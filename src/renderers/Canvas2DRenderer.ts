@@ -12,11 +12,13 @@ import {
     type PlotRect,
     clampCandleIndex,
     coordinateToIndex,
+    coordinateToSlot,
     coordinateToPrice,
     indexToCoordinate,
 } from '../core/coordinates.js';
 import { paneValueAt, type PaneLayout } from '../core/panes.js';
 import { fromScaleSpace, priceTicks, toScaleSpace, type PriceScale, type Tick } from '../core/priceScale.js';
+import { indexAtSlot } from '../core/sessionScale.js';
 import {
     LABEL_PRIORITY,
     layoutLabels,
@@ -88,6 +90,15 @@ export class Canvas2DRenderer implements IRenderer {
     private offsetY: number = 0;
     private scaleX: number = 1;
     private scaleY: number = 1;
+    /**
+     * Slot offset of every bar, or null when the series has no breaks.
+     *
+     * Read only through the helpers in `coordinates`, which take a null table as the
+     * identity. The one place this renderer has to think in slots itself is the
+     * time-axis tick loop, and that is the reason it is here rather than derived:
+     * a step of N indices is not a step of N bars' width once a gap sits between them.
+     */
+    private slotOffsets: Float64Array | null = null;
     /** Region series occupy. Equals the canvas until the axes claim space. */
     private plot: PlotRect = { x: 0, y: 0, width: 0, height: 0 };
     private devicePixelRatio: number = 1;
@@ -161,6 +172,7 @@ public init(canvas: HTMLCanvasElement, emitter: EventEmitter<ChartEvents>): void
         this.offsetX = payload.offsetX;
         this.offsetY = payload.offsetY;
         this.scaleX = payload.scaleX;
+        this.slotOffsets = payload.slots;
         this.scaleY = payload.scaleY;
         this.plot = payload.plot;
         // Absent means no panes were declared, and every label is then drawn from
@@ -226,6 +238,7 @@ public init(canvas: HTMLCanvasElement, emitter: EventEmitter<ChartEvents>): void
             offsetX: this.offsetX,
             offsetY: this.offsetY,
             scaleX: this.scaleX,
+            slots: this.slotOffsets,
             scaleY: this.scaleY,
             cssWidth,
             cssHeight,
@@ -274,9 +287,16 @@ public init(canvas: HTMLCanvasElement, emitter: EventEmitter<ChartEvents>): void
 
         this.ctx.beginPath();
 
-        const timeTickStep: number = this.niceStep(96 / this.scaleX);
+        // The step is in *slots*, and that is why this loop cannot be a plain
+        // for over indices. A step of N indices is N bars only while bars are evenly
+        // spaced; with a break in the series the same step covers a different number
+        // of pixels on each side of it, so labels crowd against one edge of an
+        // overnight gap and spread out through the session beside it. A step of N slots
+        // is N bar widths everywhere, and the slots that land inside a break resolve
+        // to no bar, which is what leaves a gap visibly empty rather than labelled.
+        const timeTickStep: number = Math.max(1, Math.round(this.niceStep(96 / this.scaleX)));
         const firstTimeTick: number = Math.ceil(
-            coordinateToIndex(viewport, plot.x) / timeTickStep,
+            coordinateToSlot(viewport, plot.x) / timeTickStep,
         ) * timeTickStep;
 
         // Which axis labels are drawn is decided once, with the decorations, because
@@ -302,9 +322,15 @@ public init(canvas: HTMLCanvasElement, emitter: EventEmitter<ChartEvents>): void
         }
 
         if (this.options.grid.vertLines) {
+            // Progress, not position, is the exit. Positions stop advancing once the
+            // step runs past the end of the series, because the slot lookup clamps
+            // rather than returning -1, so a test against plotRight alone is a loop
+            // that only terminates while there are no session breaks to clamp.
+            let previousX: number = Number.NEGATIVE_INFINITY;
             for (let time: number = firstTimeTick; ; time += timeTickStep) {
-                const x: number = indexToCoordinate(viewport, time);
-                if (x > plotRight) break;
+                const x: number = indexToCoordinate(viewport, indexAtSlot(this.slotOffsets, time));
+                if (x > plotRight || x <= previousX) break;
+                previousX = x;
                 if (x < plot.x) continue;
                 const crispX: number = Math.floor(x) + 0.5;
                 this.ctx.moveTo(crispX, plot.y);
@@ -616,11 +642,20 @@ public init(canvas: HTMLCanvasElement, emitter: EventEmitter<ChartEvents>): void
         // top of both panes rather than being interrupted by the label boxes.
         this.renderPaneSeparators();
 
+        // The same progress-based exit as the grid loop above, and for the same
+        // reason: this loop steps in slots, the slot lookup clamps past the end of the
+        // series, and so x stops advancing exactly where the other one does. Sharing
+        // the tick list with the grid would be tidier still, but these two already
+        // have to agree on the step and re-deriving it here is what made them able to
+        // disagree in the first place.
+        let previousX: number = Number.NEGATIVE_INFINITY;
         for (let time: number = firstTimeTick; ; time += timeTickStep) {
-            const x: number = indexToCoordinate(viewport, time);
-            if (x > plotRight) break;
+            const index: number = indexAtSlot(this.slotOffsets, time);
+            const x: number = indexToCoordinate(viewport, index);
+            if (x > plotRight || x <= previousX) break;
+            previousX = x;
             if (x < plot.x) continue;
-            this.drawLabel(this.formatTimeAtIndex(time), x, plotBottom + TIME_LABEL_OFFSET_Y, 'center');
+            this.drawLabel(this.formatTimeAtIndex(index), x, plotBottom + TIME_LABEL_OFFSET_Y, 'center');
         }
 
         this.ctx.restore();

@@ -11,6 +11,14 @@ export interface ChartEvents {
         offsetY: number;
         scaleX: number;
         scaleY: number;
+        /**
+         * Slot offset of every retained bar, or null when the series has no breaks.
+         *
+         * The transform stays affine: `x = offsetX + slot * scaleX`, with the
+         * shader untouched, because it multiplies whatever it is given by the scale
+         * and adds the offset. Feeding slots is the entire change on the GPU side.
+         */
+        slots: Float64Array | null;
         /** Region series occupy, in CSS pixels relative to the canvas. */
         plot: PlotRect;
         /**

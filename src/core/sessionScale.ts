@@ -226,8 +226,16 @@ export function totalSlots(offsets: Float64Array): number {
  * bars. A slot before the first bar or after the last clamps to an end rather than
  * returning -1, because a pointer dragged past either edge of the chart still has
  * to resolve to the bar nearest it.
+ *
+ * A null `offsets` means the series has no breaks, and is the identity: slot `s` is
+ * bar `s`. Deliberately *not* rounded, because that would take the sub-bar precision
+ * away from the callers that need it — `nearestCandleIndex` rounds a slot to the
+ * nearest bar, and folding that into this lookup would round twice and pick the
+ * wrong bar whenever the cursor sat just past a boundary. The callers that want a
+ * whole bar round here, where they say which way.
  */
-export function indexAtSlot(offsets: Float64Array, slot: number): number {
+export function indexAtSlot(offsets: Float64Array | null, slot: number): number {
+    if (offsets === null) return slot;
     const count: number = offsets.length;
     if (count === 0) return -1;
     if (slot <= offsets[0]) return 0;
@@ -243,13 +251,39 @@ export function indexAtSlot(offsets: Float64Array, slot: number): number {
 }
 
 /**
+ * How many bars have their left edge strictly before `slot`.
+ *
+ * A separate question from `indexAtSlot`, and the two have different answers at a
+ * boundary. A bar whose left edge sits exactly on the plot's right edge is not
+ * visible, so it must not be counted — which is what makes this a count rather than
+ * `indexAtSlot(...) + 1`. Over an unbroken series the two agree except on exact
+ * integers, and on exact integers the count is the right one: a plot ending at slot
+ * 80 shows bars 0 to 79.
+ *
+ * The comparison is exact rather than epsilon-guarded, and can be: every value in a
+ * slot table is a sum of 1s and halves, so the boundary cases are representable and
+ * an epsilon here would only turn a correct answer into a wrong one near it.
+ */
+export function barsBeforeSlot(offsets: Float64Array | null, slot: number): number {
+    if (offsets === null) return Math.ceil(slot);
+    const count: number = offsets.length;
+    if (count === 0) return 0;
+    // The largest bar whose left edge is strictly before the slot. `indexAtSlot`
+    // answers for `<=`, so when the two land on the same bar it is sitting exactly on
+    // the edge and the answer is that bar's own index rather than the next one.
+    const containing: number = indexAtSlot(offsets, slot);
+    return offsets[containing] < slot ? containing + 1 : containing;
+}
+
+/**
  * Slot position of a bar's centre.
  *
  * Centres rather than left edges, because a bar's visual extent is its body and
  * body and wick are drawn from its centre, so a coordinate taken from a left edge
  * would be half a bar off everything drawn.
  */
-export function slotAtIndex(offsets: Float64Array, index: number): number {
+export function slotAtIndex(offsets: Float64Array | null, index: number): number {
+    if (offsets === null) return index;
     if (offsets.length === 0) return 0;
     const clamped: number = Math.max(0, Math.min(offsets.length - 1, Math.trunc(index)));
     const next: number = clamped + 1 < offsets.length ? offsets[clamped + 1] : offsets[clamped] + 1;

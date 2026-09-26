@@ -47,7 +47,6 @@ import {
     type PriceLineSpec,
     type ResolvedMarker,
     type ResolvedPriceLine,
-    scaleOverlayPoints,
     type ZoneSpec,
 } from './decorations.js';
 import type { VerticalTransform } from '../renderers/WebGLSeries.js';
@@ -57,6 +56,13 @@ import {
     toScaleSpace,
     type PriceScale,
 } from './priceScale.js';
+import {
+    computeSlotOffsets,
+    indexAtTime,
+    resolveSessionBreaks,
+    sizeSessionBreaks,
+    slotAtIndex,
+} from './sessionScale.js';
 import {
     bucketOverlay,
     resolveOverlays,
@@ -152,6 +158,15 @@ export class Chart {
      * reallocating a full candle buffer on every animation frame.
      */
     private scaledCandleBuffer: Float32Array = new Float32Array(0);
+    /**
+     * Slot offset of every retained bar, or null when the series has no breaks.
+     *
+     * Rebuilt only when the data changes. Pan and zoom never touch it, which is
+     * the reason the unit is slots: a per-bar table rebuilt on every wheel tick
+     * would cost more than the candle pyramid, and a table in wall-clock deltas
+     * would make the x transform a function of the viewport rather than of the data.
+     */
+    private slotOffsets: Float64Array | null = null;
     /**
      * Pane rects and vertical transforms for the current frame, in CSS pixels.
      * Recomputed with the viewport, because both depend on it.
@@ -531,6 +546,19 @@ export class Chart {
         this.candleColors = nextColors;
         if (nextOverlays !== null) this.overlays = nextOverlays;
 
+        // Switching a gap off, or between collapsed and proportional, changes every
+        // slot after the first break, so the table is rebuilt here. Not per frame and
+        // not on pan or zoom — this is an options change and options change rarely.
+        const gapsWere = previous.timeScale.sessionBreaks;
+        const gapsAre = nextResolved.timeScale.sessionBreaks;
+        if (
+            gapsWere.enabled !== gapsAre.enabled ||
+            gapsWere.mode !== gapsAre.mode ||
+            gapsWere.maxWhitespaceRatio !== gapsAre.maxWhitespaceRatio
+        ) {
+            this.rebuildSlots();
+        }
+
         this.canvasWrapper.style.backgroundColor = nextResolved.layout.background;
 
         if (nextResolved.timeScale.barSpacing !== previous.timeScale.barSpacing) {
@@ -573,7 +601,12 @@ export class Chart {
 
         if (this.followsLiveEdge) {
             this.scaleX = clamped;
-            this.offsetX = liveEdgeOffsetX(plotRight(this.viewport), this.candlePyramid.candleCount, clamped);
+            this.offsetX = liveEdgeOffsetX(
+                plotRight(this.viewport),
+                this.slotOffsets,
+                this.candlePyramid.candleCount,
+                clamped,
+            );
             return;
         }
 
@@ -725,6 +758,7 @@ export class Chart {
             offsetX: this.offsetX,
             offsetY: this.offsetY,
             scaleX: this.scaleX,
+            slots: this.slotOffsets,
             scaleY: this.scaleY,
             cssWidth,
             cssHeight,
@@ -1154,6 +1188,68 @@ export class Chart {
      * saying "autoscale" and would silently unlock a pane the caller had locked. A
      * locked price range survives this.
      */
+    /**
+     * Slot position of a bar, or the bar's own ordinal when the series has no gaps.
+     *
+     * One function, because every place geometry needs an x — the candle records, the
+     * overlay points, the zone and marker edges — needs the same conversion. Five call
+     * sites each deciding for themselves is five chances to draw something half a bar
+     * off, and on a gapped chart a half-bar error is invisible.
+     */
+    private slotX(ordinalIndex: number): number {
+        return this.slotOffsets === null ? ordinalIndex : slotAtIndex(this.slotOffsets, ordinalIndex);
+    }
+
+    /**
+     * Recomputes the slot table from the current times.
+     *
+     * Called when the data changes and when the gap options do, and never on pan or
+     * zoom. That is the reason slots are the unit rather than pixels or wall-clock
+     * deltas: a per-bar table rebuilt on every wheel tick would cost more than the
+     * candle pyramid does, and a table in deltas would make the x transform a
+     * function of the viewport instead of of the data.
+     *
+     * No breaks gets null rather than an identity table, so the common case allocates
+     * nothing and takes the exact path that shipped for six phases.
+     */
+    /**
+     * Overlay points with their x in slot space, and on the price pane their value
+     * in scale space. Non-price panes are left alone: they stay linear whatever the
+     * price pane is set to, and an RSI on a log axis has no reading.
+     */
+    private slotOverlayPoints(points: Float32Array, stride: 2 | 6): Float32Array {
+        const convertValue: boolean = this.priceScale() === 'log';
+        if (this.slotOffsets === null && !convertValue) return points;
+        const out: Float32Array = new Float32Array(points.length);
+        out.set(points);
+        const scale: PriceScale = this.priceScale();
+        for (let i = 0; i < points.length; i += stride) {
+            out[i] = this.slotX(points[i]);
+            if (convertValue) out[i + 1] = toScaleSpace(points[i + 1], scale);
+        }
+        return out;
+    }
+
+    private rebuildSlots(): void {
+        const gaps = this.resolvedOptions.timeScale.sessionBreaks;
+        const times: readonly number[] = this.candleTimes;
+        if (!gaps.enabled || times.length < 2) {
+            this.slotOffsets = null;
+            return;
+        }
+        const resolved = resolveSessionBreaks(times, {
+            mode: gaps.mode,
+            maxWhitespaceRatio: gaps.maxWhitespaceRatio,
+        });
+        const breaks = sizeSessionBreaks(times, resolved);
+        if (breaks.length === 0) {
+            this.slotOffsets = null;
+            return;
+        }
+        this.slotOffsets = computeSlotOffsets(times, breaks);
+    }
+
+
     public fitContent(): void {
         this.assertAlive();
         const count: number = this.candlePyramid.candleCount;
@@ -1164,7 +1260,7 @@ export class Chart {
         const plot: PlotRect = this.viewport.plot;
         const spacing: number = this.clampBarSpacing(plot.width / count);
         this.scaleX = spacing;
-        this.offsetX = liveEdgeOffsetX(plotRight(this.viewport), count, spacing);
+        this.offsetX = liveEdgeOffsetX(plotRight(this.viewport), this.slotOffsets, count, spacing);
         this.followsLiveEdge = true;
         this.updateViewport();
     }
@@ -1180,7 +1276,7 @@ export class Chart {
         this.assertAlive();
         const count: number = this.candlePyramid.candleCount;
         if (count === 0) return;
-        this.offsetX = liveEdgeOffsetX(plotRight(this.viewport), count, this.scaleX);
+        this.offsetX = liveEdgeOffsetX(plotRight(this.viewport), this.slotOffsets, count, this.scaleX);
         this.followsLiveEdge = true;
         this.updateViewport();
     }
@@ -1267,12 +1363,14 @@ export class Chart {
      */
     public timeToCoordinate(time: number): number | null {
         this.assertAlive();
-        const index: number = nearestCandleIndexByTime(
-            this.candleTimes.length,
-            time,
-            (candidate: number): number => this.candleTimes[candidate],
-        );
-        return index < 0 ? null : this.indexToCoordinate(index);
+        // `indexAtTime`, not the ordinal-snapping `nearestCandleIndexByTime`. Once a
+        // break is in the series those disagree, and the ordinal one is the wrong
+        // answer for a caller holding a timestamp: a time inside an overnight gap has
+        // no ordinal of its own, and the bar the ordinal search lands on depends on
+        // where the gap happens to fall in the count rather than on the clock.
+        const index: number = indexAtTime(this.candleTimes, time);
+        if (index < 0 || index >= this.candleTimes.length) return null;
+        return this.indexToCoordinate(index);
     }
 
     /** Screen y of a price. */
@@ -1335,16 +1433,26 @@ export class Chart {
 
         this.candlePyramid.reset(rawCandles);
         this.candleTimes = times;
+        this.rebuildSlots();
         this.followsLiveEdge = true;
 
         if (preserveViewport && retainedLength > 0 && previousCount > 0) {
             this.scaleX = previousScale;
             if (previousFollowing) {
-                this.offsetX = liveEdgeOffsetX(plotRight(this.viewport), retainedLength, this.scaleX);
+                this.offsetX = liveEdgeOffsetX(
+                    plotRight(this.viewport),
+                    this.slotOffsets,
+                    retainedLength,
+                    this.scaleX,
+                );
                 this.followsLiveEdge = true;
             } else if (anchorTime !== null) {
                 const retainedIndex: number = this.findNearestDataIndex(candles, retainedStart, anchorTime);
-                this.offsetX = anchorScreenX - retainedIndex * this.scaleX;
+                // The anchor is a *slot*, not an ordinal. Using the ordinal here slides
+                // the pinned bar sideways by the total width of every break before it,
+                // so a reload that added one overnight gap would visibly move the chart
+                // under a pointer that never moved.
+                this.offsetX = anchorScreenX - this.slotX(retainedIndex) * this.scaleX;
                 this.followsLiveEdge = false;
             }
         } else if (retainedLength === 0) {
@@ -1352,7 +1460,12 @@ export class Chart {
             this.scaleX = 1;
         } else {
             this.scaleX = DEFAULT_CANDLE_SPACING_PX;
-            this.offsetX = liveEdgeOffsetX(plotRight(this.viewport), retainedLength, this.scaleX);
+            this.offsetX = liveEdgeOffsetX(
+                plotRight(this.viewport),
+                this.slotOffsets,
+                retainedLength,
+                this.scaleX,
+            );
         }
         this.updateViewport();
     }
@@ -1463,6 +1576,7 @@ export class Chart {
         return isAtLiveEdgeOffset(
             this.offsetX,
             this.scaleX,
+            this.slotOffsets,
             this.candlePyramid.candleCount,
             plotRight(this.viewport),
         );
@@ -1508,7 +1622,11 @@ export class Chart {
         candle: CandleData,
     ): void {
         const offset: number = recordIndex * CANDLE_STRIDE;
-        target[offset + CANDLE_X] = ordinalIndex;
+        // A slot rather than an ordinal. The shader transform is
+        // `x * scaleX + offsetX`, which is affine in whatever it is handed, so a
+        // slot makes the series respect the breaks with no new uniform, no second
+        // program and no branch. On an unbroken series a slot *is* the ordinal.
+        target[offset + CANDLE_X] = this.slotX(ordinalIndex);
         target[offset + CANDLE_OPEN] = candle.open;
         target[offset + CANDLE_HIGH] = candle.high;
         target[offset + CANDLE_LOW] = candle.low;
@@ -1533,9 +1651,11 @@ export class Chart {
             }
             this.candlePyramid.reset(rawCandles);
             this.candleTimes = times;
+            this.rebuildSlots();
             if (this.followsLiveEdge) {
                 this.offsetX = liveEdgeOffsetX(
                     plotRight(this.viewport),
+                    this.slotOffsets,
                     replacement.length,
                     this.scaleX,
                 );
@@ -1593,6 +1713,7 @@ export class Chart {
             if (overflow > 0) {
                 this.offsetX = liveEdgeOffsetX(
                     plotRight(this.viewport),
+                    this.slotOffsets,
                     this.candlePyramid.candleCount,
                     this.scaleX,
                 );
@@ -1817,6 +1938,7 @@ export class Chart {
             offsetX: this.offsetX,
             offsetY: this.offsetY,
             scaleX: this.scaleX,
+            slots: this.slotOffsets,
             scaleY: this.scaleY,
             plot: this.viewport.plot,
             panes: this.paneLayout,
@@ -2009,9 +2131,16 @@ export class Chart {
             // An overlay on the price pane is measured in prices, so it needs the
             // same conversion the candles got. One on any other pane is left alone:
             // those panes stay linear whatever the price pane is set to.
-            const points: Float32Array = overlay.pane === PRICE_PANE && this.priceScale() === 'log'
-                ? scaleOverlayPoints(bucketed.points, bucketed.stride)
-                : bucketed.points;
+            // The x goes through the same conversion the candles' did, and both
+            // conversions happen in one pass: a stride of 6 interleaves
+            // [x, value, r, g, b, a], and converting a colour channel because the
+            // stride was misread is silent. An overlay is read against the candle it
+            // annotates, so leaving its x in ordinal space puts it half a bar off —
+            // invisible until it diverges far enough to look like it lags the price.
+            const points: Float32Array = this.slotOverlayPoints(
+                bucketed.points,
+                bucketed.stride,
+            );
             // A pane below the price one has its own scale, so an overlay there is
             // read against its own axis rather than the price axis. Pane 0 passes
             // null and shares the price transform with the candles.

@@ -381,7 +381,9 @@
             chart.setData([]);
             paintReadout();
             const source = kind.value === 'mock'
-                ? new MockCandleSource()
+                // 30 bars then a 17-hour close: enough gaps to see the break sizing and
+                 // the cumulative cap at once, without a screen of whitespace.
+                 ? new MockCandleSource(120, 500, 30)
                 : new WebSocketCandleSource(url.value);
             feedController = new ChartFeedController(
                 chart,

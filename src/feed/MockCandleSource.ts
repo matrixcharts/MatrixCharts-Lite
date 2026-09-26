@@ -14,10 +14,36 @@ export class MockCandleSource implements CandleSource {
     private sequence: number = 0;
     private randomState: number = 0x2f6e2b1;
 
+    /** Bars in a session before the feed jumps to the next one. 0 disables. */
+    private readonly barsPerSession: number;
+    /** How far a closed session jumps the clock, in milliseconds. */
+    private readonly gapMs: number;
+    private barsThisSession: number = 0;
+
+    /**
+     * `sessionBars` makes the feed behave like a traditional equity tape: bars
+     * arrive in runs and then the clock jumps forward by `gapMs`, which is what
+     * produces the overnight and weekend gaps the chart has to show as breaks.
+     *
+     * A second parameter rather than a flag on the interval because a break is not a
+     * property of the bar spacing — the spacing is one minute on both sides of it, and
+     * it is the *gap* that is long. That distinction is the whole reason the chart
+     * sizes a break separately from a bar.
+     */
     constructor(
         private readonly historyCount: number = 120,
         private readonly updateIntervalMs: number = 500,
+        sessionBars: number = 0,
+        gapMs: number = 17 * 60 * 60 * 1000,
     ) {
+        this.barsPerSession = sessionBars;
+        this.gapMs = gapMs;
+        if (!Number.isSafeInteger(sessionBars) || sessionBars < 0) {
+            throw new Error('MatrixCharts: Mock sessionBars must be a non-negative integer.');
+        }
+        if (!Number.isFinite(gapMs) || gapMs < 0) {
+            throw new Error('MatrixCharts: Mock gapMs must be a non-negative number.');
+        }
         if (!Number.isSafeInteger(historyCount) || historyCount < 1) {
             throw new Error('MatrixCharts: Mock historyCount must be a positive integer.');
         }
@@ -48,7 +74,17 @@ export class MockCandleSource implements CandleSource {
         const firstTime: number = now - (this.historyCount - 1) * 60_000;
         const history: CandleData[] = new Array<CandleData>(this.historyCount);
         let previousClose: number = 100;
+        // The clock advances one minute per bar, and jumps by a whole session
+        // whenever the current one fills. Both are the same operation on a
+        // monotonic counter, which is what keeps the live appends below consistent
+        // with this history rather than drifting back into the gaps.
+        let time: number = firstTime;
         for (let index: number = 0; index < this.historyCount; index++) {
+            if (this.barsPerSession > 0 && this.barsThisSession >= this.barsPerSession) {
+                time += this.gapMs;
+                this.barsThisSession = 0;
+            }
+            this.barsThisSession++;
             const open: number = previousClose;
             const close: number = Math.max(1, open + (this.nextRandom() - 0.48) * 1.2);
             const high: number = Math.max(open, close) + this.nextRandom() * 0.7;
@@ -58,8 +94,9 @@ export class MockCandleSource implements CandleSource {
             const volume: number = Math.round(
                 400 + Math.abs(close - open) * 900 + this.nextRandom() * 600,
             );
-            history[index] = { time: firstTime + index * 60_000, open, high, low, close, volume };
+            history[index] = { time, open, high, low, close, volume };
             previousClose = close;
+            time += 60_000;
         }
 
         this.currentCandle = history[history.length - 1];
@@ -93,7 +130,12 @@ export class MockCandleSource implements CandleSource {
         this.emit({ type: 'update', sequence: ++this.sequence, candle: this.currentCandle });
 
         if (this.tickCount % 4 === 0) {
-            const nextTime: number = previous.time + 60_000;
+            let nextTime: number = previous.time + 60_000;
+            if (this.barsPerSession > 0 && this.barsThisSession >= this.barsPerSession) {
+                nextTime += this.gapMs;
+                this.barsThisSession = 0;
+            }
+            this.barsThisSession++;
             const open: number = previous.close;
             const nextClose: number = Math.max(1, open + (this.nextRandom() - 0.49) * 1.2);
             this.currentCandle = {
