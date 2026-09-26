@@ -5,7 +5,9 @@
   "main": "index.js",
 "scripts": {
   "dev": "vite",
-  "build": "tsc"
+  "build": "tsc",
+  "test": "tsc --module commonjs --outDir .test-build && node --test tests/OHLCPyramid.test.cjs tests/CandleFeed.test.cjs tests/StreamingIntegration.test.cjs",
+  "benchmark": "tsc --module commonjs --outDir .test-build && node benchmarks/sustained-feed.cjs"
 },
   "keywords": [],
   "author": "",

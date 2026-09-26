@@ -19,6 +19,39 @@
             margin-bottom: 20px;
             font-weight: 500;
         }
+        .feed-controls {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            width: min(800px, 100%);
+            margin-bottom: 12px;
+            flex-wrap: wrap;
+        }
+        .feed-controls select,
+        .feed-controls input,
+        .feed-controls button {
+            min-height: 34px;
+            border: 1px solid #39424e;
+            border-radius: 4px;
+            background: #161b22;
+            color: #c9d1d9;
+            padding: 0 10px;
+            font: inherit;
+        }
+        .feed-controls input {
+            flex: 1 1 240px;
+        }
+        .feed-controls button {
+            cursor: pointer;
+        }
+        .feed-controls button:hover {
+            border-color: #35c9a0;
+        }
+        #feed-status {
+            margin-left: auto;
+            color: #8b949e;
+            font-size: 13px;
+        }
         /* This is the target container we pass to the library */
         #chart-container {
             width: 800px;
@@ -34,19 +67,75 @@
 </head>
 <body>
     <h2>MatrixCharts Layered Architecture</h2>
+    <div class="feed-controls">
+        <select id="feed-kind" aria-label="Feed type">
+            <option value="mock">Mock feed</option>
+            <option value="websocket">WebSocket</option>
+        </select>
+        <input id="feed-url" type="url" value="ws://localhost:8080" aria-label="WebSocket URL" hidden>
+        <button id="feed-connect" type="button">Connect</button>
+        <button id="feed-disconnect" type="button" disabled>Disconnect</button>
+        <span id="feed-status" role="status">disconnected</span>
+    </div>
     
     <!-- The Empty Container -->
     <div id="chart-container"></div>
 
 <!-- Initialize the library -->
     <script type="module">
-        import { Chart } from './src/index.ts';
-        // Boot up the engine and attach it to the div
+        import {
+            Chart,
+            ChartFeedController,
+            MockCandleSource,
+            WebSocketCandleSource,
+        } from './src/index.ts';
+
         const chart = new Chart('chart-container');
-        
-        chart.testDrawWebGLCandlesticks();
-        
-        console.log("MatrixCharts successfully initialized.", chart);
+        const kind = document.querySelector('#feed-kind');
+        const url = document.querySelector('#feed-url');
+        const connectButton = document.querySelector('#feed-connect');
+        const disconnectButton = document.querySelector('#feed-disconnect');
+        const status = document.querySelector('#feed-status');
+        let feedController = null;
+
+        kind.addEventListener('change', () => {
+            url.hidden = kind.value !== 'websocket';
+        });
+
+        connectButton.addEventListener('click', () => {
+            if (feedController) feedController.dispose();
+            chart.setData([]);
+            const source = kind.value === 'mock'
+                ? new MockCandleSource()
+                : new WebSocketCandleSource(url.value);
+            feedController = new ChartFeedController(
+                chart,
+                source,
+                (state) => { status.textContent = state; },
+                (error) => {
+                    status.textContent = error instanceof Error ? error.message : 'feed error';
+                    console.error(error);
+                },
+            );
+            connectButton.disabled = true;
+            disconnectButton.disabled = false;
+        });
+
+        disconnectButton.addEventListener('click', () => {
+            if (feedController) feedController.dispose();
+            feedController = null;
+            chart.setData([]);
+            status.textContent = 'disconnected';
+            connectButton.disabled = false;
+            disconnectButton.disabled = true;
+        });
+
+        window.addEventListener('beforeunload', () => {
+            if (feedController) feedController.dispose();
+            chart.destroy();
+        });
+
+        connectButton.click();
     </script>
 </body>
 </html>

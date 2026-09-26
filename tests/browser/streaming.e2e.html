@@ -1,0 +1,142 @@
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>MatrixCharts Streaming E2E</title>
+    <style>
+        body { margin: 20px; background: #0d1117; color: #c9d1d9; font: 14px sans-serif; }
+        #chart { width: 900px; height: 480px; background: #161b22; }
+        #result { white-space: pre-wrap; }
+    </style>
+</head>
+<body>
+    <h1>Streaming integration check</h1>
+    <div id="chart"></div>
+    <pre id="result">running</pre>
+    <script type="module">
+        import { Chart, ChartFeedController, WebSocketCandleSource } from '../../src/index.ts';
+
+        class TestSocket extends EventTarget {
+            readyState = 0;
+            sent = [];
+            open() {
+                this.readyState = 1;
+                this.dispatchEvent(new Event('open'));
+            }
+            send(value) {
+                this.sent.push(JSON.parse(value));
+            }
+            sendJson(value) {
+                this.dispatchEvent(new MessageEvent('message', { data: JSON.stringify(value) }));
+            }
+            close() {
+                this.readyState = 3;
+                this.dispatchEvent(new Event('close'));
+            }
+        }
+
+        const resultNode = document.querySelector('#result');
+        const chart = new Chart('chart', { maxRetainedCandles: 1000 });
+        const socket = new TestSocket();
+        const source = new WebSocketCandleSource('ws://integration.test/feed', {
+            webSocketFactory: () => socket,
+            reconnectMinDelayMs: 1000,
+            reconnectMaxDelayMs: 1000,
+            heartbeatTimeoutMs: 10_000,
+            watchdogIntervalMs: 500,
+        });
+        const errors = [];
+        window.__matrixChartsDrawCalls = 0;
+        const originalDrawArrays = WebGL2RenderingContext.prototype.drawArrays;
+        WebGL2RenderingContext.prototype.drawArrays = function (...args) {
+            window.__matrixChartsDrawCalls++;
+            return originalDrawArrays.apply(this, args);
+        };
+        const controller = new ChartFeedController(chart, source, () => {}, (error) => errors.push(String(error)));
+        const baseTime = Date.UTC(2025, 0, 1);
+        const makeCandle = (index, close = 100 + (index % 17)) => ({
+            time: baseTime + index * 60_000,
+            open: close - 0.4,
+            high: close + 1 + (index % 9) * 0.1,
+            low: close - 1 - (index % 7) * 0.1,
+            close,
+        });
+        const waitFrame = () => new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+
+        try {
+            socket.open();
+            if (socket.sent[0]?.type !== 'subscribe') throw new Error('Subscription frame was not sent.');
+
+            const invalidOversizedInput = Array.from({ length: 1002 }, (_, index) => makeCandle(index + 2));
+            invalidOversizedInput[0] = makeCandle(1);
+            invalidOversizedInput[1] = makeCandle(0);
+            let invalidInputRejected = false;
+            try {
+                chart.setData(invalidOversizedInput);
+            } catch {
+                invalidInputRejected = true;
+            }
+            if (!invalidInputRejected || chart.candlePyramid.candleCount !== 0) {
+                throw new Error('setData accepted invalid ordering in history discarded by retention.');
+            }
+
+            const initial = Array.from({ length: 100 }, (_, index) => makeCandle(index));
+            socket.sendJson({ type: 'snapshot', sequence: 500, candles: initial });
+            if (chart.candlePyramid.candleCount !== 100) throw new Error('Initial snapshot was not loaded.');
+
+            const appendBatch = Array.from({ length: 1200 }, (_, index) => makeCandle(index + 100));
+            socket.sendJson({ type: 'append', sequence: 501, candles: appendBatch });
+            await waitFrame();
+            if (chart.candlePyramid.candleCount !== 1000) throw new Error('Retention did not cap history at 1,000 candles.');
+            if (chart.candleTimes[0] !== makeCandle(300).time) throw new Error('Retention timestamp mapping is incorrect.');
+            const aggregateRoot = chart.candlePyramid.getLevelData(chart.candlePyramid.levelCount - 1);
+            if (aggregateRoot[2] < 100 || aggregateRoot[3] > 100) throw new Error('OHLC extrema were lost during retention.');
+
+            chart.followsLiveEdge = false;
+            chart.scaleX = 1.5;
+            chart.offsetX = 450 - 450 * chart.scaleX;
+            const anchorIndex = Math.round((450 - chart.offsetX) / chart.scaleX);
+            const anchorTime = chart.candleTimes[anchorIndex];
+
+            socket.sendJson({ type: 'append', sequence: 503, candles: [makeCandle(1300)] });
+            if (controller.state !== 'resyncing') throw new Error('Sequence gap did not enter resyncing state.');
+            socket.sendJson({ type: 'append', sequence: 504, candles: [makeCandle(1301)] });
+            await waitFrame();
+            if (chart.candleTimes.at(-1) === makeCandle(1301).time) throw new Error('Delta was applied before recovery snapshot.');
+
+            const snapshot = Array.from({ length: 1000 }, (_, index) => makeCandle(index + 300));
+            socket.sendJson({ type: 'snapshot', sequence: 900, candles: snapshot });
+            const restoredAnchorIndex = Math.round((450 - chart.offsetX) / chart.scaleX);
+            if (chart.candleTimes[restoredAnchorIndex] !== anchorTime) {
+                throw new Error('Historical timestamp anchor moved during snapshot replacement.');
+            }
+            socket.sendJson({ type: 'append', sequence: 901, candles: [makeCandle(1300)] });
+            await waitFrame();
+            if (chart.candleTimes.at(-1) !== makeCandle(1300).time) throw new Error('Post-recovery append was not applied.');
+            if (source.state !== 'connected') throw new Error('Source did not return to connected after snapshot.');
+            if (document.querySelectorAll('#chart canvas').length !== 3) throw new Error('Chart layers were not mounted.');
+
+            const gl = document.querySelectorAll('#chart canvas')[1].getContext('webgl2');
+            if (!gl || gl.getError() !== gl.NO_ERROR) throw new Error('WebGL renderer reported an error.');
+            if (window.__matrixChartsDrawCalls === 0) throw new Error('Candlestick renderer issued no draw calls.');
+            if (errors.length > 0) throw new Error(errors.join('\n'));
+
+            resultNode.textContent = JSON.stringify({
+                result: 'PASS',
+                retainedCandles: chart.candlePyramid.candleCount,
+                anchorPreserved: true,
+                sourceState: source.state,
+                webglDrawCalls: window.__matrixChartsDrawCalls,
+            }, null, 2);
+            document.documentElement.dataset.testResult = 'pass';
+        } catch (error) {
+            resultNode.textContent = `FAIL\n${error instanceof Error ? error.stack : String(error)}`;
+            document.documentElement.dataset.testResult = 'fail';
+            throw error;
+        } finally {
+            controller.dispose();
+        }
+    </script>
+</body>
+</html>

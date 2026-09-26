@@ -15,7 +15,7 @@ export class Canvas2DRenderer implements IRenderer {
     private crosshairX: number | null = null;
     private crosshairY: number | null = null;
     private ohlcData: Float32Array | null = null;
-    private timeValues: Float64Array = new Float64Array(0);
+    private timeValues: readonly number[] = [];
     
     private isGridLayer: boolean;
 

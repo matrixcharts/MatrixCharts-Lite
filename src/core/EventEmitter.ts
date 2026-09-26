@@ -2,7 +2,7 @@
 
 export interface ChartEvents {
     'viewport': { offsetX: number; offsetY: number; scaleX: number; scaleY: number };
-    'data': { ohlc: Float32Array; times: Float64Array };
+    'data': { ohlc: Float32Array; times: readonly number[] };
 }
 
 type Listener<T> = (data: T) => void;

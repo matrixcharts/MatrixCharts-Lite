@@ -1,5 +1,5 @@
 export interface CandleData {
-    /** Unix timestamp in milliseconds; timestamps must be strictly increasing. */
+    /** Unix timestamp in milliseconds. Series timestamps must be strictly increasing. */
     time: number;
     open: number;
     high: number;

@@ -28,13 +28,13 @@ export class LTTBDownsampler {
                     (secondIndex + 1) * previousGroupSize,
                     sourceCount,
                 ) - 1;
-                const groupedSourceCount: number = lastSourceIndex - firstSourceIndex + 1;
                 current[outputOffset] = (firstSourceIndex + lastSourceIndex) / 2;
                 current[outputOffset + 1] = previous[firstOffset + 1];
                 current[outputOffset + 2] = Math.max(previous[firstOffset + 2], previous[secondOffset + 2]);
                 current[outputOffset + 3] = Math.min(previous[firstOffset + 3], previous[secondOffset + 3]);
                 current[outputOffset + 4] = previous[secondOffset + 4];
-                current[outputOffset + 5] = groupedSourceCount * candles[5];
+                current[outputOffset + 5] = previous[firstOffset + 5] +
+                    (secondIndex === firstIndex ? 0 : previous[secondOffset + 5]);
             }
             levels.push(current);
             previous = current;
