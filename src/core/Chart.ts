@@ -3,6 +3,7 @@ import type { IRenderer } from './IRenderer';
 import { WebGL2Renderer } from '../renderers/WebGL2Renderer';
 import { Canvas2DRenderer } from '../renderers/Canvas2DRenderer';
 import { OHLCPyramid } from '../math/OHLCPyramid';
+import { DEFAULT_CANDLE_SPACING_PX } from '../math/candlestickBodyWidth';
 import { EventEmitter, ChartEvents } from './EventEmitter';
 import type { CandleData } from './CandleData';
 import type { ChartOptions, ChartTheme } from './ChartOptions';
@@ -278,7 +279,7 @@ export class Chart {
             this.scaleX = 1;
         } else {
             const cssWidth: number = this.canvasWrapper.clientWidth || 800;
-            this.scaleX = Math.max(1e-4, Math.min(12, cssWidth / retainedLength));
+            this.scaleX = DEFAULT_CANDLE_SPACING_PX;
             this.offsetX = cssWidth - (retainedLength - 0.5) * this.scaleX;
         }
         this.updateViewport();

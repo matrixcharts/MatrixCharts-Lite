@@ -6,7 +6,7 @@
 "scripts": {
   "dev": "vite",
   "build": "tsc",
-  "test": "tsc --module commonjs --outDir .test-build && node --test tests/OHLCPyramid.test.cjs tests/CandleFeed.test.cjs tests/StreamingIntegration.test.cjs",
+    "test": "tsc --module commonjs --outDir .test-build && node --test tests/OHLCPyramid.test.cjs tests/CandleFeed.test.cjs tests/StreamingIntegration.test.cjs tests/CandlestickLayout.test.cjs",
   "benchmark": "tsc --module commonjs --outDir .test-build && node benchmarks/sustained-feed.cjs"
 },
   "keywords": [],

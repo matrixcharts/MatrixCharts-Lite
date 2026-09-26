@@ -1,6 +1,7 @@
 // src/renderers/WebGL2Renderer.ts
 import type { IRenderer } from '../core/IRenderer';
 import type { EventEmitter, ChartEvents } from '../core/EventEmitter';
+import { candlestickBodyEdgesData } from '../math/candlestickBodyWidth';
 
 export class WebGL2Renderer implements IRenderer {
     private gl: WebGL2RenderingContext | null = null;
@@ -275,15 +276,13 @@ export class WebGL2Renderer implements IRenderer {
             }
             if (!Number.isFinite(neighborSpacing)) neighborSpacing = width;
 
-            const spacingPixels: number = neighborSpacing * scaleX * this.devicePixelRatio;
-            const maximumBodyPixels: number = Math.max(1, spacingPixels * 0.83);
-            const minimumBodyPixels: number = Math.min(2, maximumBodyPixels);
-            const requestedBodyPixels: number = width * scaleX * this.devicePixelRatio * 1.15;
-            const bodyWidthData: number = Math.min(
-                maximumBodyPixels,
-                Math.max(minimumBodyPixels, requestedBodyPixels),
-            ) / (scaleX * this.devicePixelRatio);
-            const halfWidth: number = bodyWidthData / 2;
+            const { left: bodyLeft, right: bodyRight } = candlestickBodyEdgesData(
+                x,
+                neighborSpacing,
+                scaleX,
+                this.currentOffset[0],
+                this.devicePixelRatio,
+            );
 
             let bodyTop: number = Math.max(open, close);
             let bodyBottom: number = Math.min(open, close);
@@ -324,9 +323,6 @@ export class WebGL2Renderer implements IRenderer {
 
             vertices[wickIndex++] = x; vertices[wickIndex++] = low;
             vertices[wickIndex++] = color[0]; vertices[wickIndex++] = color[1]; vertices[wickIndex++] = color[2]; vertices[wickIndex++] = color[3];
-
-            const bodyLeft: number = x - halfWidth;
-            const bodyRight: number = x + halfWidth;
 
             vertices[bodyIndex++] = bodyLeft; vertices[bodyIndex++] = bodyBottom;
             vertices[bodyIndex++] = color[0]; vertices[bodyIndex++] = color[1]; vertices[bodyIndex++] = color[2]; vertices[bodyIndex++] = color[3];
