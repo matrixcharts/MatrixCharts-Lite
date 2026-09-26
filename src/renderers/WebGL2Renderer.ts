@@ -1,8 +1,10 @@
 // src/renderers/WebGL2Renderer.ts
 import type { IRenderer } from '../core/IRenderer';
+import type { EventEmitter, ChartEvents } from '../core/EventEmitter';
 
 export class WebGL2Renderer implements IRenderer {
     private gl: WebGL2RenderingContext | null = null;
+    private emitter!: EventEmitter<ChartEvents>;
     private canvas: HTMLCanvasElement | null = null;
     private program: WebGLProgram | null = null;
     private vertexShader: WebGLShader | null = null;
@@ -34,8 +36,10 @@ export class WebGL2Renderer implements IRenderer {
     private candleWickVertexCount: number = 0;
     private candleBodyVertexCount: number = 0;
 
-    public init(canvas: HTMLCanvasElement): void {
+    public init(canvas: HTMLCanvasElement, emitter: EventEmitter<ChartEvents>): void {
         this.destroy();
+        this.emitter = emitter;
+        this.emitter.on('viewport', this.handleViewportEvent);
         const gl: WebGL2RenderingContext | null = canvas.getContext('webgl2');
         if (!gl) {
             throw new Error('MatrixCharts: WebGL2 is not supported by this browser.');
@@ -182,10 +186,10 @@ export class WebGL2Renderer implements IRenderer {
         }
     }
 
-    public setViewport(offsetX: number, offsetY: number, scaleX: number, scaleY: number): void {
-        this.currentOffset = [offsetX, offsetY];
-        this.currentScale = [scaleX, scaleY];
-    }
+    private handleViewportEvent = (payload: ChartEvents['viewport']): void => {
+        this.currentOffset = [payload.offsetX, payload.offsetY];
+        this.currentScale = [payload.scaleX, payload.scaleY];
+    };
 
     public drawLine(points: Float32Array, color: [number, number, number, number]): void {
         const gl: WebGL2RenderingContext = this.requireContext();
@@ -199,7 +203,8 @@ export class WebGL2Renderer implements IRenderer {
         this.lineVertexCount = points.length / 2;
     }
 
-    /** Uploads [x, open, high, low, close, width] candles to the GPU. */
+
+      /** Uploads [x, open, high, low, close, width] candles to the GPU. */
     public drawCandlesticks(
         candles: Float32Array,
         bullishColor: [number, number, number, number],
@@ -211,18 +216,15 @@ export class WebGL2Renderer implements IRenderer {
         }
 
         const candleCount: number = candles.length / 6;
-        const verticesPerCandle: number = 8;
-        const vertexStride: number = 6;
-        const vertices: Float32Array = new Float32Array(candleCount * verticesPerCandle * vertexStride);
-        let vertexIndex: number = 0;
-        const writeVertex = (x: number, y: number, color: [number, number, number, number]): void => {
-            vertices[vertexIndex++] = x;
-            vertices[vertexIndex++] = y;
-            vertices[vertexIndex++] = color[0];
-            vertices[vertexIndex++] = color[1];
-            vertices[vertexIndex++] = color[2];
-            vertices[vertexIndex++] = color[3];
-        };
+        const vertexStride: number = 6; // x, y, r, g, b, a
+        
+        // Wicks = 2 vertices per candle. Bodies = 6 vertices per candle (2 triangles).
+        const totalVertices: number = candleCount * 8;
+        const vertices: Float32Array = new Float32Array(totalVertices * vertexStride);
+
+        // Partition the array: wicks go at the start, bodies go immediately after all wicks
+        let wickIndex: number = 0;
+        let bodyIndex: number = candleCount * 2 * vertexStride;
 
         for (let candleIndex: number = 0; candleIndex < candleCount; candleIndex++) {
             const inputIndex: number = candleIndex * 6;
@@ -232,6 +234,7 @@ export class WebGL2Renderer implements IRenderer {
             const low: number = candles[inputIndex + 3];
             const close: number = candles[inputIndex + 4];
             const width: number = candles[inputIndex + 5];
+
             if (![x, open, high, low, close, width].every(Number.isFinite) || width <= 0) {
                 throw new Error('MatrixCharts: Candlestick values must be finite and width must be positive.');
             }
@@ -242,14 +245,32 @@ export class WebGL2Renderer implements IRenderer {
             const bodyBottom: number = Math.min(open, close);
             const bodyHeight: number = bodyTop === bodyBottom ? 1 : bodyTop - bodyBottom;
 
-            writeVertex(x, low, color);
-            writeVertex(x, high, color);
-            writeVertex(x - halfWidth, bodyBottom, color);
-            writeVertex(x + halfWidth, bodyBottom, color);
-            writeVertex(x + halfWidth, bodyTop + (bodyHeight === 1 ? 1 : 0), color);
-            writeVertex(x - halfWidth, bodyBottom, color);
-            writeVertex(x + halfWidth, bodyTop + (bodyHeight === 1 ? 1 : 0), color);
-            writeVertex(x - halfWidth, bodyTop + (bodyHeight === 1 ? 1 : 0), color);
+            // 1. Write Wick Vertices
+            vertices[wickIndex++] = x; vertices[wickIndex++] = low;
+            vertices[wickIndex++] = color[0]; vertices[wickIndex++] = color[1]; vertices[wickIndex++] = color[2]; vertices[wickIndex++] = color[3];
+
+            vertices[wickIndex++] = x; vertices[wickIndex++] = high;
+            vertices[wickIndex++] = color[0]; vertices[wickIndex++] = color[1]; vertices[wickIndex++] = color[2]; vertices[wickIndex++] = color[3];
+
+            // 2. Write Body Vertices (Triangle 1)
+            vertices[bodyIndex++] = x - halfWidth; vertices[bodyIndex++] = bodyBottom;
+            vertices[bodyIndex++] = color[0]; vertices[bodyIndex++] = color[1]; vertices[bodyIndex++] = color[2]; vertices[bodyIndex++] = color[3];
+
+            vertices[bodyIndex++] = x + halfWidth; vertices[bodyIndex++] = bodyBottom;
+            vertices[bodyIndex++] = color[0]; vertices[bodyIndex++] = color[1]; vertices[bodyIndex++] = color[2]; vertices[bodyIndex++] = color[3];
+
+            vertices[bodyIndex++] = x + halfWidth; vertices[bodyIndex++] = bodyTop + (bodyHeight === 1 ? 1 : 0);
+            vertices[bodyIndex++] = color[0]; vertices[bodyIndex++] = color[1]; vertices[bodyIndex++] = color[2]; vertices[bodyIndex++] = color[3];
+
+            // 3. Write Body Vertices (Triangle 2)
+            vertices[bodyIndex++] = x - halfWidth; vertices[bodyIndex++] = bodyBottom;
+            vertices[bodyIndex++] = color[0]; vertices[bodyIndex++] = color[1]; vertices[bodyIndex++] = color[2]; vertices[bodyIndex++] = color[3];
+
+            vertices[bodyIndex++] = x + halfWidth; vertices[bodyIndex++] = bodyTop + (bodyHeight === 1 ? 1 : 0);
+            vertices[bodyIndex++] = color[0]; vertices[bodyIndex++] = color[1]; vertices[bodyIndex++] = color[2]; vertices[bodyIndex++] = color[3];
+
+            vertices[bodyIndex++] = x - halfWidth; vertices[bodyIndex++] = bodyTop + (bodyHeight === 1 ? 1 : 0);
+            vertices[bodyIndex++] = color[0]; vertices[bodyIndex++] = color[1]; vertices[bodyIndex++] = color[2]; vertices[bodyIndex++] = color[3];
         }
 
         gl.bindBuffer(gl.ARRAY_BUFFER, this.candleBuffer);
@@ -294,6 +315,9 @@ export class WebGL2Renderer implements IRenderer {
     }
 
     public destroy(): void {
+        if (this.emitter) {
+            this.emitter.off('viewport', this.handleViewportEvent);
+        }
         if (this.gl) {
             if (this.lineBuffer) this.gl.deleteBuffer(this.lineBuffer);
             if (this.vao) this.gl.deleteVertexArray(this.vao);

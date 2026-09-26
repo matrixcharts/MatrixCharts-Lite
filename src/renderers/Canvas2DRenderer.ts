@@ -1,8 +1,10 @@
 // src/renderers/Canvas2DRenderer.ts
 import type { IRenderer } from '../core/IRenderer';
+import type { EventEmitter, ChartEvents } from '../core/EventEmitter';
 
 export class Canvas2DRenderer implements IRenderer {
     private canvas!: HTMLCanvasElement;
+    private emitter!: EventEmitter<ChartEvents>;
     private ctx!: CanvasRenderingContext2D;
 
     private offsetX: number = 0;
@@ -13,6 +15,7 @@ export class Canvas2DRenderer implements IRenderer {
     private crosshairX: number | null = null;
     private crosshairY: number | null = null;
     private ohlcData: Float32Array | null = null;
+    private timeValues: Float64Array = new Float64Array(0);
     
     private isGridLayer: boolean;
 
@@ -21,11 +24,16 @@ export class Canvas2DRenderer implements IRenderer {
         this.isGridLayer = isGridLayer;
     }
 
-    public init(canvas: HTMLCanvasElement): void {
+public init(canvas: HTMLCanvasElement, emitter: EventEmitter<ChartEvents>): void {
         this.canvas = canvas;
+        this.emitter = emitter;
         const context = canvas.getContext('2d');
         if (!context) throw new Error("MatrixCharts: Failed to initialize 2D context.");
         this.ctx = context;
+
+        this.emitter.on('viewport', this.handleViewportEvent);
+        this.emitter.on('data', this.handleDataEvent);
+
         if (!this.isGridLayer) {
             canvas.addEventListener('mousemove', this.handleMouseMove);
             canvas.addEventListener('mouseleave', this.handleMouseLeave);
@@ -41,23 +49,24 @@ export class Canvas2DRenderer implements IRenderer {
         this.ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     }
 
-    public setViewport(offsetX: number, offsetY: number, scaleX: number, scaleY: number): void {
-        this.offsetX = offsetX;
-        this.offsetY = offsetY;
-        this.scaleX = scaleX;
-        this.scaleY = scaleY;
-    }
+    private handleViewportEvent = (payload: ChartEvents['viewport']): void => {
+        this.offsetX = payload.offsetX;
+        this.offsetY = payload.offsetY;
+        this.scaleX = payload.scaleX;
+        this.scaleY = payload.scaleY;
+    };
 
-    public setOHLCData(candles: Float32Array): void {
-        if (candles.length % 6 !== 0) {
+    private handleDataEvent = (payload: ChartEvents['data']): void => {
+        if (payload.ohlc.length % 6 !== 0) {
             throw new Error('MatrixCharts: OHLC data must contain x/open/high/low/close/width values.');
         }
-        this.ohlcData = new Float32Array(candles);
-    }
+        this.ohlcData = new Float32Array(payload.ohlc);
+        this.timeValues = payload.times;
+    };
 
     public clear(): void {
-        const cssWidth = this.canvas.width / window.devicePixelRatio;
-        const cssHeight = this.canvas.height / window.devicePixelRatio;
+        const cssWidth: number = this.canvas.width / this.devicePixelRatio;
+        const cssHeight: number = this.canvas.height / this.devicePixelRatio;
         this.ctx.clearRect(0, 0, cssWidth, cssHeight);
     }
 
@@ -67,50 +76,46 @@ export class Canvas2DRenderer implements IRenderer {
             return;
         }
 
-        const cssWidth = this.canvas.width / window.devicePixelRatio;
-        const cssHeight = this.canvas.height / window.devicePixelRatio;
+        const cssWidth: number = this.canvas.width / this.devicePixelRatio;
+        const cssHeight: number = this.canvas.height / this.devicePixelRatio;
 
         this.ctx.save();
         this.ctx.strokeStyle = 'rgba(255, 255, 255, 0.15)'; // High-visibility institutional grid
         this.ctx.lineWidth = 1;
         this.ctx.beginPath();
 
-        // 1. Draw Horizontal Grid Lines (Price/Y-Axis)
-        // Static for now since we are currently only panning on the X-axis
-        const horizontalSpacing = 50;
-        for (let y = 0; y <= cssHeight; y += horizontalSpacing) {
-            // Offset by 0.5 pixels for perfectly crisp 1px lines on standard displays
-            const crispY = Math.floor(y) + 0.5; 
+        const priceTickStep: number = this.niceStep(56 / Math.abs(this.scaleY));
+        const [minimumVisiblePrice, maximumVisiblePrice]: [number, number] = this.getVisiblePriceRange(cssHeight);
+        const firstPriceTick: number = Math.ceil(minimumVisiblePrice / priceTickStep) * priceTickStep;
+        for (let price: number = firstPriceTick; price <= maximumVisiblePrice + priceTickStep * 1e-9; price += priceTickStep) {
+            const y: number = this.offsetY + price * this.scaleY;
+            if (y < 0 || y > cssHeight) continue;
+            const crispY: number = Math.floor(y) + 0.5;
             this.ctx.moveTo(0, crispY);
             this.ctx.lineTo(cssWidth, crispY);
         }
 
-        // 2. Draw Vertical Grid Lines (Time/X-Axis) with Adaptive Zoom Scaling
-        const baseSpacing = 100;
-        
-        // Calculate a logarithmic scaling factor so the grid adapts dynamically
-        // When you zoom out, the lines double in spacing to prevent clumping.
-        const zoomLevel = Math.floor(Math.log2(this.scaleX));
-        const dynamicDataStep = baseSpacing * Math.pow(2, -zoomLevel);
-        
-        // Multiply by the current scale to get the actual pixel distance on screen
-        const visiblePixelStep = dynamicDataStep * this.scaleX;
-
-        // Calculate where the first vertical line should start based on the pan offset
-        const startX = (this.offsetX % visiblePixelStep) - visiblePixelStep;
-
-        for (let x = startX; x < cssWidth + visiblePixelStep; x += visiblePixelStep) {
-            const crispX = Math.floor(x) + 0.5;
+        const timeTickStep: number = this.niceStep(96 / this.scaleX);
+        const firstTimeTick: number = Math.ceil((-this.offsetX / this.scaleX) / timeTickStep) * timeTickStep;
+        for (let time: number = firstTimeTick; ; time += timeTickStep) {
+            const x: number = this.offsetX + time * this.scaleX;
+            if (x > cssWidth) break;
+            if (x < 0) continue;
+            const crispX: number = Math.floor(x) + 0.5;
             this.ctx.moveTo(crispX, 0);
             this.ctx.lineTo(crispX, cssHeight);
         }
 
         this.ctx.stroke();
-        this.renderAxes(cssWidth, cssHeight, horizontalSpacing, visiblePixelStep, startX);
+        this.renderAxes(cssWidth, cssHeight, priceTickStep, timeTickStep, firstTimeTick);
         this.ctx.restore();
     }
 
     public destroy(): void {
+        if (this.emitter) {
+            this.emitter.off('viewport', this.handleViewportEvent);
+            this.emitter.off('data', this.handleDataEvent);
+        }
         if (!this.isGridLayer) {
             this.canvas.removeEventListener('mousemove', this.handleMouseMove);
             this.canvas.removeEventListener('mouseleave', this.handleMouseLeave);
@@ -180,7 +185,7 @@ export class Canvas2DRenderer implements IRenderer {
         const panelY: number = 10;
         const panelWidth: number = 158;
         const panelHeight: number = 58;
-        const timeLabel: string = `T ${this.formatAxisValue(candleX)}`;
+        const timeLabel: string = `T ${this.formatTimeAtIndex(candleX)}`;
         const valueLabels: string[] = [
             `O ${this.formatAxisValue(open)}`,
             `H ${this.formatAxisValue(high)}`,
@@ -207,16 +212,16 @@ export class Canvas2DRenderer implements IRenderer {
 
         const currentPrice: number = (this.crosshairY - this.offsetY) / this.scaleY;
         this.drawLabel(this.formatAxisValue(currentPrice), cssWidth - 6, this.crosshairY, 'right');
-        this.drawLabel(this.formatAxisValue(candleX), this.crosshairX + 6, cssHeight - 10, 'left');
+        this.drawLabel(this.formatTimeAtIndex(candleX), this.crosshairX + 6, cssHeight - 10, 'left');
         this.ctx.restore();
     }
 
     private renderAxes(
         cssWidth: number,
         cssHeight: number,
-        horizontalSpacing: number,
-        visiblePixelStep: number,
-        startX: number,
+        priceTickStep: number,
+        timeTickStep: number,
+        firstTimeTick: number,
     ): void {
         this.ctx.save();
         this.ctx.font = '11px sans-serif';
@@ -232,15 +237,17 @@ export class Canvas2DRenderer implements IRenderer {
         this.ctx.lineTo(cssWidth, cssHeight - 0.5);
         this.ctx.stroke();
 
-        for (let y: number = 0; y <= cssHeight; y += horizontalSpacing) {
-            const price: number = (y - this.offsetY) / this.scaleY;
-            this.drawLabel(this.formatAxisValue(price), 6, y, 'left');
+        const [minimumVisiblePrice, maximumVisiblePrice]: [number, number] = this.getVisiblePriceRange(cssHeight);
+        const firstPriceTick: number = Math.ceil(minimumVisiblePrice / priceTickStep) * priceTickStep;
+        for (let price: number = firstPriceTick; price <= maximumVisiblePrice + priceTickStep * 1e-9; price += priceTickStep) {
+            const y: number = this.offsetY + price * this.scaleY;
+            if (y >= 0 && y <= cssHeight) this.drawLabel(this.formatAxisValue(price), 6, y, 'left');
         }
 
-        for (let x: number = startX; x < cssWidth + visiblePixelStep; x += visiblePixelStep) {
-            if (x < 0 || x > cssWidth) continue;
-            const time: number = (x - this.offsetX) / this.scaleX;
-            this.drawLabel(this.formatAxisValue(time), x + 4, cssHeight - 10, 'left');
+        for (let time: number = firstTimeTick; ; time += timeTickStep) {
+            const x: number = this.offsetX + time * this.scaleX;
+            if (x > cssWidth) break;
+            if (x >= 0) this.drawLabel(this.formatTimeAtIndex(time), x + 4, cssHeight - 10, 'left');
         }
 
         this.ctx.restore();
@@ -267,5 +274,41 @@ export class Canvas2DRenderer implements IRenderer {
         if (Math.abs(value) >= 1000) return `${(value / 1000).toFixed(1)}k`;
         if (Number.isInteger(value)) return value.toString();
         return value.toFixed(1);
+    }
+
+    private formatTimeAtIndex(index: number): string {
+        if (this.timeValues.length === 0) return this.formatAxisValue(index);
+
+        const clampedIndex: number = Math.max(0, Math.min(this.timeValues.length - 1, index));
+        const lowerIndex: number = Math.floor(clampedIndex);
+        const upperIndex: number = Math.min(lowerIndex + 1, this.timeValues.length - 1);
+        const fraction: number = clampedIndex - lowerIndex;
+        const timestamp: number = this.timeValues[lowerIndex] +
+            (this.timeValues[upperIndex] - this.timeValues[lowerIndex]) * fraction;
+        const date: Date = new Date(timestamp);
+        const dataSpan: number = this.timeValues[this.timeValues.length - 1] - this.timeValues[0];
+        const averageInterval: number = dataSpan / Math.max(this.timeValues.length - 1, 1);
+        const cssWidth: number = this.canvas.width / this.devicePixelRatio;
+        const visibleSpan: number = averageInterval * cssWidth / this.scaleX;
+        const options: Intl.DateTimeFormatOptions = visibleSpan < 2 * 24 * 60 * 60 * 1000
+            ? { month: 'short', day: '2-digit', hour: '2-digit', minute: '2-digit' }
+            : visibleSpan < 365 * 24 * 60 * 60 * 1000
+                ? { month: 'short', day: '2-digit' }
+                : { year: 'numeric', month: 'short' };
+        return new Intl.DateTimeFormat(undefined, options).format(date);
+    }
+
+    private niceStep(targetStep: number): number {
+        if (!Number.isFinite(targetStep) || targetStep <= 0) return 1;
+        const magnitude: number = Math.pow(10, Math.floor(Math.log10(targetStep)));
+        const normalized: number = targetStep / magnitude;
+        const factor: number = normalized <= 1 ? 1 : normalized <= 2 ? 2 : normalized <= 5 ? 5 : 10;
+        return factor * magnitude;
+    }
+
+    private getVisiblePriceRange(cssHeight: number): [number, number] {
+        const priceAtTop: number = -this.offsetY / this.scaleY;
+        const priceAtBottom: number = (cssHeight - this.offsetY) / this.scaleY;
+        return [Math.min(priceAtTop, priceAtBottom), Math.max(priceAtTop, priceAtBottom)];
     }
 }
