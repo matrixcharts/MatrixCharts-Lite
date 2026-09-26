@@ -53,7 +53,12 @@ export class MockCandleSource implements CandleSource {
             const close: number = Math.max(1, open + (this.nextRandom() - 0.48) * 1.2);
             const high: number = Math.max(open, close) + this.nextRandom() * 0.7;
             const low: number = Math.min(open, close) - this.nextRandom() * 0.7;
-            history[index] = { time: firstTime + index * 60_000, open, high, low, close };
+            // Volume tracks the size of the move, so the histogram reads like a
+            // market rather than uniform noise and the peak is not always one bar.
+            const volume: number = Math.round(
+                400 + Math.abs(close - open) * 900 + this.nextRandom() * 600,
+            );
+            history[index] = { time: firstTime + index * 60_000, open, high, low, close, volume };
             previousClose = close;
         }
 

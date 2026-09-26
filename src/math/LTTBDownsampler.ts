@@ -4,6 +4,7 @@ import {
     CANDLE_LOW,
     CANDLE_OPEN,
     CANDLE_STRIDE,
+    CANDLE_VOLUME,
     CANDLE_WIDTH,
     CANDLE_X,
 } from './candleLayout.js';
@@ -51,6 +52,11 @@ export class LTTBDownsampler {
                 current[outputOffset + CANDLE_CLOSE] = previous[secondOffset + CANDLE_CLOSE];
                 current[outputOffset + CANDLE_WIDTH] = previous[firstOffset + CANDLE_WIDTH] +
                     (secondIndex === firstIndex ? 0 : previous[secondOffset + CANDLE_WIDTH]);
+                // Volume accumulates like width: a coarser bar covers more trades,
+                // so summing is what keeps the total across every level equal to the
+                // total at full resolution.
+                current[outputOffset + CANDLE_VOLUME] = previous[firstOffset + CANDLE_VOLUME] +
+                    (secondIndex === firstIndex ? 0 : previous[secondOffset + CANDLE_VOLUME]);
             }
             levels.push(current);
             previous = current;
@@ -142,10 +148,10 @@ export class LTTBDownsampler {
     }
 
     /**
-     * Aggregates an interleaved [x, open, high, low, close, width] series to a
-     * target candle count. Unlike LTTB (which drops points), this fuses buckets
-     * into larger timeframe candles to perfectly preserve all extreme highs and
-     * lows.
+     * Aggregates an interleaved [x, open, high, low, close, width, volume]
+     * series to a target candle count. Unlike LTTB (which drops points), this
+     * fuses buckets into larger timeframe candles to perfectly preserve all
+     * extreme highs and lows.
      *
      * Unused by any production path. The pyramid's own multi-resolution levels
      * serve every zoom, so this single-target variant has no caller; it is kept
@@ -190,6 +196,11 @@ export class LTTBDownsampler {
             sampled[outIndex + CANDLE_CLOSE] = candles[endInputIndex + CANDLE_CLOSE];
             sampled[outIndex + CANDLE_WIDTH] = candles[startInputIndex + CANDLE_WIDTH]
                 * (endIndex - startIndex + 1);
+            let bucketVolume = 0;
+            for (let j = startIndex; j <= endIndex; j++) {
+                bucketVolume += candles[j * CANDLE_STRIDE + CANDLE_VOLUME];
+            }
+            sampled[outIndex + CANDLE_VOLUME] = bucketVolume;
         }
 
         return sampled;

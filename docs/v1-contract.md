@@ -217,6 +217,10 @@ chart.setTheme(theme: ChartTheme): void   // same as applyOptions({ theme })
 | `layout.textColor` | CSS colour | theme preset |
 | `layout.priceAxisWidth` | non-negative number (additive in 1.x) | `78` |
 | `layout.timeAxisHeight` | non-negative number (additive in 1.x) | `22` |
+| `volume.visible` | boolean (additive in 1.x) | `false` |
+| `volume.color` | CSS colour, applies to both directions | theme preset |
+| `volume.upColor` / `volume.downColor` | CSS colour | theme preset |
+| `volume.heightRatio` | number in (0, 1] (additive in 1.x) | `0.2` |
 | `grid.vertLines` / `grid.horzLines` | boolean | `true` |
 | `grid.color` | CSS colour, alpha honoured | theme preset |
 | `crosshair.visible` | boolean | `true` |
@@ -227,6 +231,10 @@ chart.setTheme(theme: ChartTheme): void   // same as applyOptions({ theme })
 | `candlestick.upColor` / `downColor` | CSS colour | theme preset |
 | `candlestick.wickVisible` | boolean | `true` |
 | `candlestick.borderVisible` | boolean | `false` |
+| `candlestick.style` | one of the six styles (additive in 1.x) | `'candlestick'` |
+| `candlestick.baselinePrice` | non-negative number (additive in 1.x) | first visible close |
+| `candlestick.lineColor` | CSS colour (additive in 1.x) | theme up colour |
+| `candlestick.areaFillColor` | CSS colour (additive in 1.x) | up colour at 25% |
 | `candlestick.borderUpColor` / `borderDownColor` | CSS colour | theme preset |
 
 **Theme switching and overrides.** A theme change re-seeds every colour from that theme's preset and then re-applies anything the caller set explicitly, so an override survives a theme switch:
@@ -259,9 +267,48 @@ The gutter widths are a fixed size rather than measured from the label text, bec
 
 **`candlestick.wickVisible: false`** skips generating and drawing the wick segments. **`borderVisible: true`** draws a 1 device-pixel frame inside the body outline and insets the fill to match, in the same indexed pass with no extra shader or draw call. The body is never grown, so the gutter between bars is unchanged, and the frame is skipped on bodies too small to hold it.
 
+## Candle styles
+
+`candlestick.style` selects how the same OHLC data is drawn. All six share one program, one uniform set, and one vertex format, and differ only in how vertices are generated and which primitive they draw, so switching costs a repaint and nothing else. They all share the horizontal transform, and the price scale does not move between the body-drawing styles.
+
+| Style | Geometry |
+|---|---|
+| `candlestick` | Filled body between open and close, with a wick spanning low to high. The default. |
+| `hollow` | Body left unfilled and framed in its own body colour, with the wick still drawn. The frame is implied and drawn whether or not `borderVisible` was asked for. |
+| `ohlc` | No body. A vertical low-to-high line with a tick left of the bar at open and a tick right at close, each capped at half the bar gap. |
+| `baseline` | A filled body plus one horizontal rule across the visible candles, at `baselinePrice` or the first visible close. |
+| `line` | A polyline through the close of every candle, on the shared line series. |
+| `area` | The same close polyline with the region beneath it filled down to the bottom of the plot. |
+
+`hollow` separates the body fill from the wick colour: a transparent fill must not make the wick invisible, which is a real bug the vertical-extent assertion caught.
+
+## Translucent series compositing
+
+The data layer sits over an opaque grid layer, so its alpha is applied once by the GL blend and once more by the browser when the canvas is composited. The fragment shader therefore emits **premultiplied** colour and the context blends with `ONE, ONE_MINUS_SRC_ALPHA`. Blending with `SRC_ALPHA` instead squares the alpha channel against a transparent destination, which made a 25% area fill land at 6% and a 50% volume bar at 25%. Opaque colours are unaffected, so this changes only the translucent series.
+
 The border is a frame of four strips, never a quad underneath the body. That matters for translucent fills: the fill always composites against the plot background, never against the border colour, so `borderVisible` cannot tint the interior of a candle. Verified by construction, since a body covered by the border quad would blend to the border's hue wherever the fill has alpha.
 
 The frame is exactly one device pixel at any `devicePixelRatio`. Every body edge is resolved to a whole device pixel on the CPU and then emitted as the data value whose device position is that exact pixel, so the shader's `floor(device + 0.5)` snap is never near a rounding boundary. This is not a formality: a body edge landing on a whole CSS pixel puts `position * pixelRatio` on a half-integer at every odd-tenth ratio, where that snap is knife-edge, and the two edges of a one-pixel frame then round independently and produce a two-pixel or zero-pixel frame. The row is computed in `float32` to match the uniforms the GPU actually receives, because a `pixelRatio` such as `2.3` is not representable in `float32` and a row chosen in double precision can be the row the body was never drawn on.
+
+## Series on the data layer
+
+Every series drawn into the plot owns its own vertex array, vertex buffer, and index buffer, and draws from its own geometry. They did not used to: the renderer held a single vertex buffer, so two series could never both be resident and whichever uploaded last won. The visible symptom is narrower than one series disappearing — the candle series is re-uploaded on every viewport update, so a shared buffer is refilled with candle geometry before the next draw, and the corruption lands on whichever series did not upload last, drawing the other series' vertices under its own primitive.
+
+All series share **one** program, one uniform set, and one vertex format: interleaved `[x, y, r, g, b, a]` in data coordinates with per-vertex colour. A series therefore differs only in how its vertices are generated and which primitive it draws, never in how a vertex is transformed, so a new series type cannot drift the transform out of step with the others.
+
+The transform is device pixels in and device pixels out: the shader multiplies by the pixel ratio and divides by the backing store's resolution. There was a second program for lines that worked in CSS pixels against a device-pixel viewport, which placed line geometry in the top-left quarter of the canvas at any ratio above one. Unifying on the device-pixel transform is what makes a second series correct rather than merely present.
+
+A series that measures something other than price sets **its own vertical transform** while continuing to share the horizontal one, because every series is indexed on the same time axis. The volume histogram uses this: its bars are scaled against the largest volume on screen, so a volume spike can never stretch the price axis.
+
+## Volume and the histogram
+
+`CandleData.volume` is **optional**, which is what keeps it additive — a required field is a breaking change. When present it must be a finite, non-negative number; a present-but-invalid volume is rejected as a malformed candle rather than quietly drawn as zero. An absent volume is stored as 0, so absent and a genuine zero are deliberately indistinguishable: both mean nothing to draw.
+
+Volume is a channel on the candle record, not a separate series, so it is aggregated with the rest of the record. The rule is **sum**, in every path: a coarser bar covers more trades, so its traded size is the total of its members. This is the invariant that makes a coarser level honest, and it is asserted directly — the total volume of every level equals the full-resolution total. A reducer that sampled, took a maximum, or took the last value would all produce a plausible-looking pyramid and a wrong total.
+
+`volume.visible` is `false` by default. When switched on, the histogram occupies the bottom `volume.heightRatio` of the plot and is drawn as its own series against its own scale, reading the same pyramid level as the candlesticks so the two cannot drift apart in time. A later release gives volume its own pane; `heightRatio` is what becomes that pane's height, and nothing about the scaling changes.
+
+A present `volume` on the wire is validated and carried through by `WebSocketCandleSource`, and only carried when the wire carried it, so an absent volume stays absent rather than becoming a zero that reads like real data.
 
 Recolouring reaches the GPU without touching the data: `applyOptions` repaints from the existing vertex buffers, and `getCandleCount()` is unchanged.
 

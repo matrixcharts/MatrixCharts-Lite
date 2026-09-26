@@ -10,12 +10,19 @@ import {
     CANDLE_LOW,
     CANDLE_OPEN,
     CANDLE_STRIDE,
+    CANDLE_VOLUME,
     CANDLE_WIDTH,
     CANDLE_X,
 } from '../math/candleLayout.js';
 import { EventEmitter, ChartEvents } from './EventEmitter.js';
 import type { CandleData } from './CandleData.js';
-import type { ChartOptions, ChartTheme, ResolvedCandleColors, ResolvedChartOptions } from './options.js';
+import type {
+    CandleStyle,
+    ChartOptions,
+    ChartTheme,
+    ResolvedCandleColors,
+    ResolvedChartOptions,
+} from './options.js';
 import { mergeOptionPartials, resolveCandleColors, resolveOptions } from './options.js';
 import { resolveChartContainer } from './resolveChartContainer.js';
 import type {
@@ -57,6 +64,16 @@ const CLICK_SLOP_PX = 4;
  * `candlestickBodyWidthDevicePixels`, which reads the bar spacing instead.
  */
 const DEFAULT_BODY_WIDTH_WEIGHT = 0.7;
+
+/**
+ * Volume for a candle, with an absent value read as 0. `validateCandle` has
+ * already rejected a present-but-invalid volume, so the only question here is
+ * whether there was one at all. Absent and genuine zero are deliberately
+ * indistinguishable downstream: both mean nothing to draw.
+ */
+function candleVolume(candle: CandleData): number {
+    return candle.volume ?? 0;
+}
 
 export class Chart {
     private container: HTMLElement;
@@ -715,12 +732,16 @@ export class Chart {
 
         const level: Float32Array = this.candlePyramid.getLevelData(0);
         const offset: number = index * CANDLE_STRIDE;
+        const volume: number = level[offset + CANDLE_VOLUME];
         return {
             time,
             open: level[offset + CANDLE_OPEN],
             high: level[offset + CANDLE_HIGH],
             low: level[offset + CANDLE_LOW],
             close: level[offset + CANDLE_CLOSE],
+            // Reported only when there is something to report, so a series with no
+            // volume does not grow a field of zeroes that reads like real data.
+            ...(volume > 0 ? { volume } : {}),
         };
     }
 
@@ -928,9 +949,18 @@ export class Chart {
     private validateCandle(candle: CandleData, previousTime: number, index: number): void {
         const values: number[] = [candle.time, candle.open, candle.high, candle.low, candle.close];
         const floatValues: number[] = [candle.open, candle.high, candle.low, candle.close];
+        // Volume is optional, so it is only checked when it was actually supplied.
+        // A present-but-invalid volume is a data error, not a missing field, and
+        // is rejected here rather than being quietly drawn as zero.
+        const volumeSupplied: boolean = candle.volume !== undefined;
         if (
             !values.every(Number.isFinite) ||
             !floatValues.every((value: number): boolean => Number.isFinite(Math.fround(value))) ||
+            (volumeSupplied && (
+                !Number.isFinite(candle.volume) ||
+                !Number.isFinite(Math.fround(candle.volume as number)) ||
+                (candle.volume as number) < 0
+            )) ||
             Math.abs(candle.time) > 8.64e15 ||
             candle.time <= previousTime ||
             candle.high < Math.max(candle.open, candle.close) ||
@@ -996,6 +1026,7 @@ export class Chart {
         target[offset + CANDLE_LOW] = candle.low;
         target[offset + CANDLE_CLOSE] = candle.close;
         target[offset + CANDLE_WIDTH] = DEFAULT_BODY_WIDTH_WEIGHT;
+        target[offset + CANDLE_VOLUME] = candleVolume(candle);
     }
 
     private flushPendingData(): void {
@@ -1043,6 +1074,7 @@ export class Chart {
                 lastUpdate.low,
                 lastUpdate.close,
                 DEFAULT_BODY_WIDTH_WEIGHT,
+                candleVolume(lastUpdate),
             );
         }
 
@@ -1056,6 +1088,7 @@ export class Chart {
                 candle.low,
                 candle.close,
                 DEFAULT_BODY_WIDTH_WEIGHT,
+                candleVolume(candle),
             );
             this.candleTimes.push(candle.time);
         }
@@ -1257,13 +1290,124 @@ export class Chart {
     private uploadVisibleCandles(): void {
         // Colours were parsed to vec4 when the options were applied, so this
         // per-frame path only copies four precomputed channels.
-        this.dataRenderer.drawCandlesticks(
-            this.displayedCandles,
-            this.candleColors,
-            this.resolvedOptions.candlestick.wickVisible,
-            this.resolvedOptions.candlestick.borderVisible,
-        );
+        const style: CandleStyle = this.resolvedOptions.candlestick.style;
+        if (style === 'line' || style === 'area') {
+            // These styles plot a single price per bar, so they are line geometry
+            // rather than candle geometry. The candle series is cleared so a
+            // previous style's bodies do not linger behind the line.
+            this.dataRenderer.clearCandlesticks();
+            this.uploadVisibleClose(style);
+        } else {
+            this.dataRenderer.drawCandlesticks(this.displayedCandles, {
+                colors: this.candleColors,
+                style,
+                wickVisible: this.resolvedOptions.candlestick.wickVisible,
+                borderVisible: this.resolvedOptions.candlestick.borderVisible,
+                baselinePrice: this.baselinePrice(),
+            });
+        }
+        this.uploadVisibleVolume();
         this.emitter.emit('data', { times: this.candleTimes });
+    }
+
+    /**
+     * Uploads the close price as a polyline, and as an area fill beneath it.
+     *
+     * The two styles share the same points, so the fill edge and the stroke edge
+     * are the same numbers and cannot drift apart.
+     */
+    private uploadVisibleClose(style: CandleStyle): void {
+        const count: number = this.displayedCandles.length / CANDLE_STRIDE;
+        if (count < 2) {
+            this.dataRenderer.clearLine();
+            this.dataRenderer.clearArea();
+            return;
+        }
+        const points = new Float32Array(count * 2);
+        for (let i = 0; i < count; i++) {
+            const offset: number = i * CANDLE_STRIDE;
+            points[i * 2] = this.displayedCandles[offset + CANDLE_X];
+            points[i * 2 + 1] = this.displayedCandles[offset + CANDLE_CLOSE];
+        }
+        const lineColor = this.resolvedOptions.candlestick.lineColor;
+        this.dataRenderer.drawLine(points, lineColor);
+
+        if (style === 'area') {
+            // The fill runs to the bottom of the plot, which is the lowest price
+            // the axis can show, so the area never invents a scale of its own.
+            const plot: PlotRect = this.viewport.plot;
+            this.dataRenderer.drawArea(
+                points,
+                this.resolvedOptions.candlestick.areaFillColor,
+                coordinateToPrice(this.viewport, plot.y + plot.height),
+            );
+        } else {
+            this.dataRenderer.clearArea();
+        }
+    }
+
+    /**
+     * The reference price for the baseline style: the configured one, or the close
+     * of the first visible candle. Defaulting to a real close keeps the line on
+     * screen, where a caller-chosen price far outside the fitted range would draw
+     * nothing at all.
+     */
+    private baselinePrice(): number | null {
+        if (this.resolvedOptions.candlestick.style !== 'baseline') return null;
+        const configured: number | null = this.resolvedOptions.candlestick.baselinePrice;
+        if (configured !== null) return configured;
+        if (this.displayedCandles.length === 0) return null;
+        return this.displayedCandles[CANDLE_CLOSE];
+    }
+
+    /**
+     * Fits the histogram to the bottom of the plot and uploads it.
+     *
+     * The volume scale is its own: bars are measured against the largest volume
+     * on screen, so a volume spike cannot stretch the price axis. The region is
+     * the bottom `heightRatio` of the plot for now; when volume gets its own pane
+     * this becomes that pane's height and nothing else about the scaling changes.
+     */
+    private uploadVisibleVolume(): void {
+        const volume = this.resolvedOptions.volume;
+        if (!volume.visible || this.displayedCandles.length === 0) {
+            this.dataRenderer.clearHistogram();
+            return;
+        }
+
+        const plot: PlotRect = this.viewport.plot;
+        const regionHeight: number = plot.height * volume.heightRatio;
+        if (regionHeight <= 0) {
+            this.dataRenderer.clearHistogram();
+            return;
+        }
+
+        // Scanned twice: once for the peak, once to draw. The slice is already
+        // bounded by the visible window, so this is over the bars on screen only.
+        let peak = 0;
+        const count: number = this.displayedCandles.length / CANDLE_STRIDE;
+        for (let i: number = 0; i < count; i++) {
+            const value: number = this.displayedCandles[i * CANDLE_STRIDE + CANDLE_VOLUME];
+            if (value > peak) peak = value;
+        }
+        if (!(peak > 0)) {
+            // Nothing to draw. An all-zero series would otherwise render a row of
+            // zero-height bars, which is a different thing from "no volume".
+            this.dataRenderer.clearHistogram();
+            return;
+        }
+
+        // Bars occupy the bottom of the plot, growing upward, so the price axis
+        // keeps the full height and the histogram reads as a strip beneath it.
+        const scaleY: number = -(regionHeight * 0.92) / peak;
+        const baseline: number = plot.y + plot.height;
+        const offsetY: number = baseline - 0 * scaleY;
+        this.dataRenderer.drawHistogram(
+            this.displayedCandles,
+            volume.colors,
+            scaleY,
+            offsetY,
+        );
     }
 
     public destroy(): void {

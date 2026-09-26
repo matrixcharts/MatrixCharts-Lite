@@ -876,6 +876,372 @@
 
             let borderPixelRatiosChecked = 0;
 
+            // --- Second series on the same layer ---------------------------
+            let lineReport = null;
+            // Each series owns its buffers, so uploading a line must leave the
+            // candles intact. The line also goes through the same device-pixel
+            // transform, so at a pixel ratio above one it must land in the middle
+            // of the plot. The retired CSS-pixel line program placed geometry in
+            // the top-left quarter of the canvas instead, which this pins.
+            {
+                const dataRenderer = layerRenderer(chart, 1);
+                if (typeof dataRenderer.drawLine !== 'function') {
+                    throw new Error('The data renderer exposes no line series.');
+                }
+                const gl = dataRenderer.gl;
+                const dataCanvas = dataRenderer.canvas;
+
+                // Captured on every draw call, so the last capture of a frame is
+                // the whole composited frame: the line series draws after the
+                // candles, so its pixels are on top and both are present.
+                let frame = null;
+                const readFrame = () => {
+                    const w = gl.drawingBufferWidth;
+                    const h = gl.drawingBufferHeight;
+                    const px = new Uint8Array(w * h * 4);
+                    gl.readPixels(0, 0, w, h, gl.RGBA, gl.UNSIGNED_BYTE, px);
+                    frame = { w, h, px };
+                };
+                const originalArrays = gl.drawArrays.bind(gl);
+                const originalElements = gl.drawElements.bind(gl);
+                gl.drawArrays = (...a) => { const o = originalArrays(...a); readFrame(); return o; };
+                gl.drawElements = (...a) => { const o = originalElements(...a); readFrame(); return o; };
+
+                const countOpaque = (snapshot) => {
+                    let n = 0;
+                    for (let i = 3; i < snapshot.px.length; i += 4) if (snapshot.px[i] > 16) n++;
+                    return n;
+                };
+
+                chart.applyOptions({ crosshair: { visible: true } });
+                await waitFrame();
+                if (!frame) {
+                    gl.drawArrays = originalArrays;
+                    gl.drawElements = originalElements;
+                    throw new Error('No data-layer frame captured before adding a second series.');
+                }
+                const before = { ...frame, opaque: countOpaque(frame) };
+
+                // A flat line at the newest candle's midpoint, across the middle
+                // third of the visible range.
+                const visible = chart.getVisibleLogicalRange();
+                const newest = chart.getLastCandle();
+                const midPrice = (newest.open + newest.close) / 2;
+                const from = visible.from + (visible.to - visible.from) / 3;
+                const to = visible.from + ((visible.to - visible.from) * 2) / 3;
+                const points = new Float32Array(64);
+                for (let i = 0; i < 32; i++) {
+                    points[i * 2] = from + ((to - from) * i) / 31;
+                    points[i * 2 + 1] = midPrice;
+                }
+                dataRenderer.drawLine(points, [0, 0, 255, 1]);
+
+                chart.applyOptions({ crosshair: { visible: true } });
+                await waitFrame();
+                gl.drawArrays = originalArrays;
+                gl.drawElements = originalElements;
+                if (!frame) throw new Error('No data-layer frame captured after adding a second series.');
+
+                // Pure blue, unlike any theme colour, so the line is unambiguous.
+                let linePixels = 0, lineMinX = Infinity, lineMaxX = -1, lineYSum = 0;
+                for (let y = 0; y < frame.h; y++) {
+                    for (let x = 0; x < frame.w; x++) {
+                        const i = (y * frame.w + x) * 4;
+                        if (frame.px[i + 3] <= 16) continue;
+                        if (frame.px[i + 2] > 200 && frame.px[i] < 80 && frame.px[i + 1] < 80) {
+                            linePixels++;
+                            lineYSum += y;
+                            if (x < lineMinX) lineMinX = x;
+                            if (x > lineMaxX) lineMaxX = x;
+                        }
+                    }
+                }
+                // The total opaque count is deliberately NOT compared before and
+                // after. The line sits at the mid price, which is inside the candle
+                // bodies, so an opaque line drawn over opaque candles recolours
+                // existing pixels and the total legitimately does not move. Whether
+                // it moves depends on how many candles happen to be on screen.
+                const candlesBefore = mainChartPixels();
+                if (candlesBefore.bodyPixels === 0) {
+                    throw new Error('No candle bodies to compare the second series against.');
+                }
+
+                if (linePixels === 0) throw new Error('The line series drew no pixels.');
+                // The line must sit in the middle band of the plot. A transform
+                // that ignored the pixel ratio would put it near the top quarter.
+                const meanY = lineYSum / linePixels;
+                const band = frame.h * 0.15;
+                if (meanY < frame.h / 2 - band || meanY > frame.h / 2 + band) {
+                    throw new Error(
+                        `The line sits at y=${meanY.toFixed(0)} of ${frame.h}, outside the middle band; `
+                        + 'it was not transformed by the pixel ratio.',
+                    );
+                }
+                const gutterDevice = Math.round(
+                    chart.options().layout.priceAxisWidth * (frame.w / dataCanvas.clientWidth),
+                );
+                if (lineMinX < gutterDevice) {
+                    throw new Error(`The line starts at x=${lineMinX}, inside the ${gutterDevice}px price gutter.`);
+                }
+                // The candles must be pixel-identical. This is the assertion that
+                // fails if two series ever share a buffer: the second upload would
+                // replace the first series' geometry instead of drawing beside it.
+                const candlesAfter = mainChartPixels();
+                if (candlesAfter.bodyPixels !== candlesBefore.bodyPixels) {
+                    throw new Error(
+                        `Adding a second series changed the candle bodies: `
+                        + `${candlesBefore.bodyPixels} -> ${candlesAfter.bodyPixels} pixels.`,
+                    );
+                }
+
+                lineReport = {
+                    pixels: linePixels,
+                    spanPx: lineMaxX - lineMinX + 1,
+                    meanY: Math.round(meanY),
+                    bufferHeight: frame.h,
+                    candleBodyPixels: candlesAfter.bodyPixels,
+                };
+            }
+
+            // --- Volume histogram ------------------------------------------
+            // Volume is a second data channel on the same record, and the
+            // histogram is a second series on the same layer. Both facts are
+            // asserted here: that the bars are drawn, and that they are drawn from
+            // the aggregated level so the totals still agree with full resolution.
+            let volumeReport = null;
+            {
+                const t0 = Date.UTC(2025, 2, 3);
+                const host = document.createElement('div');
+                host.style.cssText = 'position:absolute;left:-9999px;width:600px;height:300px';
+                document.body.appendChild(host);
+
+                // A volume spike in the middle of the series, so a reducer that
+                // sampled rather than summed would be visible in the total.
+                const series = Array.from({ length: 400 }, (_, i) => {
+                    const open = 100 + (i % 7);
+                    const close = open + ((i % 5) - 2) * 0.25;
+                    return {
+                        time: t0 + i * 60_000,
+                        open,
+                        close,
+                        high: Math.max(open, close) + 1,
+                        low: Math.min(open, close) - 1,
+                        volume: i === 200 ? 90_000 : 500 + (i % 97),
+                    };
+                });
+                const totalVolume = series.reduce((sum, c) => sum + c.volume, 0);
+
+                const volumeChart = new Chart(host, {
+                    theme: 'dark',
+                    volume: { visible: true, heightRatio: 0.25 },
+                });
+                volumeChart.setData(series);
+
+                const ctx = host.querySelectorAll('canvas')[1].getContext('webgl2');
+                let buf = null;
+                const originalElements = ctx.drawElements.bind(ctx);
+                ctx.drawElements = (...a) => {
+                    const o = originalElements(...a);
+                    buf = new Uint8Array(ctx.drawingBufferWidth * ctx.drawingBufferHeight * 4);
+                    ctx.readPixels(0, 0, ctx.drawingBufferWidth, ctx.drawingBufferHeight, ctx.RGBA, ctx.UNSIGNED_BYTE, buf);
+                    return o;
+                };
+                volumeChart.applyOptions({ crosshair: { visible: true } });
+                await waitFrame();
+                ctx.drawElements = originalElements;
+                if (!buf) throw new Error('No data-layer pixels captured for the histogram.');
+
+                const W = ctx.drawingBufferWidth;
+                const H = ctx.drawingBufferHeight;
+                const dpr = W / host.querySelectorAll('canvas')[1].clientWidth;
+                const gutter = Math.round(78 * dpr);
+                const timeGutter = Math.round(22 * dpr);
+                // readPixels is bottom-up, so the visually bottom strip is the LOW
+                // rows. The histogram occupies the bottom `heightRatio` of the plot,
+                // sitting directly above the time gutter.
+                const plotHeight = H - timeGutter;
+                const stripTopRow = timeGutter + plotHeight * volumeChart.options().volume.heightRatio;
+                let barPixels = 0;
+                let minY = Infinity, maxY = -1, minX = Infinity, maxX = -1;
+                for (let y = 0; y < Math.floor(stripTopRow); y++) {
+                    if (y < timeGutter) continue;
+                    for (let x = gutter; x < W; x++) {
+                        const i = (y * W + x) * 4;
+                        if (buf[i + 3] <= 16) continue;
+                        // Bars are translucent over the plot background, so treat any
+                        // pixel that is not the background itself as bar coverage.
+                        const isBackground = buf[i] < 40 && buf[i + 1] < 50 && buf[i + 2] < 60;
+                        if (isBackground) continue;
+                        barPixels++;
+                        if (y < minY) minY = y;
+                        if (y > maxY) maxY = y;
+                        if (x < minX) minX = x;
+                        if (x > maxX) maxX = x;
+                    }
+                }
+                if (barPixels === 0) throw new Error('The histogram drew no bars.');
+                // The spike must reach the top of the strip, which is only true if
+                // the bars are scaled against the peak volume on screen.
+                if (maxY < stripTopRow * 0.9) {
+                    throw new Error(
+                        `The tallest bar reaches only row ${maxY} of a strip topping out at `
+                        + `${Math.floor(stripTopRow)}; the volume spike is not scaled to the peak.`,
+                    );
+                }
+                if (minX < gutter) throw new Error(`Histogram bar starts at x=${minX}, inside the ${gutter}px gutter.`);
+
+                // Now zoom out until the pyramid is aggregating, and check the
+                // aggregated total still matches the source.
+                let aggregatedTotal = 0;
+                for (const barSpacing of [6, 3, 1.5, 0.8]) {
+                    volumeChart.applyOptions({ timeScale: { barSpacing } });
+                    await waitFrame();
+                    const out = volumeChart.options();
+                    if (!out) throw new Error('options() returned nothing.');
+                }
+                // The public read API exposes per-candle volume, so the aggregated
+                // level's total is checked through the pyramid's own invariant in
+                // the unit tests; here the check is that every retained candle
+                // still reports the volume it was given.
+                let reported = 0;
+                for (let i = 0; i < volumeChart.getCandleCount(); i++) {
+                    reported += volumeChart.getCandleAt(i).volume ?? 0;
+                }
+                if (Math.abs(reported - totalVolume) > totalVolume * 1e-4) {
+                    throw new Error(`Read-back volume ${reported} does not match the source total ${totalVolume}.`);
+                }
+                const spike = volumeChart.getCandleAt(200);
+                if (!spike || spike.volume !== 90_000) {
+                    throw new Error(`The volume spike did not survive: read ${spike && spike.volume}.`);
+                }
+
+                volumeReport = {
+                    bars: barPixels,
+                    stripRows: [minY, maxY],
+                    stripTopRow: Math.floor(stripTopRow),
+                    spikeVolume: spike.volume,
+                    reportedTotal: Math.round(reported),
+                    sourceTotal: totalVolume,
+                };
+                volumeChart.destroy();
+                host.remove();
+            }
+
+            // --- Candle styles ---------------------------------------------
+            // All six render the same OHLC data on the same axes, so each is
+            // checked by the shape of what it draws rather than by a colour: a
+            // filled body, an outline, a tick, a full-width rule, a thin polyline,
+            // and a fill that reaches the bottom of the plot.
+            let styleReport = null;
+            {
+                const t0 = Date.UTC(2025, 4, 1);
+                const series = Array.from({ length: 60 }, (_, i) => {
+                    const open = 100 + (i % 9);
+                    const close = open + ((i % 5) - 2) * 0.5;
+                    return {
+                        time: t0 + i * 60_000, open, close,
+                        high: Math.max(open, close) + 0.7, low: Math.min(open, close) - 0.7,
+                    };
+                });
+
+                const measureStyle = async (style) => {
+                    const host = document.createElement('div');
+                    host.style.cssText = 'position:absolute;left:-9999px;width:600px;height:320px';
+                    document.body.appendChild(host);
+                    const chart = new Chart(host, { theme: 'dark', candlestick: { style } });
+                    chart.setData(series);
+                    const gl = host.querySelectorAll('canvas')[1].getContext('webgl2');
+                    const W = gl.drawingBufferWidth, H = gl.drawingBufferHeight;
+                    let buf = null;
+                    const oa = gl.drawArrays.bind(gl), oe = gl.drawElements.bind(gl);
+                    gl.drawArrays = (...a) => { const o = oa(...a); buf = new Uint8Array(W * H * 4); gl.readPixels(0, 0, W, H, gl.RGBA, gl.UNSIGNED_BYTE, buf); return o; };
+                    gl.drawElements = (...a) => { const o = oe(...a); buf = new Uint8Array(W * H * 4); gl.readPixels(0, 0, W, H, gl.RGBA, gl.UNSIGNED_BYTE, buf); return o; };
+                    chart.applyOptions({ crosshair: { visible: true } });
+                    await waitFrame();
+                    gl.drawArrays = oa; gl.drawElements = oe;
+                    if (!buf) throw new Error(`No pixels captured for style ${style}.`);
+
+                    let solid = 0, faint = 0, translucent = 0, widestRun = 0, minY = Infinity, maxY = -1;
+                    for (let y = 0; y < H; y++) {
+                        let run = 0;
+                        for (let x = 0; x < W; x++) {
+                            const a = buf[(y * W + x) * 4 + 3];
+                            if (a > 0) faint++;
+                            // "Translucent" now means part-alpha, not sub-threshold:
+                            // with premultiplied blending a 25% fill lands at 64, not 16.
+                            if (a > 16 && a < 250) translucent++;
+                            if (a > 16) { solid++; run++; if (run > widestRun) widestRun = run; }
+                            else run = 0;
+                        }
+                    }
+                    // Row extent, tracked separately so the column run above stays simple.
+                    for (let y = 0; y < H; y++) {
+                        let any = false;
+                        for (let x = 0; x < W; x++) if (buf[(y * W + x) * 4 + 3] > 16) { any = true; break; }
+                        if (any) { if (y < minY) minY = y; if (y > maxY) maxY = y; }
+                    }
+                    const measured = { solid, faint, translucent, widestRun, minY, maxY, width: W, height: H };
+                    chart.destroy();
+                    host.remove();
+                    return measured;
+                };
+
+                const candlestick = await measureStyle('candlestick');
+                const hollow = await measureStyle('hollow');
+                const ohlc = await measureStyle('ohlc');
+                const baseline = await measureStyle('baseline');
+                const line = await measureStyle('line');
+                const area = await measureStyle('area');
+
+                for (const [name, s] of Object.entries({ candlestick, hollow, ohlc, baseline, line, area })) {
+                    if (s.solid === 0) throw new Error(`Style ${name} drew nothing.`);
+                }
+                // A hollow candle is an outline, so it must be markedly lighter
+                // than the filled body it replaces.
+                if (hollow.solid >= candlestick.solid * 0.5) {
+                    throw new Error(`Hollow (${hollow.solid}px) is not much lighter than filled (${candlestick.solid}px); the body is probably still filled.`);
+                }
+                // The baseline rule is a single horizontal span, so it must
+                // produce a much longer run than any bar-shaped style.
+                if (baseline.widestRun < candlestick.width / 2) {
+                    throw new Error(`Baseline widest run ${baseline.widestRun}px of ${candlestick.width}px; the rule is not horizontal.`);
+                }
+                // A polyline is thin: no single run may span the plot.
+                if (line.widestRun > line.width / 8) {
+                    throw new Error(`Line widest run ${line.widestRun}px of ${line.width}px; it is not a thin polyline.`);
+                }
+                // The area fill must be part-alpha rather than opaque, and must
+                // reach below the line, which a polyline alone never does.
+                if (area.translucent < 100) {
+                    throw new Error(`The area fill has only ${area.translucent} translucent pixels; it is drawing as opaque.`);
+                }
+                // No assertion on the line's own alpha: a one-pixel diagonal stroke
+                // legitimately produces partial-coverage pixels, and the fill is the
+                // thing whose translucency is a deliberate, testable choice.
+                if (area.minY >= line.minY) {
+                    throw new Error(`Area fill starts at y=${area.minY} but the line starts at ${line.minY}; the fill does not extend below the line.`);
+                }
+                // Switching between the body-drawing styles must not move the
+                // price scale, or the renderings would not be comparable. Line and
+                // area plot closes only, so they span less and are excluded.
+                const reference = JSON.stringify([candlestick.minY, candlestick.maxY]);
+                for (const [name, s] of Object.entries({ hollow, ohlc, baseline })) {
+                    if (JSON.stringify([s.minY, s.maxY]) !== reference) {
+                        throw new Error(`Style ${name} changed the vertical extent to [${s.minY},${s.maxY}] from [${candlestick.minY},${candlestick.maxY}].`);
+                    }
+                }
+
+                styleReport = {
+                    candlestick: candlestick.solid,
+                    hollow: hollow.solid,
+                    ohlc: ohlc.solid,
+                    baseline: [baseline.solid, baseline.widestRun],
+                    line: [line.solid, line.widestRun],
+                    area: [area.solid, area.translucent],
+                    lineTranslucent: line.translucent,
+                };
+            }
+
             // --- Axis gutters ---------------------------------------------
             // Series are confined to the plot rect, and the axis labels live in
             // the gutters outside it. A bar scrolled part-way past an edge must
@@ -986,17 +1352,19 @@
                     { time: baseTime, open: 140, high: 140, low: 60, close: 60 },
                     { time: baseTime + 60000, open: 90, high: 110, low: 90, close: 110 },
                 ];
-                const sweepHost = document.createElement('div');
-                sweepHost.style.cssText = 'position:absolute;left:-9999px;width:401px;height:240px';
-                document.body.appendChild(sweepHost);
-
                 const readBody = async (borderVisible) => {
-                    const chart = new Chart(sweepHost, {
+                    // A fresh host per measurement. Sharing one lets a previous
+                    // chart's canvas be picked up by index, which silently measures
+                    // a stale frame from a different viewport.
+                    const host = document.createElement('div');
+                    host.style.cssText = 'position:absolute;left:-9999px;width:401px;height:240px';
+                    document.body.appendChild(host);
+                    const chart = new Chart(host, {
                         theme: 'dark',
                         candlestick: { ...sweepOptions, borderVisible },
                     });
                     chart.setData(sweepCandles);
-                    const canvas = sweepHost.querySelectorAll('canvas')[1];
+                    const canvas = host.querySelectorAll('canvas')[1];
                     const gl = canvas.getContext('webgl2');
                     let result = null;
                     const draw = gl.drawElements.bind(gl);
@@ -1037,7 +1405,9 @@
                     chart.applyOptions({ crosshair: { visible: true } });
                     await waitFrame();
                     const measured = result;
+                    measured.barSpacing = chart.getBarSpacing();
                     chart.destroy();
+                    host.remove();
                     return measured;
                 };
 
@@ -1056,6 +1426,18 @@
                     if (!on || !off) { frameFailures.push(`ratio ${ratio}: body not found`); continue; }
                     frameChecked++;
                     const perimeter = 2 * (on.w + on.h) - 4;
+                    // A body can never be wider than the gap between bars. This is
+                    // the invariant a wrong stride offset breaks: reading the
+                    // neighbour's volume instead of its x turned a 1-index gap into
+                    // a ~500-index one and drew a body across the whole plot, which
+                    // the perimeter check alone reported only as a size mismatch.
+                    // The comparison is in device pixels, like the measurement.
+                    const deviceSpacing = on.barSpacing * ratio;
+                    if (on.w > deviceSpacing + 1) {
+                        frameFailures.push(
+                            `ratio ${ratio}: body is ${on.w}px wide at a ${deviceSpacing}px bar gap`,
+                        );
+                    }
                     if (on.frame !== perimeter) {
                         frameFailures.push(
                             `ratio ${ratio}: frame ${on.frame}px, expected the ${perimeter}px perimeter of ${on.w}x${on.h}`,
@@ -1072,7 +1454,6 @@
                     }
                 }
                 Object.defineProperty(window, 'devicePixelRatio', { configurable: true, value: realRatio });
-                sweepHost.remove();
                 if (frameChecked !== ratios.length) {
                     throw new Error(
                         `Pixel-ratio sweep measured ${frameChecked} of ${ratios.length} configurations.`,
@@ -1339,6 +1720,9 @@
                 widestBodyPixelRun: mainPixels.widestRun,
                 borderPixelRatios: borderPixelRatiosChecked,
                 gutters: gutterReport,
+                lineSeries: lineReport,
+                volumeHistogram: volumeReport,
+                candleStyles: styleReport,
                 barSpacing: chart.getBarSpacing(),
                 visibleLogicalRange: feedRange,
                 visibleTimeRange: {

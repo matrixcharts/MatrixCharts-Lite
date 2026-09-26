@@ -5,6 +5,7 @@ import {
     CANDLE_LOW,
     CANDLE_OPEN,
     CANDLE_STRIDE,
+    CANDLE_VOLUME,
     CANDLE_WIDTH,
     CANDLE_X,
 } from './candleLayout.js';
@@ -49,12 +50,13 @@ export class OHLCPyramid {
         low: number,
         close: number,
         width: number,
+        volume: number,
     ): void {
-        this.validateValues(x, open, high, low, close, width);
+        this.validateValues(x, open, high, low, close, width, volume);
 
         const newIndex: number = this.sourceCandleCount;
         this.ensureCapacity(0, newIndex + 1);
-        this.writeCandle(this.levels[0], newIndex * CANDLE_STRIDE, x, open, high, low, close, width);
+        this.writeCandle(this.levels[0], newIndex * CANDLE_STRIDE, x, open, high, low, close, width, volume);
         this.sourceCandleCount++;
         this.levelCounts[0] = this.sourceCandleCount;
         this.recomputeAncestors(newIndex);
@@ -67,14 +69,17 @@ export class OHLCPyramid {
         low: number,
         close: number,
         width: number,
+        volume: number,
     ): void {
         if (this.sourceCandleCount === 0) {
             throw new Error('MatrixCharts: Cannot update the last candle before data is set.');
         }
-        this.validateValues(x, open, high, low, close, width);
+        this.validateValues(x, open, high, low, close, width, volume);
 
         const lastIndex: number = this.sourceCandleCount - 1;
-        this.writeCandle(this.levels[0], lastIndex * CANDLE_STRIDE, x, open, high, low, close, width);
+        this.writeCandle(
+            this.levels[0], lastIndex * CANDLE_STRIDE, x, open, high, low, close, width, volume,
+        );
         this.recomputeAncestors(lastIndex);
     }
 
@@ -133,9 +138,9 @@ export class OHLCPyramid {
         ) - 1;
 
         // A bucket fuses two children: the group's open and close come from the
-        // outer edges, high and low are the extremes, and width accumulates. An
-        // odd tail can pair a candle with itself, which the width sum must not
-        // double-count.
+        // outer edges, high and low are the extremes, and width and volume
+        // accumulate. An odd tail can pair a candle with itself, which neither
+        // sum may double-count.
         this.writeCandle(
             this.levels[levelIndex],
             outputOffset,
@@ -146,6 +151,8 @@ export class OHLCPyramid {
             children[secondOffset + CANDLE_CLOSE],
             children[firstOffset + CANDLE_WIDTH]
                 + (secondChildIndex === firstChildIndex ? 0 : children[secondOffset + CANDLE_WIDTH]),
+            children[firstOffset + CANDLE_VOLUME]
+                + (secondChildIndex === firstChildIndex ? 0 : children[secondOffset + CANDLE_VOLUME]),
         );
     }
 
@@ -174,6 +181,7 @@ export class OHLCPyramid {
         low: number,
         close: number,
         width: number,
+        volume: number,
     ): void {
         target[offset + CANDLE_X] = x;
         target[offset + CANDLE_OPEN] = open;
@@ -181,6 +189,7 @@ export class OHLCPyramid {
         target[offset + CANDLE_LOW] = low;
         target[offset + CANDLE_CLOSE] = close;
         target[offset + CANDLE_WIDTH] = width;
+        target[offset + CANDLE_VOLUME] = volume;
     }
 
     private validateValues(
@@ -190,10 +199,12 @@ export class OHLCPyramid {
         low: number,
         close: number,
         width: number,
+        volume: number,
     ): void {
         if (
-            ![x, open, high, low, close, width].every(Number.isFinite) ||
+            ![x, open, high, low, close, width, volume].every(Number.isFinite) ||
             width <= 0 ||
+            volume < 0 ||
             high < Math.max(open, close) ||
             low > Math.min(open, close) ||
             high < low

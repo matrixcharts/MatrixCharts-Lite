@@ -127,6 +127,22 @@
                 <option value="true">on</option>
             </select>
         </label>
+        <label class="swatch">Style
+            <select id="candle-style" aria-label="Candle rendering style">
+                <option value="candlestick">candlestick</option>
+                <option value="hollow">hollow</option>
+                <option value="ohlc">ohlc</option>
+                <option value="baseline">baseline</option>
+                <option value="line">line</option>
+                <option value="area">area</option>
+            </select>
+        </label>
+        <label class="swatch">Volume
+            <select id="volume-visible" aria-label="Volume histogram visibility">
+                <option value="false">off</option>
+                <option value="true">on</option>
+            </select>
+        </label>
         <label class="swatch">Cross
             <select id="crosshair-visible" aria-label="Crosshair visibility">
                 <option value="true">on</option>
@@ -243,6 +259,8 @@
         const downInput = document.querySelector('#candle-down');
         const wicksInput = document.querySelector('#candle-wicks');
         const bordersInput = document.querySelector('#candle-borders');
+        const volumeInput = document.querySelector('#volume-visible');
+        const styleInput = document.querySelector('#candle-style');
         const crosshairInput = document.querySelector('#crosshair-visible');
         const gridInput = document.querySelector('#grid-mode');
         const precisionInput = document.querySelector('#price-precision');
@@ -274,6 +292,12 @@
         bordersInput.addEventListener('change', () => {
             restyle({ candlestick: { borderVisible: bordersInput.value === 'true' } }, `borders ${bordersInput.value}`);
         });
+        volumeInput.addEventListener('change', () => {
+            restyle({ volume: { visible: volumeInput.value === 'true' } }, `volume ${volumeInput.value}`);
+        });
+        styleInput.addEventListener('change', () => {
+            restyle({ candlestick: { style: styleInput.value } }, `style ${styleInput.value}`);
+        });
         crosshairInput.addEventListener('change', () => {
             restyle({ crosshair: { visible: crosshairInput.value === 'true' } }, `crosshair ${crosshairInput.value}`);
         });
@@ -299,6 +323,7 @@
             downInput.value = options.candlestick.downColor;
             wicksInput.value = String(options.candlestick.wickVisible);
             bordersInput.value = String(options.candlestick.borderVisible);
+            styleInput.value = options.candlestick.style;
             crosshairInput.value = String(options.crosshair.visible);
             gridInput.value = options.grid.vertLines && options.grid.horzLines
                 ? 'both'

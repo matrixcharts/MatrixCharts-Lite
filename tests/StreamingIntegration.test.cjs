@@ -49,7 +49,10 @@ class RetainedChartTarget {
         this.rebuild();
     }
     rebuild() {
-        const data = new Float32Array(this.candles.length * 6);
+        // Mirrors Chart.writeCandleRecord, including the volume channel, so a
+        // change to the record layout is caught here rather than as a truncated
+        // buffer that happens to throw somewhere less obvious.
+        const data = new Float32Array(this.candles.length * STRIDE);
         this.candles.forEach((candle, index) => data.set([
             index,
             candle.open,
@@ -57,10 +60,23 @@ class RetainedChartTarget {
             candle.low,
             candle.close,
             0.7,
-        ], index * 6));
+            candle.volume ?? 0,
+        ], index * STRIDE));
         this.pyramid.reset(data);
     }
+
+    totalVolume() {
+        const level = this.pyramid.getLevelData(0);
+        let sum = 0;
+        for (let index = 0; index < level.length / STRIDE; index++) {
+            sum += level[index * STRIDE + VOLUME];
+        }
+        return sum;
+    }
 }
+
+const STRIDE = 7;
+const VOLUME = 6;
 
 const makeCandle = (index, close = 100 + index % 31) => ({
     time: 1735689600000 + index * 60_000,
@@ -68,9 +84,10 @@ const makeCandle = (index, close = 100 + index % 31) => ({
     high: close + 2 + index % 13,
     low: close - 3 - index % 11,
     close,
+    volume: 500 + (index % 211),
 });
 
-test('feed ingest, retention, aggregate integrity, and snapshot recovery work together', () => {
+test('feed ingest, retention, aggregate integrity, and snapshot recovery work together', (context) => {
     const sockets = [];
     const source = new WebSocketCandleSource('ws://integration.test', {
         webSocketFactory: () => {
@@ -115,6 +132,13 @@ test('feed ingest, retention, aggregate integrity, and snapshot recovery work to
     assert.equal(controller.state, 'connected');
     assert.equal(target.candles.length, 1000);
     assert.equal(target.candles[0].time, recovery[0].time);
+    // Volume survives the whole feed path, and retention trims exactly the
+    // candles that were dropped rather than their volume.
+    const expectedVolume = recovery.reduce((sum, candle) => sum + candle.volume, 0);
+    assert.equal(target.totalVolume(), expectedVolume);
     assert.deepEqual(errors, []);
     controller.dispose();
+    // A failed assertion above would otherwise leave the source's watchdog and
+    // reconnect timers running, and the test process would never exit.
+    context.after(() => source.stop());
 });

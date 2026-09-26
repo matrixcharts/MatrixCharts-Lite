@@ -3,20 +3,20 @@
  * and the data renderer. Every level of the pyramid uses this same layout, so a
  * level is a plain `Float32Array` of `CANDLE_STRIDE`-float records:
  *
- *   [x, open, high, low, close, width]
+ *   [x, open, high, low, close, width, volume]
  *
  * `x` is the source-space ordinal index rather than a pixel or a timestamp, and
  * `width` is a relative weight that aggregation sums, not a pixel width. Neither
- * is a data channel: the only data channel is price, carried by the four price
- * fields. A new channel, such as volume, is appended as a further field and its
- * aggregate rule added alongside the ones in `LTTBDownsampler`.
+ * is a data channel. The data channels are price, carried by the four price
+ * fields, and `volume`, which is summed across an aggregated group because a
+ * bucket's traded size is the total of its members.
  *
- * The stride is named rather than written inline because a bare `6` appears in
- * every length calculation, slice, and channel read across the data path, where
- * mistaking it for an unrelated `6` — the renderer's GPU vertex stride, which is
- * also six floats — silently reads the wrong field.
+ * The stride is named rather than written inline because a bare `7` would appear
+ * in every length calculation, slice, and channel read across the data path,
+ * where mistaking it for an unrelated `6` — the renderer's GPU vertex stride,
+ * which is also six floats — silently reads the wrong field.
  */
-export const CANDLE_STRIDE: number = 6;
+export const CANDLE_STRIDE: number = 7;
 
 /** Ordinal index of the record, in source-space candle units. */
 export const CANDLE_X: number = 0;
@@ -30,3 +30,10 @@ export const CANDLE_LOW: number = 3;
 export const CANDLE_CLOSE: number = 4;
 /** Relative body width; the sum across an aggregated group. */
 export const CANDLE_WIDTH: number = 5;
+/**
+ * Traded volume; the sum across an aggregated group. A candle with no volume is
+ * stored as 0, so an absent value and a genuine zero are indistinguishable in the
+ * record. That is deliberate: both mean "nothing to draw", and the histogram is
+ * opt-in.
+ */
+export const CANDLE_VOLUME: number = 6;

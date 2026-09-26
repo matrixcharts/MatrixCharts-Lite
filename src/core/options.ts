@@ -37,6 +37,29 @@ export interface LayoutOptions {
     timeAxisHeight?: number;
 }
 
+export interface VolumeOptions {
+    /**
+     * Whether to draw the volume histogram. Additive in 1.x. Off by default, so a
+     * series that carries no volume draws nothing extra.
+     */
+    visible?: boolean;
+    /** One colour for every bar. Ignored when `upColor` or `downColor` is set. */
+    color?: string;
+    /** Bars for candles that closed at or above their open. */
+    upColor?: string;
+    /** Bars for candles that closed below their open. */
+    downColor?: string;
+    /**
+     * Fraction of the plot height the histogram occupies, from the bottom.
+     * Additive in 1.x. Must be greater than 0 and at most 1.
+     *
+     * The histogram is scaled to its own range rather than the price range, so it
+     * never distorts the price axis. It shares the plot for now; a later release
+     * gives it its own pane, and the fraction is what becomes that pane's height.
+     */
+    heightRatio?: number;
+}
+
 export interface GridOptions {
     vertLines?: boolean;
     horzLines?: boolean;
@@ -59,6 +82,27 @@ export interface TimeScaleOptions {
     maxBarSpacing?: number;
 }
 
+/**
+ * How the OHLC series is drawn. All six render the same candle data on the same
+ * time axis and the same price scale; they differ only in how vertices are
+ * generated, so switching between them costs nothing but a repaint.
+ *
+ * Additive in 1.x.
+ */
+export type CandleStyle =
+    /** Filled body between open and close, with a wick spanning low to high. */
+    | 'candlestick'
+    /** Outline only: the body is left unfilled and framed in the body colour. */
+    | 'hollow'
+    /** No body. A vertical low-to-high line with a left tick at open and a right tick at close. */
+    | 'ohlc'
+    /** Filled body plus a horizontal reference line across the visible range. */
+    | 'baseline'
+    /** A polyline through the close of every candle, with no body or wick. */
+    | 'line'
+    /** The close polyline with the area beneath it filled. */
+    | 'area';
+
 export interface CandlestickOptions {
     upColor?: string;
     downColor?: string;
@@ -67,6 +111,21 @@ export interface CandlestickOptions {
     borderVisible?: boolean;
     borderUpColor?: string;
     borderDownColor?: string;
+    /** Additive in 1.x. Defaults to `'candlestick'`. */
+    style?: CandleStyle;
+    /**
+     * Reference price for the `'baseline'` style. Additive in 1.x. When absent the
+     * close of the first visible candle is used, so the line is always on screen
+     * rather than far outside the fitted range.
+     */
+    baselinePrice?: number;
+    /** Colour of the `'line'` and `'area'` styles. Additive in 1.x. */
+    lineColor?: string;
+    /**
+     * Fill beneath the `'area'` style, as a colour with its own alpha. Additive in
+     * 1.x. Defaults to `lineColor` at half alpha.
+     */
+    areaFillColor?: string;
 }
 
 /** Caller-supplied options. Every field is optional and merges over the preset. */
@@ -80,6 +139,7 @@ export interface ChartOptions {
     timeZone?: string;
     priceFormat?: PriceFormatOptions;
     layout?: LayoutOptions;
+    volume?: VolumeOptions;
     grid?: GridOptions;
     crosshair?: CrosshairOptions;
     timeScale?: TimeScaleOptions;
@@ -94,6 +154,18 @@ export interface ResolvedLayout {
     timeAxisHeight: number;
 }
 export interface ResolvedGrid { vertLines: boolean; horzLines: boolean; color: string }
+
+/** The histogram's RGBA channels, resolved from CSS when options are applied. */
+export interface ResolvedVolumeColors {
+    up: [number, number, number, number];
+    down: [number, number, number, number];
+}
+
+export interface ResolvedVolume {
+    visible: boolean;
+    colors: ResolvedVolumeColors;
+    heightRatio: number;
+}
 export interface ResolvedCrosshair { visible: boolean; color: string }
 export interface ResolvedTimeScale { barSpacing: number; minBarSpacing: number; maxBarSpacing: number }
 export interface ResolvedCandlestick {
@@ -103,6 +175,12 @@ export interface ResolvedCandlestick {
     borderVisible: boolean;
     borderUpColor: string;
     borderDownColor: string;
+    style: CandleStyle;
+    /** Null means "use the first visible candle's close". */
+    baselinePrice: number | null;
+    /** RGBA for the line and area styles, parsed from CSS when options are applied. */
+    lineColor: Rgba;
+    areaFillColor: Rgba;
 }
 
 /** Every option resolved to a concrete value. Returned by `chart.options()`. */
@@ -113,6 +191,7 @@ export interface ResolvedChartOptions {
     timeZone: string;
     priceFormat: ResolvedPriceFormat;
     layout: ResolvedLayout;
+    volume: ResolvedVolume;
     grid: ResolvedGrid;
     crosshair: ResolvedCrosshair;
     timeScale: ResolvedTimeScale;
@@ -127,7 +206,7 @@ export const DEFAULT_MIN_BAR_SPACING = 0.5;
 export const DEFAULT_MAX_BAR_SPACING = 400;
 
 /** Non-theme-dependent defaults. Theme presets override the color fields. */
-const BASE_DEFAULTS: Omit<ResolvedChartOptions, 'theme' | 'locale' | 'candlestick' | 'layout' | 'grid' | 'crosshair'> = {
+const BASE_DEFAULTS: Omit<ResolvedChartOptions, 'theme' | 'locale' | 'candlestick' | 'layout' | 'volume' | 'grid' | 'crosshair'> = {
     maxRetainedCandles: DEFAULT_MAX_RETAINED_CANDLES,
     timeZone: 'UTC',
     priceFormat: { precision: 2, minMove: 0.01 },
@@ -141,12 +220,19 @@ const BASE_DEFAULTS: Omit<ResolvedChartOptions, 'theme' | 'locale' | 'candlestic
 /** Colors and chrome seeded per theme. Explicit overrides are re-applied on top. */
 const THEME_PRESETS: Record<ChartTheme, {
     layout: Omit<ResolvedLayout, 'priceAxisWidth' | 'timeAxisHeight'>;
+    /** Volume colours are theme colours, but visibility and height are not. */
+    volume: { colors: { up: string; down: string } };
     grid: ResolvedGrid;
     crosshair: ResolvedCrosshair;
-    candlestick: ResolvedCandlestick;
+    /** Style choice and baseline are not theme colours, so they are omitted. */
+    candlestick: Omit<
+        ResolvedCandlestick,
+        'style' | 'baselinePrice' | 'lineColor' | 'areaFillColor'
+    >;
 }> = {
     dark: {
         layout: { background: '#0b0f17', textColor: '#c6d0df' },
+        volume: { colors: { up: 'rgba(26, 217, 140, 0.5)', down: 'rgba(242, 64, 89, 0.5)' } },
         grid: { vertLines: true, horzLines: true, color: 'rgba(184, 198, 218, 0.13)' },
         crosshair: { visible: true, color: 'rgba(0, 220, 255, 0.9)' },
         candlestick: {
@@ -160,6 +246,7 @@ const THEME_PRESETS: Record<ChartTheme, {
     },
     paper: {
         layout: { background: '#f4f1e8', textColor: '#343b41' },
+        volume: { colors: { up: 'rgba(5, 122, 82, 0.45)', down: 'rgba(194, 38, 51, 0.45)' } },
         grid: { vertLines: true, horzLines: true, color: 'rgba(54, 62, 70, 0.15)' },
         crosshair: { visible: true, color: 'rgba(0, 111, 145, 0.9)' },
         candlestick: {
@@ -192,6 +279,32 @@ function requireIntegerInRange(value: unknown, label: string, min: number, max: 
 function requirePositiveFinite(value: unknown, label: string): number {
     if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0) {
         fail(`${label} must be a positive finite number, received ${describe(value)}.`);
+    }
+    return value;
+}
+
+const CANDLE_STYLES: readonly CandleStyle[] = [
+    'candlestick', 'hollow', 'ohlc', 'baseline', 'line', 'area',
+];
+
+function requireCandleStyle(value: unknown): CandleStyle {
+    if (typeof value !== 'string' || !CANDLE_STYLES.includes(value as CandleStyle)) {
+        fail(
+            `candlestick.style must be one of ${CANDLE_STYLES.join(', ')}, received ${describe(value)}.`,
+        );
+    }
+    return value as CandleStyle;
+}
+
+/** The same colour with a replaced alpha, for fills derived from a stroke colour. */
+function withAlpha(rgba: Rgba, alpha: number): Rgba {
+    return [rgba[0], rgba[1], rgba[2], alpha];
+}
+
+/** A finite number within an inclusive range. */
+function requireNumberInRange(value: unknown, label: string, min: number, max: number): number {
+    if (typeof value !== 'number' || !Number.isFinite(value) || value < min || value > max) {
+        fail(`${label} must be a number between ${min} and ${max}, received ${describe(value)}.`);
     }
     return value;
 }
@@ -348,6 +461,24 @@ const DEFAULT_LAYOUT_METRICS = {
     timeAxisHeight: 22,
 } as const;
 
+/**
+ * Volume defaults that are not theme colours. The histogram is off by default,
+ * so a series with no volume is unaffected, and occupies the bottom fifth of the
+ * plot when switched on.
+ */
+const DEFAULT_VOLUME_METRICS = {
+    visible: false,
+    heightRatio: 0.2,
+} as const;
+
+/**
+ * Default candlestick rendering and colours for the non-candlestick styles.
+ * Not theme colours for `style` and `baselinePrice`, which are choices rather
+ * than appearance; the line and area colours follow each theme's up colour so a
+ * line chart reads as belonging to the same chart as its candles.
+ */
+const DEFAULT_CANDLE_STYLE: CandleStyle = 'candlestick';
+
 /** Preset-only snapshot for a theme, with no caller overrides applied. */
 export function themeDefaults(theme: ChartTheme): ResolvedChartOptions {
     const preset = THEME_PRESETS[theme];
@@ -357,10 +488,26 @@ export function themeDefaults(theme: ChartTheme): ResolvedChartOptions {
         locale: runtimeLocale(),
         priceFormat: { ...BASE_DEFAULTS.priceFormat },
         layout: { ...preset.layout, ...DEFAULT_LAYOUT_METRICS },
+        volume: {
+            ...DEFAULT_VOLUME_METRICS,
+            colors: {
+                up: parseCssColor(preset.volume.colors.up, 'volume.upColor'),
+                down: parseCssColor(preset.volume.colors.down, 'volume.downColor'),
+            },
+        },
         grid: { ...preset.grid },
         crosshair: { ...preset.crosshair },
         timeScale: { ...BASE_DEFAULTS.timeScale },
-        candlestick: { ...preset.candlestick },
+        candlestick: {
+            ...preset.candlestick,
+            style: DEFAULT_CANDLE_STYLE,
+            baselinePrice: null,
+            lineColor: parseCssColor(preset.candlestick.upColor, 'candlestick.upColor'),
+            areaFillColor: withAlpha(
+                parseCssColor(preset.candlestick.upColor, 'candlestick.upColor'),
+                0.25,
+            ),
+        },
     };
 }
 
@@ -383,6 +530,45 @@ export function resolveOptions(partial: ChartOptions, fallbackTheme: ChartTheme 
     }
     if (partial.locale !== undefined) resolved.locale = requireLocale(partial.locale);
     if (partial.timeZone !== undefined) resolved.timeZone = requireTimeZone(partial.timeZone);
+
+    if (partial.volume !== undefined) {
+        const volume = requirePlainObject(partial.volume, 'volume');
+        if (volume.visible !== undefined) {
+            resolved.volume.visible = requireBoolean(volume.visible, 'volume.visible');
+        }
+        if (volume.heightRatio !== undefined) {
+            resolved.volume.heightRatio = requireNumberInRange(
+                volume.heightRatio,
+                'volume.heightRatio',
+                0,
+                1,
+            );
+            if (resolved.volume.heightRatio <= 0) {
+                fail('volume.heightRatio must be greater than 0; a histogram with no height draws nothing.');
+            }
+        }
+        // A single colour applies to both directions unless a direction overrides
+        // it, so the common case is one option rather than two identical ones.
+        if (volume.color !== undefined) {
+            const shared = requireColor(volume.color, 'volume.color');
+            resolved.volume.colors = {
+                up: parseCssColor(shared, 'volume.color'),
+                down: parseCssColor(shared, 'volume.color'),
+            };
+        }
+        if (volume.upColor !== undefined) {
+            resolved.volume.colors.up = parseCssColor(
+                requireColor(volume.upColor, 'volume.upColor'),
+                'volume.upColor',
+            );
+        }
+        if (volume.downColor !== undefined) {
+            resolved.volume.colors.down = parseCssColor(
+                requireColor(volume.downColor, 'volume.downColor'),
+                'volume.downColor',
+            );
+        }
+    }
 
     if (partial.priceFormat !== undefined) {
         const priceFormat = requirePlainObject(partial.priceFormat, 'priceFormat');
@@ -464,6 +650,27 @@ export function resolveOptions(partial: ChartOptions, fallbackTheme: ChartTheme 
         if (candlestick.borderDownColor !== undefined) resolved.candlestick.borderDownColor = requireColor(candlestick.borderDownColor, 'candlestick.borderDownColor');
         if (candlestick.wickVisible !== undefined) resolved.candlestick.wickVisible = requireBoolean(candlestick.wickVisible, 'candlestick.wickVisible');
         if (candlestick.borderVisible !== undefined) resolved.candlestick.borderVisible = requireBoolean(candlestick.borderVisible, 'candlestick.borderVisible');
+        if (candlestick.style !== undefined) {
+            resolved.candlestick.style = requireCandleStyle(candlestick.style);
+        }
+        if (candlestick.baselinePrice !== undefined) {
+            resolved.candlestick.baselinePrice = requireNonNegativeNumber(
+                candlestick.baselinePrice,
+                'candlestick.baselinePrice',
+            );
+        }
+        if (candlestick.lineColor !== undefined) {
+            resolved.candlestick.lineColor = parseCssColor(
+                requireColor(candlestick.lineColor, 'candlestick.lineColor'),
+                'candlestick.lineColor',
+            );
+        }
+        if (candlestick.areaFillColor !== undefined) {
+            resolved.candlestick.areaFillColor = parseCssColor(
+                requireColor(candlestick.areaFillColor, 'candlestick.areaFillColor'),
+                'candlestick.areaFillColor',
+            );
+        }
     }
 
     return resolved;
@@ -487,7 +694,7 @@ export function mergeOptionPartials(
     }
 
     const merged: ChartOptions = { ...base };
-    const nestedKeys = ['priceFormat', 'layout', 'grid', 'crosshair', 'timeScale', 'candlestick'] as const;
+    const nestedKeys = ['priceFormat', 'layout', 'volume', 'grid', 'crosshair', 'timeScale', 'candlestick'] as const;
     for (const key of nestedKeys) {
         const patchValue = patch[key];
         if (patchValue === undefined) continue;

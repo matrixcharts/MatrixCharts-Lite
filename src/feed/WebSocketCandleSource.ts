@@ -304,7 +304,9 @@ export class WebSocketCandleSource implements CandleSource {
 
     private parseCandle(value: unknown): CandleData {
         if (typeof value !== 'object' || value === null) throw new Error('Candle must be an object.');
-        const candle: { time?: unknown; open?: unknown; high?: unknown; low?: unknown; close?: unknown } = value;
+        const candle: {
+            time?: unknown; open?: unknown; high?: unknown; low?: unknown; close?: unknown; volume?: unknown;
+        } = value;
         // `Number.isFinite`, not `typeof`: JSON.parse turns an out-of-range literal
         // such as 1e999 into Infinity, which is a number but not a usable price or
         // timestamp. Rejecting it here keeps the parser's contract honest instead of
@@ -318,12 +320,23 @@ export class WebSocketCandleSource implements CandleSource {
         ) {
             throw new Error('Candle fields time/open/high/low/close must be finite numbers.');
         }
-        return {
+        // Volume is optional on the wire. A present volume is validated rather
+        // than passed through, because a candle whose volume cannot be drawn is a
+        // malformed frame, not a candle with no volume: dropping it silently would
+        // leave a feed that looks healthy while the histogram is quietly wrong.
+        if (candle.volume !== undefined && (!Number.isFinite(candle.volume) || (candle.volume as number) < 0)) {
+            throw new Error('Candle volume must be a finite, non-negative number when present.');
+        }
+        const parsed: CandleData = {
             time: candle.time as number,
             open: candle.open as number,
             high: candle.high as number,
             low: candle.low as number,
             close: candle.close as number,
         };
+        // Only carried when the wire carried it, so an absent volume stays
+        // absent rather than becoming a zero that reads like real data.
+        if (candle.volume !== undefined) parsed.volume = candle.volume as number;
+        return parsed;
     }
 }
