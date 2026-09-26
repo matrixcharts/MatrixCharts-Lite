@@ -18,6 +18,14 @@ import {
     visiblePriceRange,
 } from '../core/coordinates.js';
 import { paneTickStep, paneValueAt, paneValueSpan, MIN_PANE_TICKS, type PaneLayout } from '../core/panes.js';
+import {
+    LABEL_PRIORITY,
+    layoutLabels,
+    shouldDrawMarkers,
+    type LabelCandidate,
+    type PlacedMarker,
+    type ResolvedPriceLine,
+} from '../core/decorations.js';
 import type { VerticalTransform } from './WebGLSeries.js';
 
 /**
@@ -25,6 +33,36 @@ import type { VerticalTransform } from './WebGLSeries.js';
  * default time gutter is 22px, so 13px puts the text roughly centred in it.
  */
 const TIME_LABEL_OFFSET_Y = 13;
+
+/**
+ * Height a price-gutter label reserves, and the two heights in play: an axis tick
+ * and the last-price tag. They differ so a tag does not displace a tick that is
+ * further away than it really is.
+ */
+const AXIS_LABEL_HEIGHT = 14;
+const LAST_PRICE_LABEL_HEIGHT = 18;
+
+/** Marker geometry, in CSS pixels at `size` 1. */
+const MARKER_SIZE = 9;
+const MARKER_OFFSET = 8;
+const MARKER_MARGIN = 24;
+
+/**
+ * Which price-gutter labels survive this frame, and where the surviving ones sit.
+ * Built by `planLabels` and read by both the axis and the decoration pass, because
+ * they compete for the same strip of gutter.
+ */
+interface DecorationLabels {
+    /** One entry per candidate, in candidate order. */
+    keep: boolean[];
+    /** Axis tick y to its candidate index. */
+    tickIndex: Map<number, number>;
+    /** Price-line tag y to its candidate index. */
+    lineIndex: Map<number, number>;
+    lastY: number | null;
+    /** Whether the last-price tag was itself kept after collisions. */
+    lastShown: boolean;
+}
 
 /**
  * One pane's worth of axis labelling: where it is, how a value maps to a y inside
@@ -70,6 +108,13 @@ export class Canvas2DRenderer implements IRenderer {
      * price scale across the whole plot exactly as it was before panes existed.
      */
     private panes: PaneLayout | null = null;
+    /**
+     * Decorations, drawn on the grid layer so they sit under the crosshair and in
+     * the same pass as the axis labels they share the price gutter with.
+     */
+    private priceLines: readonly ResolvedPriceLine[] = [];
+    private markers: readonly PlacedMarker[] = [];
+    private lastPrice: { price: number; direction: 'up' | 'down' } | null = null;
     
     private isGridLayer: boolean;
 
@@ -89,6 +134,7 @@ public init(canvas: HTMLCanvasElement, emitter: EventEmitter<ChartEvents>): void
         this.emitter.on('data', this.handleDataEvent);
         this.emitter.on('options', this.handleOptionsEvent);
         this.emitter.on('crosshair', this.handleCrosshairEvent);
+        this.emitter.on('decorations', this.handleDecorationsEvent);
     }
 
     public resize(width: number, height: number, dpr: number): void {
@@ -152,6 +198,15 @@ public init(canvas: HTMLCanvasElement, emitter: EventEmitter<ChartEvents>): void
         this.timeValues = payload.times;
     };
 
+    private handleDecorationsEvent = (payload: ChartEvents['decorations']): void => {
+        // The UI layer is cleared to transparent, so it holds no decorations; the
+        // grid layer is not, so only that one has to remember and repaint them.
+        if (!this.isGridLayer) return;
+        this.priceLines = payload.priceLines;
+        this.markers = payload.markers;
+        this.lastPrice = payload.lastPrice;
+    };
+
     private get viewport(): ChartViewport {
         const cssWidth: number = this.canvas.width / this.devicePixelRatio;
         const cssHeight: number = this.canvas.height / this.devicePixelRatio;
@@ -207,6 +262,11 @@ public init(canvas: HTMLCanvasElement, emitter: EventEmitter<ChartEvents>): void
             coordinateToIndex(viewport, plot.x) / timeTickStep,
         ) * timeTickStep;
 
+        // Which axis labels are drawn is decided once, with the decorations, because
+        // they share the gutter: a last-price tag sitting on a tick has to displace
+        // that tick, and neither knows about the other on its own.
+        const labels: DecorationLabels = this.planLabels();
+
         if (this.options.grid.horzLines) {
             // Horizontal lines are per pane, from that pane's own scale. Drawing
             // them from the price scale across the whole plot would put a price
@@ -236,8 +296,76 @@ public init(canvas: HTMLCanvasElement, emitter: EventEmitter<ChartEvents>): void
         }
 
         this.ctx.stroke();
-        this.renderAxes(viewport, timeTickStep, firstTimeTick);
+        this.renderAxes(viewport, timeTickStep, firstTimeTick, labels);
+        this.renderDecorations(viewport, labels);
         this.ctx.restore();
+    }
+
+    /**
+     * Decides, in one pass, which labels the price gutter can show: the axis ticks,
+     * the price-line tags, and the last-price tag.
+     *
+     * Planned together because they compete for the same strip of gutter and none of
+     * them can see the others. A last-price tag at 104.30 sitting on the 104 tick
+     * has to displace that tick, or the two are drawn on top of each other and both
+     * become unreadable.
+     */
+    private planLabels(): DecorationLabels {
+        const bands: PriceBand[] = this.priceBands();
+        const priceBand: PriceBand | undefined = bands[0];
+
+        const ticks: Array<{ y: number; price: number }> = [];
+        for (const band of bands) {
+            const [low, high]: [number, number] = band.range;
+            const first: number = Math.ceil(low / band.step) * band.step;
+            for (let price: number = first; price <= high + band.step * 1e-9; price += band.step) {
+                const y: number = band.y(price);
+                if (y < band.rect.y || y > band.rect.y + band.rect.height) continue;
+                ticks.push({ y, price });
+            }
+        }
+
+        const lines: Array<{ y: number; line: ResolvedPriceLine }> = [];
+        for (const line of this.priceLines) {
+            if (priceBand === undefined) continue;
+            const y: number = priceBand.y(line.price);
+            // A line scrolled off the top or bottom of the price pane is not drawn at
+            // all, tag included: a tag for a price that is not on screen reads as a
+            // price that is.
+            if (y < priceBand.rect.y || y > priceBand.rect.y + priceBand.rect.height) continue;
+            lines.push({ y, line });
+        }
+
+        let lastY: number | null = null;
+        if (this.lastPrice !== null && priceBand !== undefined) {
+            const y: number = priceBand.y(this.lastPrice.price);
+            if (y >= priceBand.rect.y && y <= priceBand.rect.y + priceBand.rect.height) lastY = y;
+        }
+
+        const candidates: LabelCandidate[] = [];
+        const tickIndex = new Map<number, number>();
+        for (const tick of ticks) {
+            tickIndex.set(tick.y, candidates.length);
+            candidates.push({ y: tick.y, priority: LABEL_PRIORITY.tick, height: AXIS_LABEL_HEIGHT });
+        }
+        const lineIndex = new Map<number, number>();
+        for (const entry of lines) {
+            if (!entry.line.axisLabelVisible) continue;
+            lineIndex.set(entry.y, candidates.length);
+            candidates.push({ y: entry.y, priority: LABEL_PRIORITY.priceLine, height: AXIS_LABEL_HEIGHT });
+        }
+        if (lastY !== null) {
+            candidates.push({ y: lastY, priority: LABEL_PRIORITY.lastPrice, height: LAST_PRICE_LABEL_HEIGHT });
+        }
+
+        const keep: boolean[] = layoutLabels(candidates);
+        return {
+            keep,
+            tickIndex,
+            lineIndex,
+            lastY,
+            lastShown: lastY !== null && keep[candidates.length - 1],
+        };
     }
 
     /**
@@ -391,6 +519,7 @@ public init(canvas: HTMLCanvasElement, emitter: EventEmitter<ChartEvents>): void
         viewport: ChartViewport,
         timeTickStep: number,
         firstTimeTick: number,
+        labels: DecorationLabels,
     ): void {
         const plot: PlotRect = viewport.plot;
         const plotRight: number = plot.x + plot.width;
@@ -409,13 +538,16 @@ public init(canvas: HTMLCanvasElement, emitter: EventEmitter<ChartEvents>): void
         this.ctx.lineTo(plotRight, plotBottom - 0.5);
         this.ctx.stroke();
 
-        // One set of price labels per pane, from that pane's own scale.
+        // One set of price labels per pane, from that pane's own scale, minus
+        // whichever ones a price line or the last-price tag has claimed.
         for (const band of this.priceBands()) {
             const [minimumVisiblePrice, maximumVisiblePrice]: [number, number] = band.range;
             const firstPriceTick: number = Math.ceil(minimumVisiblePrice / band.step) * band.step;
             for (let price: number = firstPriceTick; price <= maximumVisiblePrice + band.step * 1e-9; price += band.step) {
                 const y: number = band.y(price);
                 if (y < band.rect.y || y > band.rect.y + band.rect.height) continue;
+                const index: number | undefined = labels.tickIndex.get(y);
+                if (index !== undefined && labels.keep[index] === false) continue;
                 this.drawLabel(this.formatAxisValue(price), plot.x - 6, y, 'right');
             }
         }
@@ -466,6 +598,160 @@ public init(canvas: HTMLCanvasElement, emitter: EventEmitter<ChartEvents>): void
             }
         }
         this.ctx.restore();
+    }
+
+    /**
+     * Price lines, their axis tags, the last-price rule, and markers.
+     *
+     * Drawn here rather than in a renderer of their own because the whole point is
+     * that they are not series: nothing here allocates a buffer, nothing is
+     * aggregated, and nothing needs the downsampler to know it exists. Canvas2D
+     * handles a few thousand of these without complaint; the point at which that
+     * stops being true is the point to revisit this, and it is recorded in the
+     * contract rather than guessed at now.
+     */
+    private renderDecorations(viewport: ChartViewport, labels: DecorationLabels): void {
+        const plot: PlotRect = viewport.plot;
+        const plotRight: number = plot.x + plot.width;
+
+        // Markers first, so a price line and its tag sit above them.
+        this.renderMarkers(viewport, plot);
+
+        for (const line of this.priceLines) {
+            const y: number = priceToCoordinate(viewport, line.price);
+            if (y < plot.y || y > plot.y + plot.height) continue;
+
+            this.ctx.save();
+            this.ctx.strokeStyle = this.cssColor(line.color);
+            this.ctx.lineWidth = line.lineWidth;
+            if (line.lineStyle === 'dashed') this.ctx.setLineDash([6, 4]);
+            // The rule spans the plot and stops at its edge, so it never runs under
+            // the price gutter; only the tag is allowed in there.
+            this.ctx.beginPath();
+            const crispY: number = Math.floor(y) + 0.5;
+            this.ctx.moveTo(plot.x, crispY);
+            this.ctx.lineTo(plotRight, crispY);
+            this.ctx.stroke();
+            this.ctx.restore();
+
+            if (line.title.length > 0) {
+                this.drawLabel(line.title, plot.x + 6, crispY, 'left');
+            }
+            if (line.axisLabelVisible) {
+                const index: number | undefined = labels.lineIndex.get(y);
+                if (index === undefined || labels.keep[index]) {
+                    this.drawTag(
+                        this.formatAxisValue(line.price),
+                        plot.x - 6,
+                        crispY,
+                        line.axisLabelColor ?? line.color,
+                    );
+                }
+            }
+        }
+
+        if (labels.lastShown && labels.lastY !== null && this.lastPrice !== null) {
+            const y: number = priceToCoordinate(viewport, this.lastPrice.price);
+            const crispY: number = Math.floor(y) + 0.5;
+            const color: readonly [number, number, number, number] = this.lastPrice.direction === 'up'
+                ? this.colors.up
+                : this.colors.down;
+            this.ctx.save();
+            this.ctx.strokeStyle = this.cssColor(color);
+            this.ctx.lineWidth = 1;
+            // Dashed so it reads as "where price is now" rather than as another
+            // annotation the caller placed.
+            this.ctx.setLineDash([2, 2]);
+            this.ctx.beginPath();
+            this.ctx.moveTo(plot.x, crispY);
+            this.ctx.lineTo(plotRight, crispY);
+            this.ctx.stroke();
+            this.ctx.restore();
+            this.drawTag(this.formatAxisValue(this.lastPrice.price), plot.x - 6, crispY, color);
+        }
+    }
+
+    private renderMarkers(viewport: ChartViewport, plot: PlotRect): void {
+        if (this.markers.length === 0) return;
+        // A marker is a fixed number of pixels wide, so below a few pixels per bar a
+        // screen of them is a smear. Dropped rather than shrunk.
+        if (!shouldDrawMarkers(Math.abs(viewport.scaleX))) return;
+
+        for (const marker of this.markers) {
+            if (!Number.isFinite(marker.price)) continue;
+            const x: number = indexToCoordinate(viewport, marker.index);
+            if (x < plot.x - MARKER_MARGIN || x > plot.x + plot.width + MARKER_MARGIN) continue;
+
+            const size: number = MARKER_SIZE * marker.size;
+            let y: number = priceToCoordinate(viewport, marker.price);
+            // Arrows stand off the bar they annotate; a circle or square sits on the
+            // price itself, because a marker's job is to point at a level.
+            if (marker.position === 'aboveBar') y -= MARKER_OFFSET;
+            else if (marker.position === 'belowBar') y += MARKER_OFFSET;
+
+            this.ctx.save();
+            this.ctx.fillStyle = this.cssColor(marker.color);
+            this.ctx.strokeStyle = this.cssColor(marker.color);
+            this.ctx.lineWidth = 1.5;
+            if (marker.shape === 'arrowUp' || marker.shape === 'arrowDown') {
+                this.drawArrow(x, y, size, marker.shape === 'arrowUp' ? -1 : 1);
+            } else if (marker.shape === 'circle') {
+                this.ctx.beginPath();
+                this.ctx.arc(x, y, size / 2, 0, Math.PI * 2);
+                this.ctx.fill();
+            } else {
+                this.ctx.fillRect(x - size / 2, y - size / 2, size, size);
+            }
+            this.ctx.restore();
+
+            if (marker.text.length > 0) {
+                this.drawLabel(
+                    marker.text,
+                    x + size,
+                    marker.position === 'belowBar' ? y + size : y - size,
+                    'left',
+                );
+            }
+        }
+    }
+
+    /** A filled triangle, pointing up or down, with its tip at `y`. */
+    private drawArrow(x: number, y: number, size: number, direction: -1 | 1): void {
+        const half: number = size / 2;
+        const length: number = size * 0.9;
+        this.ctx.beginPath();
+        this.ctx.moveTo(x, y - direction * length / 2);
+        this.ctx.lineTo(x - half, y + direction * length / 2);
+        this.ctx.lineTo(x + half, y + direction * length / 2);
+        this.ctx.closePath();
+        this.ctx.fill();
+    }
+
+    /**
+     * A tag in the price gutter, filled in its own colour so it reads as belonging
+     * to the line or candle it labels rather than as another axis label.
+     */
+    private drawTag(text: string, x: number, y: number, color: readonly [number, number, number, number]): void {
+        this.ctx.save();
+        this.drawLabel(text, x, y, 'right');
+        // drawLabel painted the usual background and text; repaint the box in the
+        // tag's colour and the text over it, so the shape is the same size for every
+        // tag and the collision planning above stays honest.
+        this.ctx.fillStyle = this.cssColor(color);
+        const metrics: TextMetrics = this.ctx.measureText(text);
+        const padding: number = 3;
+        const width: number = metrics.width + padding * 2;
+        this.ctx.fillRect(x - width + padding, y - AXIS_LABEL_HEIGHT / 2, width, AXIS_LABEL_HEIGHT);
+        this.ctx.fillStyle = this.options.layout.textColor;
+        this.ctx.textAlign = 'right';
+        this.ctx.textBaseline = 'middle';
+        this.ctx.fillText(text, x, y);
+        this.ctx.restore();
+    }
+
+    /** `rgba(...)` string for an already-parsed colour, keeping its own alpha. */
+    private cssColor(color: readonly [number, number, number, number]): string {
+        return this.withAlpha(color, color[3]);
     }
 
     private drawLabel(text: string, x: number, y: number, alignment: CanvasTextAlign): void {

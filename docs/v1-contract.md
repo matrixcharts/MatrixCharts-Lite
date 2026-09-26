@@ -373,6 +373,24 @@ Two behaviours worth stating, because both are the alternative to something wors
 
 Pane separators are not draggable in this release. Heights are an option, not an interaction.
 
+## Decorations: price lines, the last price, and markers
+
+These are **decorations, not series**. A price line has no volume, no aggregation, and no business being reduced by the pyramid; teaching the downsampler about them would mean every indicator output had to declare which kind of series it was before a single bar could be aggregated. They are drawn on the UI canvas, under the crosshair and beside the price gutter where the axis labels already live. Nothing here allocates a buffer.
+
+`setPriceLines(lines)` replaces the whole set, as `setOverlays` does, and validates it before applying any of it: a rejected line leaves the existing set untouched. A line needs a unique non-empty `id` and a finite `price`; `lineWidth` is 1 to 4 CSS pixels, `lineStyle` is `solid` or `dashed` (defaulting to dashed, so an annotation does not read as the grid), `axisLabelVisible` defaults to true, and `title` and `axisLabelColor` are optional. Out-of-range values are rejected rather than clamped. `removePriceLine(id)` removes one and reports whether it was there. `getPriceLineIds()` reads the set back.
+
+`setMarkers(markers)` replaces the marker set; `getMarkers()` reports each one with the ordinal its timestamp snapped to and the price it is drawn at; `clearMarkers()` removes them all.
+
+**A marker snaps its time to the nearest candle; an overlay does not.** The distinction is density. An overlay is a continuous series whose whole shape depends on landing on the right bars, so an unmatched timestamp there is a bug worth refusing — a line drawn half a bar out of place reaches a trading desk. A marker is a single annotation, where the nearest bar is what a click between two bars meant. `getMarkers()` reports where each one went, so a caller can see the resolution rather than infer it.
+
+Markers are drawn on the price pane, above or below the bar's high or low, or on its close. A marker's price is recomputed from its bar every frame, so one standing above a still-updating candle follows it.
+
+**Markers are dropped entirely below four pixels per bar**, not shrunk. A marker is a fixed number of pixels wide, so a screen full of them at two pixels per bar is a smear, and an unreadable annotation is worse than an absent one. The positions are still readable through `getMarkers()` at any zoom.
+
+The last-price rule and tag are **derived, not supplied**. Chart already knows the newest candle, so asking a caller to restate it would create a second source of truth that could disagree with the candles by one update. `getLastPrice()` reports the newest close and its direction, and the rule tracks the live edge because it is recomputed with the viewport rather than captured when the decorations were set. The tag is filled in the candle's up or down colour.
+
+When two labels want the same strip of the price gutter, the resolution is **by priority, not by position**: the last-price tag outranks a price-line tag, which outranks an axis tick, and a kept label displaces anything within its own height of it. Sorting by y and thinning out what collides would drop whichever happened to be drawn first, which is not something a reader can predict; dropping the axis tick instead keeps the annotations the caller asked for. A price line scrolled off the price pane is not drawn at all, tag included, because a tag for a price that is not on screen reads as a price that is.
+
 ## Feed v1
 
 Use `WebSocketCandleSource` + `ChartFeedController` against a `CandleTarget` (`Chart` implements this). Do not open sockets inside renderers.

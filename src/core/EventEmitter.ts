@@ -3,6 +3,7 @@ import type { CandleData } from './CandleData.js';
 import type { PlotRect } from './coordinates.js';
 import type { ResolvedChartOptions } from './options.js';
 import type { PaneLayout } from './panes.js';
+import type { PlacedMarker, ResolvedPriceLine } from './decorations.js';
 
 export interface ChartEvents {
     'viewport': {
@@ -28,6 +29,25 @@ export interface ChartEvents {
      * broadcast, so it is not copied per frame here.
      */
     'data': { times: readonly number[] };
+    /**
+     * Decorations to draw on the UI layer: price lines, markers, and the
+     * last-price tag state.
+     *
+     * Internal, like `viewport`. It exists so the UI renderer can draw them
+     * without reaching back into Chart, and it is a separate event from
+     * `viewport` because decorations change on their own schedule — a marker
+     * arrives with a trade, not with a pan.
+     */
+    'decorations': {
+        priceLines: readonly ResolvedPriceLine[];
+        markers: readonly PlacedMarker[];
+        /**
+         * The newest candle's close and direction, or `null` with no data. Derived
+         * by Chart rather than supplied, so the tag cannot disagree with the
+         * candles it is labelling.
+         */
+        lastPrice: { price: number; direction: 'up' | 'down' } | null;
+    };
     /** Fully resolved options. Emitted once on construction and on every apply. */
     'options': ResolvedChartOptions;
     /**

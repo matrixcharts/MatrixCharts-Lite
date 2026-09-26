@@ -143,6 +143,14 @@
                 <option value="true">on</option>
             </select>
         </label>
+        <label class="swatch">Decorations
+            <select id="decorations" aria-label="Price lines and markers">
+                <option value="none">none</option>
+                <option value="lines">price lines</option>
+                <option value="trades">trade markers</option>
+                <option value="both">both</option>
+            </select>
+        </label>
         <label class="swatch">Panes
             <select id="pane-weights" aria-label="Pane layout">
                 <option value="1">1 pane</option>
@@ -582,6 +590,47 @@
                 status.textContent = error instanceof Error ? error.message : 'pane error';
             }
         });
+
+        // Decorations are annotations, not indicators: a horizontal rule the caller
+        // picked a price for, and a marker on individual trades. The chart is told
+        // where they go; it is not told what they mean.
+        const decorationInput = document.querySelector('#decorations');
+        const setDecorations = (kind) => {
+            const count = chart.getCandleCount();
+            if (count === 0 || kind === 'none') {
+                chart.setPriceLines([]);
+                chart.clearMarkers();
+                return;
+            }
+            const last = chart.getLastPrice();
+            const lines = last === null ? [] : [
+                { id: 'last-known', price: last.price, color: '#ff9f0a', lineStyle: 'solid', title: 'last' },
+                { id: 'round', price: Math.round(last.price), color: '#5ac8fa', title: 'round' },
+                // Deliberately close to the line above, so the collision handling
+                // between two caller tags and the axis ticks is visible.
+                { id: 'nearby', price: Math.round(last.price) + 0.5, color: '#30d158' },
+            ];
+            const markers = [];
+            if (kind === 'trades' || kind === 'both') {
+                // Every seventh bar, alternating sides, standing in for a feed's
+                // fills. The last one is deliberately off-centre in time to show
+                // that a marker snaps to its nearest bar.
+                for (let i = 4; i < count; i += 7) {
+                    markers.push({
+                        time: chart.getCandleAt(i).time,
+                        position: i % 14 === 4 ? 'aboveBar' : 'belowBar',
+                        shape: i % 14 === 4 ? 'arrowDown' : 'arrowUp',
+                        color: i % 14 === 4 ? '#ff453a' : '#30d158',
+                    });
+                }
+            }
+            chart.setPriceLines(lines);
+            chart.setMarkers(markers);
+        };
+        decorationInput.addEventListener('change', () => setDecorations(decorationInput.value));
+        setInterval(() => {
+            if (decorationInput.value !== 'none') setDecorations(decorationInput.value);
+        }, 700);
 
         window.addEventListener('beforeunload', () => {
             if (feedController) feedController.dispose();

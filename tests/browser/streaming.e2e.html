@@ -1650,6 +1650,183 @@
                 host.remove();
             }
 
+            // --- Price lines, last price, and markers -----------------------
+            // Decorations, not series: drawn on the UI layer. What matters is that a
+            // price line is confined to the plot, its tag is in the gutter, the
+            // last-price rule tracks the newest candle, and a marker lands on the
+            // bar its timestamp is nearest to.
+            let decorationReport = null;
+            {
+                const t0 = Date.UTC(2025, 9, 1);
+                const count = 120;
+                const series = Array.from({ length: count }, (_, i) => {
+                    const open = 200 + Math.sin(i / 8) * 8;
+                    const close = open + ((i % 5) - 2) * 0.5;
+                    return {
+                        time: t0 + i * 60_000, open, close,
+                        high: Math.max(open, close) + 1.5, low: Math.min(open, close) - 1.5,
+                    };
+                });
+
+                const host = document.createElement('div');
+                host.style.cssText = 'position:absolute;left:-9999px;width:700px;height:400px';
+                document.body.appendChild(host);
+                const chart = new Chart(host, { theme: 'dark' });
+                chart.setData(series);
+
+                const last = chart.getLastPrice();
+                if (last === null) throw new Error('No last price with data loaded.');
+                // Compared with a tolerance, not exactly: candle values round-trip
+                // through the pyramid's float32 storage, so reading one back returns
+                // the float32 value, not the double that was supplied. Demanding
+                // exact equality here would be asserting a precision the library
+                // does not have.
+                const lastClose = series[count - 1].close;
+                if (Math.abs(last.price - lastClose) > Math.abs(lastClose) * 1e-6) {
+                    throw new Error(`getLastPrice reports ${last.price}, the last close is ${lastClose}.`);
+                }
+                const expectedDirection = series[count - 1].close >= series[count - 1].open ? 'up' : 'down';
+                if (last.direction !== expectedDirection) {
+                    throw new Error(`getLastPrice direction is ${last.direction}, expected ${expectedDirection}.`);
+                }
+
+                // #00e5ff is not a theme colour, not a candle colour, and not used by
+                // any other decoration under test, so its pixels can only be this line.
+                const linePrice = 200;
+                // Placed near the live edge, because the chart opens at the live edge
+                // and a marker on an early bar would simply be off screen. Guarded
+                // below so it cannot silently degrade into measuring nothing.
+                const markerBar = count - 20;
+                const markerTime = series[markerBar].time + 40_000;
+                chart.setPriceLines([
+                    { id: 'level', price: linePrice, color: '#00e5ff', lineStyle: 'solid', title: 'level' },
+                ]);
+                chart.setMarkers([
+                    { time: markerTime, position: 'belowBar', shape: 'circle', color: '#ff00ff', size: 2 },
+                ]);
+                if (chart.getPriceLineIds().join(',') !== 'level') {
+                    throw new Error(`Price line ids are ${chart.getPriceLineIds().join(',')}, expected level.`);
+                }
+                // 40s past a bar is nearer the next one, and the report has to say so.
+                const placed = chart.getMarkers();
+                if (placed.length !== 1 || placed[0].index !== markerBar + 1) {
+                    throw new Error(`A marker 40s after bar ${markerBar} landed on `
+                        + `${JSON.stringify(placed.map((m) => m.index))}, expected ${markerBar + 1}.`);
+                }
+                if (!Number.isFinite(placed[0].price)) {
+                    throw new Error('A placed marker has no price.');
+                }
+                // The bar has to be on screen for the pixel checks below to mean
+                // anything, exactly as the overlay alignment check does.
+                const markerX = chart.indexToCoordinate(placed[0].index);
+                if (markerX <= 0 || markerX >= host.clientWidth) {
+                    throw new Error(`The marked bar is off screen at x=${markerX}; the test would be measuring nothing.`);
+                }
+                if (!Number.isFinite(placed[0].price)) {
+                    throw new Error('A placed marker has no price.');
+                }
+
+                // A rejected price line leaves the existing set alone.
+                let lineError = '';
+                try {
+                    chart.setPriceLines([
+                        { id: 'ok', price: 201 },
+                        { id: 'bad', price: Number.NaN },
+                    ]);
+                } catch (error) {
+                    lineError = error instanceof Error ? error.message : String(error);
+                }
+                if (!lineError.includes('finite price')) {
+                    throw new Error(`A bad price line was not refused: ${lineError || 'no error'}`);
+                }
+                if (chart.getPriceLineIds().join(',') !== 'level') {
+                    throw new Error('A refused price line replaced the existing one.');
+                }
+
+                const layout = chart.options().layout;
+                const gutter = Math.round(layout.priceAxisWidth * 2);
+                const axis = host.querySelectorAll('canvas')[0].getContext('2d');
+                const axisBuf = axis.getImageData(0, 0, gutter, axis.canvas.height);
+                let tagInGutter = 0;
+                for (let y = 0; y < axis.canvas.height; y++) {
+                    for (let x = 0; x < gutter; x++) {
+                        const i = (y * axis.canvas.width + x) * 4;
+                        if (axisBuf.data[i + 3] < 128) continue;
+                        // #00e5ff, the price line's colour, as its axis tag.
+                        if (axisBuf.data[i] < 90 && axisBuf.data[i + 1] > 180 && axisBuf.data[i + 2] > 200) tagInGutter++;
+                    }
+                }
+                if (tagInGutter === 0) {
+                    throw new Error('The price line drew no axis tag in the price gutter.');
+                }
+
+                // The rule itself spans the plot and stops at its edge. Sampled on the
+                // UI layer, which is not flipped, so rows are already top-down.
+                let ruleRows = 0, markerPixels = 0;
+                for (let y = 0; y < axis.canvas.height; y++) {
+                    let inPlot = 0;
+                    for (let x = gutter; x < axis.canvas.width; x++) {
+                        const i = (y * axis.canvas.width + x) * 4;
+                        if (axisBuf.data[i + 3] < 128) continue;
+                        inPlot++;
+                    }
+                    if (inPlot > 0) ruleRows++;
+                }
+                if (ruleRows === 0) throw new Error('The price line drew no rule inside the plot.');
+
+                // Marker colour, and it must be inside the plot rect.
+                const markerBuf = axis.getImageData(gutter, 0, axis.canvas.width - gutter, axis.canvas.height);
+                const MW = axis.canvas.width - gutter;
+                for (let p = 0; p < MW * axis.canvas.height; p++) {
+                    const i = p * 4;
+                    if (markerBuf.data[i + 3] < 128) continue;
+                    if (markerBuf.data[i] > 170 && markerBuf.data[i + 1] < 90 && markerBuf.data[i + 2] > 170) markerPixels++;
+                }
+                if (markerPixels === 0) {
+                    throw new Error('The marker drew no pixels.');
+                }
+
+                // The last-price rule must follow the newest candle rather than
+                // sitting where it was when the decorations were set.
+                const beforeTrack = chart.getLastPrice().price;
+                const moved = series.map((bar, i) => (i === count - 1
+                    ? { ...bar, close: bar.close + 12, high: bar.high + 12 }
+                    : bar));
+                chart.setData(moved);
+                const afterTrack = chart.getLastPrice().price;
+                if (!(afterTrack > beforeTrack)) {
+                    throw new Error(`The last price did not follow the updated candle: ${beforeTrack} then ${afterTrack}.`);
+                }
+
+                // Removing them releases them rather than leaving them drawn.
+                chart.setPriceLines([]);
+                chart.clearMarkers();
+                if (chart.getPriceLineIds().length !== 0 || chart.getMarkers().length !== 0) {
+                    throw new Error('Decorations were not removed.');
+                }
+                const cleared = axis.getImageData(0, 0, axis.canvas.width, axis.canvas.height);
+                let leftover = 0;
+                for (let p = 0; p < axis.canvas.width * axis.canvas.height; p++) {
+                    const i = p * 4;
+                    if (cleared.data[i + 3] < 128) continue;
+                    if (cleared.data[i] < 90 && cleared.data[i + 1] > 180 && cleared.data[i + 2] > 200) leftover++;
+                }
+                if (leftover !== 0) {
+                    throw new Error(`Price line pixels survived removal: ${leftover} left.`);
+                }
+
+                decorationReport = {
+                    lastPrice: beforeTrack,
+                    trackedTo: afterTrack,
+                    tagInGutter,
+                    markerIndex: placed[0].index,
+                    markerOnScreenX: Math.round(markerX),
+                    markerPixels,
+                };
+                chart.destroy();
+                host.remove();
+            }
+
             // --- Axis gutters ---------------------------------------------
             // Series are confined to the plot rect, and the axis labels live in
             // the gutters outside it. A bar scrolled part-way past an edge must
@@ -2133,6 +2310,7 @@
                 candleStyles: styleReport,
                 overlays: overlayReport,
                 panes: paneReport,
+                decorations: decorationReport,
                 barSpacing: chart.getBarSpacing(),
                 visibleLogicalRange: feedRange,
                 visibleTimeRange: {

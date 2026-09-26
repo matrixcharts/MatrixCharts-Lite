@@ -14,6 +14,12 @@ export type {
 export type { LogicalRange, TimeRange } from './core/coordinates.js';
 export type { OverlayPoint, OverlaySpec } from './core/overlays.js';
 export type {
+    MarkerPosition,
+    MarkerShape,
+    MarkerSpec,
+    PriceLineSpec,
+} from './core/decorations.js';
+export type {
     ChartClickEvent,
     CrosshairCleared,
     CrosshairData,

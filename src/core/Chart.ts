@@ -35,6 +35,16 @@ import {
     PRICE_PANE,
 } from './panes.js';
 import type { PaneLayout } from './panes.js';
+import {
+    markerAnchorPrice,
+    resolveMarkers,
+    resolvePriceLines,
+    type MarkerSpec,
+    type PlacedMarker,
+    type PriceLineSpec,
+    type ResolvedMarker,
+    type ResolvedPriceLine,
+} from './decorations.js';
 import type { VerticalTransform } from '../renderers/WebGLSeries.js';
 import {
     bucketOverlay,
@@ -121,6 +131,9 @@ export class Chart {
      * a pane index has already been resolved away by then.
      */
     private overlaySpecs: readonly OverlaySpec[] = [];
+    /** Decorations, drawn on the UI layer rather than as series. */
+    private priceLines: ResolvedPriceLine[] = [];
+    private markers: ResolvedMarker[] = [];
     /**
      * Pane rects and vertical transforms for the current frame, in CSS pixels.
      * Recomputed with the viewport, because both depend on it.
@@ -841,6 +854,140 @@ export class Chart {
     }
 
     /**
+     * Replaces the chart's price lines.
+     *
+     * A price line is a horizontal rule at a fixed price, optionally labelled on
+     * the price axis and optionally titled at its left end. Like overlays, the whole
+     * set is replaced rather than merged, so a call is idempotent, and the set is
+     * validated before any of it is applied.
+     *
+     * Price lines are decorations rather than series: they have no volume, no
+     * aggregation, and are not reduced by the pyramid. They are drawn on the UI
+     * layer, under the crosshair.
+     *
+     * When two labels want the same strip of the price gutter, the caller's own
+     * annotations win and the axis tick is dropped, because a reader can do without
+     * a gridline label and not without the annotation they asked for.
+     */
+    public setPriceLines(lines: readonly PriceLineSpec[]): void {
+        this.assertAlive();
+        this.priceLines = resolvePriceLines(lines, (spec, cssColor) => (
+            cssColor === undefined
+                ? this.resolvedOptions.candlestick.lineColor
+                : parseCssColor(cssColor, `price line ${spec.id} colour`)
+        ));
+        this.emitDecorations();
+    }
+
+    /**
+     * Removes one price line by id. Returns whether it was there, so a caller can
+     * tell a removal that happened from one that did not.
+     */
+    public removePriceLine(id: string): boolean {
+        this.assertAlive();
+        const before: number = this.priceLines.length;
+        this.priceLines = this.priceLines.filter((line: ResolvedPriceLine): boolean => line.id !== id);
+        if (this.priceLines.length === before) return false;
+        this.emitDecorations();
+        return true;
+    }
+
+    /** The price line ids currently drawn, in the order they were given. */
+    public getPriceLineIds(): string[] {
+        this.assertAlive();
+        return this.priceLines.map((line: ResolvedPriceLine): string => line.id);
+    }
+
+    /**
+     * Replaces the chart's series markers.
+     *
+     * A marker is an annotation at a `(time, price-ish)` location: above or below a
+     * bar, or on its close. Times are snapped to the nearest candle, which is what
+     * a marker placed between two bars means, and `getMarkers()` reports the
+     * ordinal each one landed on.
+     *
+     * Markers are dropped entirely below four pixels per bar rather than shrunk. A
+     * marker is a fixed number of pixels wide, so a screen full of them at two
+     * pixels per bar is a smear, and an unreadable annotation is worse than an
+     * absent one — the data is still readable through `getMarkers()`.
+     */
+    public setMarkers(markers: readonly MarkerSpec[]): void {
+        this.assertAlive();
+        this.markers = resolveMarkers(markers, this.candleTimes, (cssColor) => (
+            cssColor === undefined
+                ? this.resolvedOptions.candlestick.lineColor
+                : parseCssColor(cssColor, 'marker colour')
+        ));
+        this.emitDecorations();
+    }
+
+    /**
+     * The markers currently supplied, with the ordinal each timestamp snapped to
+     * and the price each is drawn at.
+     *
+     * Present whether or not they are visible, so a caller can read positions at a
+     * zoom where the markers themselves are suppressed. The price is the live one,
+     * recomputed from the bar the marker landed on rather than fixed when
+     * `setMarkers` was called, so it moves with a candle that is still updating.
+     */
+    public getMarkers(): PlacedMarker[] {
+        this.assertAlive();
+        return this.markersWithPrices();
+    }
+
+    /** Removes every marker. */
+    public clearMarkers(): void {
+        this.setMarkers([]);
+    }
+
+    /**
+     * The newest candle's close and whether it closed up, or `null` with no data.
+     * This is what the last-price tag is drawn from.
+     */
+    public getLastPrice(): { price: number; direction: 'up' | 'down' } | null {
+        this.assertAlive();
+        return this.lastPrice();
+    }
+
+    private lastPrice(): { price: number; direction: 'up' | 'down' } | null {
+        const candle: CandleData | null = this.getLastCandle();
+        if (candle === null || !Number.isFinite(candle.close)) return null;
+        return { price: candle.close, direction: candle.close >= candle.open ? 'up' : 'down' };
+    }
+
+    private emitDecorations(redraw: boolean = true): void {
+        this.emitter.emit('decorations', {
+            priceLines: this.priceLines,
+            markers: this.markersWithPrices(),
+            lastPrice: this.lastPrice(),
+        });
+        // Decorations do not affect layout, so this repaints without redoing the
+        // viewport work. Called with `false` from `updateViewport`, which is about
+        // to redraw anyway.
+        if (redraw) this.redraw();
+    }
+
+    /**
+     * Markers with the price each one is drawn at, read from the bar it snapped to.
+     *
+     * Recomputed every frame rather than at `setMarkers` time, because a live candle
+     * changes the high a marker above it is anchored to, and a marker pinned to a
+     * stale high would drift away from the bar it is annotating.
+     */
+    private markersWithPrices(): PlacedMarker[] {
+        if (this.markers.length === 0) return [];
+        return this.markers.map((marker: ResolvedMarker): PlacedMarker => {
+            const candle: CandleData | null = this.getCandleAt(marker.index);
+            return {
+                ...marker,
+                price: candle === null
+                    ? Number.NaN
+                    : markerAnchorPrice(candle, marker.position),
+            };
+        });
+    }
+
+    /**
      * How many panes the chart has. Always at least 1, the price pane, and equal
      * to the length of `panes.weights`.
      */
@@ -1412,6 +1559,10 @@ export class Chart {
             panes: this.paneLayout,
         });
         this.uploadVisibleCandles();
+        // The last-price tag is derived from the newest candle, so it has to follow
+        // every append; emitting it here is what makes it track the live edge
+        // instead of showing the price as of the last explicit call.
+        this.emitDecorations(false);
         // A pan, zoom, or feed append moves the bars under a stationary pointer,
         // so the crosshair has to be recomputed before the redraw that shows it.
         this.refreshCrosshairAfterViewportChange();
