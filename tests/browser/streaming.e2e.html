@@ -55,33 +55,36 @@
         window.__matrixChartsDrawCalls = 0;
         window.__matrixChartsBodyPixels = 0;
         window.__matrixChartsWidestBodyRun = 0;
+        const measureBodyPixels = (gl) => {
+            const pixels = new Uint8Array(gl.drawingBufferWidth * gl.drawingBufferHeight * 4);
+            gl.readPixels(0, 0, gl.drawingBufferWidth, gl.drawingBufferHeight, gl.RGBA, gl.UNSIGNED_BYTE, pixels);
+            let bodyPixels = 0;
+            const rowStride = gl.drawingBufferWidth * 4;
+            for (let row = 0; row < gl.drawingBufferHeight; row++) {
+                let runLength = 0;
+                for (let column = 0; column < gl.drawingBufferWidth; column++) {
+                    const pixelIndex = row * rowStride + column * 4;
+                    const red = pixels[pixelIndex];
+                    const green = pixels[pixelIndex + 1];
+                    const alpha = pixels[pixelIndex + 3];
+                    if (alpha > 0) bodyPixels++;
+                    const isCandleColor = alpha > 0 && (green > red * 1.4 || red > green * 1.7);
+                    runLength = isCandleColor ? runLength + 1 : 0;
+                    window.__matrixChartsWidestBodyRun = Math.max(window.__matrixChartsWidestBodyRun, runLength);
+                }
+            }
+            window.__matrixChartsBodyPixels = bodyPixels;
+        };
         const originalDrawArrays = WebGL2RenderingContext.prototype.drawArrays;
         WebGL2RenderingContext.prototype.drawArrays = function (...args) {
             window.__matrixChartsDrawCalls++;
-            const result = originalDrawArrays.apply(this, args);
-            if (args[0] === this.TRIANGLES) {
-                const pixels = new Uint8Array(this.drawingBufferWidth * this.drawingBufferHeight * 4);
-                this.readPixels(0, 0, this.drawingBufferWidth, this.drawingBufferHeight, this.RGBA, this.UNSIGNED_BYTE, pixels);
-                let bodyPixels = 0;
-                for (let index = 3; index < pixels.length; index += 4) {
-                    if (pixels[index] > 0) bodyPixels++;
-                }
-                window.__matrixChartsBodyPixels = bodyPixels;
-
-                const rowStride = this.drawingBufferWidth * 4;
-                for (let row = 0; row < this.drawingBufferHeight; row++) {
-                    let runLength = 0;
-                    for (let column = 0; column < this.drawingBufferWidth; column++) {
-                        const pixelIndex = row * rowStride + column * 4;
-                        const red = pixels[pixelIndex];
-                        const green = pixels[pixelIndex + 1];
-                        const alpha = pixels[pixelIndex + 3];
-                        const isCandleColor = alpha > 0 && (green > red * 1.4 || red > green * 1.7);
-                        runLength = isCandleColor ? runLength + 1 : 0;
-                        window.__matrixChartsWidestBodyRun = Math.max(window.__matrixChartsWidestBodyRun, runLength);
-                    }
-                }
-            }
+            return originalDrawArrays.apply(this, args);
+        };
+        const originalDrawElements = WebGL2RenderingContext.prototype.drawElements;
+        WebGL2RenderingContext.prototype.drawElements = function (...args) {
+            window.__matrixChartsDrawCalls++;
+            const result = originalDrawElements.apply(this, args);
+            measureBodyPixels(this);
             return result;
         };
         const controller = new ChartFeedController(chart, source, () => {}, (error) => errors.push(String(error)));

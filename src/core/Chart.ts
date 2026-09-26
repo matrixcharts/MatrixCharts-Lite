@@ -5,7 +5,7 @@ import { Canvas2DRenderer } from '../renderers/Canvas2DRenderer';
 import { OHLCPyramid } from '../math/OHLCPyramid';
 import { EventEmitter, ChartEvents } from './EventEmitter';
 import type { CandleData } from './CandleData';
-import type { ChartOptions } from './ChartOptions';
+import type { ChartOptions, ChartTheme } from './ChartOptions';
 
 export class Chart {
     private container: HTMLElement;
@@ -33,6 +33,7 @@ export class Chart {
     private pendingAppends: CandleData[] = [];
     private pendingLastUpdate: CandleData | null = null;
     private pendingReplace: boolean = false;
+    private theme: ChartTheme;
 
     constructor(containerId: string, options: ChartOptions = {}) {
         const maxRetainedCandles: number = options.maxRetainedCandles ?? 1_000_000;
@@ -40,6 +41,10 @@ export class Chart {
             throw new Error('MatrixCharts: maxRetainedCandles must be a positive safe integer.');
         }
         this.maxRetainedCandles = maxRetainedCandles;
+        this.theme = options.theme ?? 'dark';
+        if (this.theme !== 'dark' && this.theme !== 'paper') {
+            throw new Error('MatrixCharts: theme must be either dark or paper.');
+        }
 
         const el = document.getElementById(containerId);
         if (!el) throw new Error(`MatrixCharts: Container '${containerId}' not found.`);
@@ -71,6 +76,7 @@ export class Chart {
         const uiRenderer = new Canvas2DRenderer(false);
         uiRenderer.init(uiCanvas, this.emitter);
         this.renderers.push(uiRenderer);
+        this.emitter.emit('theme', this.theme);
 
         // Bind the resize observer to the wrapper
         this.resizeObserver = new ResizeObserver((entries) => {
@@ -195,6 +201,17 @@ export class Chart {
 
     public setData(candles: readonly CandleData[]): void {
         this.loadData(candles, false);
+    }
+
+    public setTheme(theme: ChartTheme): void {
+        if (theme !== 'dark' && theme !== 'paper') {
+            throw new Error('MatrixCharts: theme must be either dark or paper.');
+        }
+        if (this.theme === theme) return;
+        this.theme = theme;
+        this.canvasWrapper.style.backgroundColor = theme === 'dark' ? '#0b0f17' : '#f4f1e8';
+        this.emitter.emit('theme', theme);
+        this.updateViewport();
     }
 
     /** Replaces authoritative feed history while retaining the current time anchor when available. */
@@ -587,10 +604,16 @@ export class Chart {
 
     private uploadVisibleCandles(): void {
         const dataRenderer: WebGL2Renderer = this.renderers[1] as WebGL2Renderer;
+        const bullishColor: [number, number, number, number] = this.theme === 'dark'
+            ? [0.1, 0.85, 0.55, 1]
+            : [0.02, 0.48, 0.32, 1];
+        const bearishColor: [number, number, number, number] = this.theme === 'dark'
+            ? [0.95, 0.25, 0.35, 1]
+            : [0.76, 0.15, 0.2, 1];
         dataRenderer.drawCandlesticks(
             this.displayedCandles,
-            [0.1, 0.85, 0.55, 0.9],
-            [0.95, 0.25, 0.35, 0.9],
+            bullishColor,
+            bearishColor,
         );
         this.emitter.emit('data', { ohlc: this.displayedCandles, times: this.candleTimes });
     }

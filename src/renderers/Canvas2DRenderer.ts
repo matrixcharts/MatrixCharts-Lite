@@ -1,6 +1,7 @@
 // src/renderers/Canvas2DRenderer.ts
 import type { IRenderer } from '../core/IRenderer';
 import type { EventEmitter, ChartEvents } from '../core/EventEmitter';
+import type { ChartTheme } from '../core/ChartOptions';
 
 export class Canvas2DRenderer implements IRenderer {
     private canvas!: HTMLCanvasElement;
@@ -16,6 +17,7 @@ export class Canvas2DRenderer implements IRenderer {
     private crosshairY: number | null = null;
     private ohlcData: Float32Array | null = null;
     private timeValues: readonly number[] = [];
+    private theme: ChartTheme = 'dark';
     
     private isGridLayer: boolean;
 
@@ -33,6 +35,7 @@ public init(canvas: HTMLCanvasElement, emitter: EventEmitter<ChartEvents>): void
 
         this.emitter.on('viewport', this.handleViewportEvent);
         this.emitter.on('data', this.handleDataEvent);
+        this.emitter.on('theme', this.handleThemeEvent);
 
         if (!this.isGridLayer) {
             canvas.addEventListener('mousemove', this.handleMouseMove);
@@ -56,6 +59,10 @@ public init(canvas: HTMLCanvasElement, emitter: EventEmitter<ChartEvents>): void
         this.scaleY = payload.scaleY;
     };
 
+    private handleThemeEvent = (theme: ChartEvents['theme']): void => {
+        this.theme = theme;
+    };
+
     private handleDataEvent = (payload: ChartEvents['data']): void => {
         if (payload.ohlc.length % 6 !== 0) {
             throw new Error('MatrixCharts: OHLC data must contain x/open/high/low/close/width values.');
@@ -67,6 +74,11 @@ public init(canvas: HTMLCanvasElement, emitter: EventEmitter<ChartEvents>): void
     public clear(): void {
         const cssWidth: number = this.canvas.width / this.devicePixelRatio;
         const cssHeight: number = this.canvas.height / this.devicePixelRatio;
+        if (this.isGridLayer) {
+            this.ctx.fillStyle = this.theme === 'dark' ? '#0b0f17' : '#f4f1e8';
+            this.ctx.fillRect(0, 0, cssWidth, cssHeight);
+            return;
+        }
         this.ctx.clearRect(0, 0, cssWidth, cssHeight);
     }
 
@@ -80,7 +92,9 @@ public init(canvas: HTMLCanvasElement, emitter: EventEmitter<ChartEvents>): void
         const cssHeight: number = this.canvas.height / this.devicePixelRatio;
 
         this.ctx.save();
-        this.ctx.strokeStyle = 'rgba(255, 255, 255, 0.15)'; // High-visibility institutional grid
+        this.ctx.strokeStyle = this.theme === 'dark'
+            ? 'rgba(184, 198, 218, 0.13)'
+            : 'rgba(54, 62, 70, 0.15)';
         this.ctx.lineWidth = 1;
         this.ctx.beginPath();
 
@@ -115,6 +129,7 @@ public init(canvas: HTMLCanvasElement, emitter: EventEmitter<ChartEvents>): void
         if (this.emitter) {
             this.emitter.off('viewport', this.handleViewportEvent);
             this.emitter.off('data', this.handleDataEvent);
+            this.emitter.off('theme', this.handleThemeEvent);
         }
         if (!this.isGridLayer) {
             this.canvas.removeEventListener('mousemove', this.handleMouseMove);
@@ -144,7 +159,9 @@ public init(canvas: HTMLCanvasElement, emitter: EventEmitter<ChartEvents>): void
         const cssHeight: number = this.canvas.height / this.devicePixelRatio;
 
         this.ctx.save();
-        this.ctx.strokeStyle = 'rgba(0, 220, 255, 0.85)';
+        this.ctx.strokeStyle = this.theme === 'dark'
+            ? 'rgba(0, 220, 255, 0.9)'
+            : 'rgba(0, 111, 145, 0.9)';
         this.ctx.lineWidth = 1;
         this.ctx.setLineDash([4, 4]);
         this.ctx.beginPath();
@@ -196,13 +213,13 @@ public init(canvas: HTMLCanvasElement, emitter: EventEmitter<ChartEvents>): void
         this.ctx.save();
         this.ctx.font = '11px sans-serif';
         this.ctx.textBaseline = 'middle';
-        this.ctx.fillStyle = 'rgba(13, 17, 23, 0.92)';
+        this.ctx.fillStyle = this.theme === 'dark' ? 'rgba(13, 17, 23, 0.96)' : 'rgba(250, 248, 241, 0.97)';
         this.ctx.fillRect(panelX, panelY, panelWidth, panelHeight);
         this.ctx.strokeStyle = close >= open
-            ? 'rgba(26, 218, 145, 0.85)'
-            : 'rgba(245, 72, 90, 0.85)';
+            ? (this.theme === 'dark' ? 'rgba(26, 218, 145, 0.95)' : 'rgba(0, 112, 75, 0.95)')
+            : (this.theme === 'dark' ? 'rgba(245, 72, 90, 0.95)' : 'rgba(184, 43, 55, 0.95)');
         this.ctx.strokeRect(panelX + 0.5, panelY + 0.5, panelWidth - 1, panelHeight - 1);
-        this.ctx.fillStyle = 'rgba(201, 209, 217, 0.9)';
+        this.ctx.fillStyle = this.theme === 'dark' ? '#d8e0eb' : '#252c32';
         this.ctx.fillText(timeLabel, panelX + 8, panelY + 10);
         for (let valueIndex: number = 0; valueIndex < valueLabels.length; valueIndex++) {
             const columnX: number = panelX + 8 + (valueIndex % 2) * 76;
@@ -226,8 +243,8 @@ public init(canvas: HTMLCanvasElement, emitter: EventEmitter<ChartEvents>): void
         this.ctx.save();
         this.ctx.font = '11px sans-serif';
         this.ctx.textBaseline = 'middle';
-        this.ctx.fillStyle = 'rgba(201, 209, 217, 0.9)';
-        this.ctx.strokeStyle = 'rgba(201, 209, 217, 0.35)';
+        this.ctx.fillStyle = this.theme === 'dark' ? '#c6d0df' : '#343b41';
+        this.ctx.strokeStyle = this.theme === 'dark' ? 'rgba(184, 198, 218, 0.38)' : 'rgba(54, 62, 70, 0.42)';
         this.ctx.lineWidth = 1;
 
         this.ctx.beginPath();
@@ -264,9 +281,9 @@ public init(canvas: HTMLCanvasElement, emitter: EventEmitter<ChartEvents>): void
             : alignment === 'center'
                 ? x - textWidth / 2
                 : x - padding;
-        this.ctx.fillStyle = 'rgba(13, 17, 23, 0.78)';
+        this.ctx.fillStyle = this.theme === 'dark' ? 'rgba(11, 15, 23, 0.92)' : 'rgba(244, 241, 232, 0.94)';
         this.ctx.fillRect(boxLeft, y - textHeight / 2, textWidth, textHeight);
-        this.ctx.fillStyle = 'rgba(201, 209, 217, 0.9)';
+        this.ctx.fillStyle = this.theme === 'dark' ? '#c6d0df' : '#343b41';
         this.ctx.fillText(text, x, y);
     }
 

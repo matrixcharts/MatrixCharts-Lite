@@ -18,6 +18,7 @@ export class WebGL2Renderer implements IRenderer {
     private lineBuffer: WebGLBuffer | null = null;
     private candleVao: WebGLVertexArrayObject | null = null;
     private candleBuffer: WebGLBuffer | null = null;
+    private candleIndexBuffer: WebGLBuffer | null = null;
     
     private positionLocation: number = -1;
     private resolutionLocation: WebGLUniformLocation | null = null;
@@ -30,6 +31,7 @@ export class WebGL2Renderer implements IRenderer {
     private candleOffsetLocation: WebGLUniformLocation | null = null;
     private candleScaleLocation: WebGLUniformLocation | null = null;
     private candlePixelRatioLocation: WebGLUniformLocation | null = null;
+    private candleSnapOffsetLocation: WebGLUniformLocation | null = null;
 
     private currentOffset: [number, number] = [0, 0];
     private currentScale: [number, number] = [1, 1];
@@ -76,10 +78,11 @@ export class WebGL2Renderer implements IRenderer {
             uniform vec2 u_offset;
             uniform vec2 u_scale;
             uniform float u_pixelRatio;
+            uniform float u_snapOffset;
             out vec4 v_color;
             void main() {
                 vec2 transformedPosition = ((a_position * u_scale) + u_offset) * u_pixelRatio;
-                transformedPosition = floor(transformedPosition) + vec2(0.5);
+                transformedPosition = floor(transformedPosition + vec2(0.5 - u_snapOffset)) + vec2(u_snapOffset);
                 vec2 zeroToOne = transformedPosition / u_resolution;
                 vec2 clipSpace = (zeroToOne * 2.0) - 1.0;
                 gl_Position = vec4(clipSpace * vec2(1.0, -1.0), 0.0, 1.0);
@@ -137,11 +140,13 @@ export class WebGL2Renderer implements IRenderer {
 
             this.candleVao = gl.createVertexArray();
             this.candleBuffer = gl.createBuffer();
-            if (!this.candleVao || !this.candleBuffer) {
+            this.candleIndexBuffer = gl.createBuffer();
+            if (!this.candleVao || !this.candleBuffer || !this.candleIndexBuffer) {
                 throw new Error('MatrixCharts: Failed to create candlestick GPU resources.');
             }
             gl.bindVertexArray(this.candleVao);
             gl.bindBuffer(gl.ARRAY_BUFFER, this.candleBuffer);
+            gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, this.candleIndexBuffer);
             this.candlePositionLocation = gl.getAttribLocation(this.candleProgram, 'a_position');
             this.candleColorLocation = gl.getAttribLocation(this.candleProgram, 'a_color');
             gl.enableVertexAttribArray(this.candlePositionLocation);
@@ -152,13 +157,15 @@ export class WebGL2Renderer implements IRenderer {
             this.candleOffsetLocation = gl.getUniformLocation(this.candleProgram, 'u_offset');
             this.candleScaleLocation = gl.getUniformLocation(this.candleProgram, 'u_scale');
             this.candlePixelRatioLocation = gl.getUniformLocation(this.candleProgram, 'u_pixelRatio');
+            this.candleSnapOffsetLocation = gl.getUniformLocation(this.candleProgram, 'u_snapOffset');
             if (
                 this.candlePositionLocation < 0 ||
                 this.candleColorLocation < 0 ||
                 !this.candleResolutionLocation ||
                 !this.candleOffsetLocation ||
                 !this.candleScaleLocation ||
-                !this.candlePixelRatioLocation
+                !this.candlePixelRatioLocation ||
+                !this.candleSnapOffsetLocation
             ) {
                 throw new Error('MatrixCharts: Required candlestick shader inputs were not found.');
             }
@@ -230,13 +237,18 @@ export class WebGL2Renderer implements IRenderer {
             throw new Error('MatrixCharts: Candlestick viewport scales must be non-zero.');
         }
         
-        // Wicks = 2 vertices per candle. Bodies = 6 vertices per candle (2 triangles).
-        const totalVertices: number = candleCount * 8;
+        // Wicks = 4 vertices per candle (above/below body). Bodies = 4 vertices per candle.
+        const verticesPerCandle: number = 8;
+        const wickVerticesPerCandle: number = 4;
+        const totalVertices: number = candleCount * verticesPerCandle;
         const vertices: Float32Array = new Float32Array(totalVertices * vertexStride);
+        const bodyIndices: Uint32Array = new Uint32Array(candleCount * 6);
 
-        // Partition the array: wicks go at the start, bodies go immediately after all wicks
+        // Partition the array so wick segments never pass through or blend over candle bodies.
         let wickIndex: number = 0;
-        let bodyIndex: number = candleCount * 2 * vertexStride;
+        let bodyIndex: number = candleCount * wickVerticesPerCandle * vertexStride;
+        let bodyVertexIndex: number = candleCount * wickVerticesPerCandle;
+        let bodyIndexOffset: number = 0;
 
         for (let candleIndex: number = 0; candleIndex < candleCount; candleIndex++) {
             const inputIndex: number = candleIndex * 6;
@@ -283,38 +295,66 @@ export class WebGL2Renderer implements IRenderer {
                 bodyBottom = bodyCenter - halfPixelHeight;
             }
 
-            // 1. Write Wick Vertices
-            vertices[wickIndex++] = x; vertices[wickIndex++] = low;
-            vertices[wickIndex++] = color[0]; vertices[wickIndex++] = color[1]; vertices[wickIndex++] = color[2]; vertices[wickIndex++] = color[3];
+            const physicalTop: number = Math.floor(
+                (bodyTop * this.currentScale[1] + this.currentOffset[1]) * this.devicePixelRatio + 0.5,
+            );
+            const physicalBottom: number = Math.floor(
+                (bodyBottom * this.currentScale[1] + this.currentOffset[1]) * this.devicePixelRatio + 0.5,
+            );
+            const upperPixelCenter: number = physicalTop - 0.5;
+            const lowerPixelCenter: number = physicalBottom + 0.5;
+            const upperWickBoundary: number = (
+                upperPixelCenter / this.devicePixelRatio - this.currentOffset[1]
+            ) / this.currentScale[1];
+            const lowerWickBoundary: number = (
+                lowerPixelCenter / this.devicePixelRatio - this.currentOffset[1]
+            ) / this.currentScale[1];
+            const upperWickEnd: number = Math.min(high, Math.max(bodyTop, upperWickBoundary));
+            const lowerWickStart: number = Math.max(low, Math.min(bodyBottom, lowerWickBoundary));
 
+            // Upper wick ends above the body; lower wick starts below it to avoid overdraw seams.
             vertices[wickIndex++] = x; vertices[wickIndex++] = high;
             vertices[wickIndex++] = color[0]; vertices[wickIndex++] = color[1]; vertices[wickIndex++] = color[2]; vertices[wickIndex++] = color[3];
 
-            // 2. Write Body Vertices (Triangle 1)
-            vertices[bodyIndex++] = x - halfWidth; vertices[bodyIndex++] = bodyBottom;
+            vertices[wickIndex++] = x; vertices[wickIndex++] = upperWickEnd;
+            vertices[wickIndex++] = color[0]; vertices[wickIndex++] = color[1]; vertices[wickIndex++] = color[2]; vertices[wickIndex++] = color[3];
+
+            vertices[wickIndex++] = x; vertices[wickIndex++] = lowerWickStart;
+            vertices[wickIndex++] = color[0]; vertices[wickIndex++] = color[1]; vertices[wickIndex++] = color[2]; vertices[wickIndex++] = color[3];
+
+            vertices[wickIndex++] = x; vertices[wickIndex++] = low;
+            vertices[wickIndex++] = color[0]; vertices[wickIndex++] = color[1]; vertices[wickIndex++] = color[2]; vertices[wickIndex++] = color[3];
+
+            const bodyLeft: number = x - halfWidth;
+            const bodyRight: number = x + halfWidth;
+
+            vertices[bodyIndex++] = bodyLeft; vertices[bodyIndex++] = bodyBottom;
             vertices[bodyIndex++] = color[0]; vertices[bodyIndex++] = color[1]; vertices[bodyIndex++] = color[2]; vertices[bodyIndex++] = color[3];
 
-            vertices[bodyIndex++] = x + halfWidth; vertices[bodyIndex++] = bodyBottom;
+            vertices[bodyIndex++] = bodyRight; vertices[bodyIndex++] = bodyBottom;
             vertices[bodyIndex++] = color[0]; vertices[bodyIndex++] = color[1]; vertices[bodyIndex++] = color[2]; vertices[bodyIndex++] = color[3];
 
-            vertices[bodyIndex++] = x + halfWidth; vertices[bodyIndex++] = bodyTop;
+            vertices[bodyIndex++] = bodyLeft; vertices[bodyIndex++] = bodyTop;
             vertices[bodyIndex++] = color[0]; vertices[bodyIndex++] = color[1]; vertices[bodyIndex++] = color[2]; vertices[bodyIndex++] = color[3];
 
-            // 3. Write Body Vertices (Triangle 2)
-            vertices[bodyIndex++] = x - halfWidth; vertices[bodyIndex++] = bodyBottom;
+            vertices[bodyIndex++] = bodyRight; vertices[bodyIndex++] = bodyTop;
             vertices[bodyIndex++] = color[0]; vertices[bodyIndex++] = color[1]; vertices[bodyIndex++] = color[2]; vertices[bodyIndex++] = color[3];
 
-            vertices[bodyIndex++] = x + halfWidth; vertices[bodyIndex++] = bodyTop;
-            vertices[bodyIndex++] = color[0]; vertices[bodyIndex++] = color[1]; vertices[bodyIndex++] = color[2]; vertices[bodyIndex++] = color[3];
-
-            vertices[bodyIndex++] = x - halfWidth; vertices[bodyIndex++] = bodyTop;
-            vertices[bodyIndex++] = color[0]; vertices[bodyIndex++] = color[1]; vertices[bodyIndex++] = color[2]; vertices[bodyIndex++] = color[3];
+            bodyIndices[bodyIndexOffset++] = bodyVertexIndex;
+            bodyIndices[bodyIndexOffset++] = bodyVertexIndex + 1;
+            bodyIndices[bodyIndexOffset++] = bodyVertexIndex + 2;
+            bodyIndices[bodyIndexOffset++] = bodyVertexIndex + 2;
+            bodyIndices[bodyIndexOffset++] = bodyVertexIndex + 1;
+            bodyIndices[bodyIndexOffset++] = bodyVertexIndex + 3;
+            bodyVertexIndex += 4;
         }
 
         gl.bindBuffer(gl.ARRAY_BUFFER, this.candleBuffer);
         gl.bufferData(gl.ARRAY_BUFFER, vertices, gl.DYNAMIC_DRAW);
-        this.candleWickVertexCount = candleCount * 2;
-        this.candleBodyVertexCount = candleCount * 6;
+        gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, this.candleIndexBuffer);
+        gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, bodyIndices, gl.DYNAMIC_DRAW);
+        this.candleWickVertexCount = candleCount * wickVerticesPerCandle;
+        this.candleBodyVertexCount = bodyIndices.length;
     }
 
     public render(): void {
@@ -347,8 +387,15 @@ export class WebGL2Renderer implements IRenderer {
             gl.uniform2f(this.candleScaleLocation, this.currentScale[0], this.currentScale[1]);
             gl.uniform1f(this.candlePixelRatioLocation, this.devicePixelRatio);
             gl.bindVertexArray(this.candleVao);
+            gl.uniform1f(this.candleSnapOffsetLocation, 0.5);
             gl.drawArrays(gl.LINES, 0, this.candleWickVertexCount);
-            gl.drawArrays(gl.TRIANGLES, this.candleWickVertexCount, this.candleBodyVertexCount);
+            gl.uniform1f(this.candleSnapOffsetLocation, 0.0);
+            gl.drawElements(
+                gl.TRIANGLES,
+                this.candleBodyVertexCount,
+                gl.UNSIGNED_INT,
+                0,
+            );
         }
         gl.bindVertexArray(null);
     }
@@ -364,6 +411,7 @@ export class WebGL2Renderer implements IRenderer {
             if (this.fragmentShader) this.gl.deleteShader(this.fragmentShader);
             if (this.program) this.gl.deleteProgram(this.program);
             if (this.candleBuffer) this.gl.deleteBuffer(this.candleBuffer);
+            if (this.candleIndexBuffer) this.gl.deleteBuffer(this.candleIndexBuffer);
             if (this.candleVao) this.gl.deleteVertexArray(this.candleVao);
             if (this.candleVertexShader) this.gl.deleteShader(this.candleVertexShader);
             if (this.candleFragmentShader) this.gl.deleteShader(this.candleFragmentShader);
@@ -375,6 +423,7 @@ export class WebGL2Renderer implements IRenderer {
         this.fragmentShader = null;
         this.program = null;
         this.candleBuffer = null;
+        this.candleIndexBuffer = null;
         this.candleVao = null;
         this.candleVertexShader = null;
         this.candleFragmentShader = null;
@@ -387,6 +436,7 @@ export class WebGL2Renderer implements IRenderer {
         this.candleOffsetLocation = null;
         this.candleScaleLocation = null;
         this.candlePixelRatioLocation = null;
+        this.candleSnapOffsetLocation = null;
         this.lineVertexCount = 0;
         this.candleWickVertexCount = 0;
         this.candleBodyVertexCount = 0;

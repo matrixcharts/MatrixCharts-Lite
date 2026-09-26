@@ -3,6 +3,7 @@
 export interface ChartEvents {
     'viewport': { offsetX: number; offsetY: number; scaleX: number; scaleY: number };
     'data': { ohlc: Float32Array; times: readonly number[] };
+    'theme': 'dark' | 'paper';
 }
 
 type Listener<T> = (data: T) => void;
