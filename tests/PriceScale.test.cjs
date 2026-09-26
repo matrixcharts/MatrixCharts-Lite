@@ -156,3 +156,44 @@ test('priceTicks dispatches to the strategy for the scale in use', () => {
         logTicks(0.5, 5000, 9),
     );
 });
+
+// A log axis whose range is narrower than one gap in the decade ladder. This is not an
+// edge case: a stock trading 104 to 109 over a session is the commonest shape a log
+// chart gets, and before the fallback the ladder placed nothing at all in that range
+// and the pane rendered with no price axis whatsoever.
+test('a log range narrower than a decade still gets an axis', () => {
+    const ticks = logTicks(104.1857, 108.9104, 8);
+    assert.ok(ticks.length >= 2, `expected labels, got ${ticks.length}`);
+    for (const tick of ticks) {
+        assert.ok(tick.price >= 104.1857 && tick.price <= 108.9104, `${tick.price} is off the pane`);
+    }
+});
+
+test('the sub-decade fallback still spans the range', () => {
+    const ticks = logTicks(104.1857, 108.9104, 8);
+    const first = ticks[0].price;
+    const last = ticks[ticks.length - 1].price;
+    // Not just "some labels": the first and last have to reach the edges, or the axis
+    // is readable only in the middle and a reader cannot bound the data.
+    assert.ok(first <= 105.5, `first label ${first} is too far in`);
+    assert.ok(last >= 107.5, `last label ${last} is too far in`);
+});
+
+test('a range spanning decades keeps its anchors rather than stepping', () => {
+    // The fallback must not creep in here: 1, 100 and 10000 are the numbers a reader
+    // navigates by, and a step through decades drops whichever the phase misses.
+    const ticks = logTicks(0.5, 50000, 8);
+    const prices = ticks.map((tick) => tick.price);
+    assert.ok(prices.includes(1), `lost the anchor at 1: ${prices.join(',')}`);
+    assert.ok(prices.includes(100), `lost the anchor at 100: ${prices.join(',')}`);
+    assert.ok(prices.includes(10000), `lost the anchor at 10000: ${prices.join(',')}`);
+});
+
+test('a log range is labelled in prices, not in logs', () => {
+    // A regression guard on the conversion rather than the spacing: a tick's value is
+    // the log the axis is affine over, and its price is what the reader is shown.
+    const ticks = logTicks(0.5, 50000, 8);
+    for (const tick of ticks) {
+        assert.ok(Math.abs(tick.value - Math.log(tick.price)) < 1e-9, 'value and price disagree');
+    }
+});

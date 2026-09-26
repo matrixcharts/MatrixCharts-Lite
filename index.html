@@ -739,9 +739,14 @@
         const lockInput = document.querySelector('#scale-lock');
         scaleInput.addEventListener('change', () => {
             const [mode, inverted] = scaleInput.value.split(',');
-            chart.applyOptions({
-                priceScale: { mode, inverted: inverted === '1', autoScale: lockInput.value !== 'locked' },
-            });
+            try {
+                chart.applyOptions({
+                    priceScale: { mode, inverted: inverted === '1', autoScale: lockInput.value !== 'locked' },
+                });
+                status.textContent = `scale ${chart.options().priceScale.mode}`;
+            } catch (error) {
+                status.textContent = `scale error: ${error instanceof Error ? error.message : error}`;
+            }
         });
         lockInput.addEventListener('change', () => {
             if (lockInput.value === 'locked') {

@@ -167,6 +167,21 @@ export function logTicks(minimum: number, maximum: number, targetCount: number):
             ticks.push({ value: Math.log(price), price });
         }
     }
+    // A decade-anchored ladder can only place a tick at a mantissa times a power of
+    // ten, so a range narrower than one gap in that ladder gets *no* ticks at all. A
+    // stock trading 104 to 109 over a session is the commonest shape there is, and
+    // the anchor it would respect - 100 - is off screen, so anchoring there is not a
+    // virtue, it is the whole axis missing.
+    //
+    // So the anchor governs while it carries the axis, and a plain step takes over
+    // when it cannot. The trigger is a floor rather than anything relative to the
+    // requested count: below two labels the axis cannot be read off, and a target
+    // has no business overriding that. Measuring against the request instead breaks
+    // thinning outright, because asking for many labels makes the ladder look
+    // inadequate on a range it is labelling perfectly well.
+    if (ticks.length < 2) {
+        return linearTicks(minimum, maximum, wanted);
+    }
     return ticks;
 }
 

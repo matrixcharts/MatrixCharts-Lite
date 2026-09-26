@@ -1694,28 +1694,42 @@ export class Chart {
         const paddedMax = high + padding;
 
         // Fitted to the price pane, so the highest and lowest visible candle land
-        // inside the pane rather than inside the canvas. The sign carries the
-        // inversion: scaleY is negative for an ordinary axis, where a larger value
-        // sits higher up.
-        const magnitude: number = pricePane.height / (paddedMax - paddedMin);
+        // inside the pane rather than inside the canvas.
+        //
+        // The two offsets below look like a sign slip and are not: they are the
+        // same equation solved for each direction. With `scaleY = -magnitude` a
+        // value at `v` sits at `y = offsetY - v * magnitude`, so putting the lowest
+        // padded value on the pane's bottom edge gives
+        // `offsetY = bottom + v * magnitude`. Inverting the axis flips `scaleY`'s
+        // sign, and the offset has to flip with it or the transform is not an
+        // inverse of itself — which renders an empty chart with an axis reading
+        // around minus a hundred, on a series trading at a hundred and six.
+        this.applyVerticalFit(paddedMin, paddedMax, pricePane);
+    }
+
+    /**
+     * Sets the price pane's vertical transform from a padded value range, honouring
+     * the inversion. One place, so the fit and the locked range cannot disagree
+     * about the sign convention.
+     */
+    private applyVerticalFit(low: number, high: number, pane: PlotRect): void {
+        const span: number = high - low;
+        if (!(span > 0)) return;
+        const magnitude: number = pane.height / span;
         this.scaleY = this.resolvedOptions.priceScale.inverted ? magnitude : -magnitude;
         this.offsetY = this.resolvedOptions.priceScale.inverted
-            ? pricePane.y + paddedMin * magnitude
-            : pricePane.y + pricePane.height - paddedMin * magnitude;
+            ? pane.y - low * magnitude
+            : pane.y + pane.height + low * magnitude;
     }
 
     /** Establishes the pane's transform from a price range, without padding. */
     private applyPriceRange(range: readonly [number, number]): void {
-        const pricePane: PlotRect = this.pricePaneRect();
         const scale: PriceScale = this.priceScale();
-        const low: number = toScaleSpace(range[0], scale);
-        const high: number = toScaleSpace(range[1], scale);
-        if (!(high > low)) return;
-        const magnitude: number = pricePane.height / (high - low);
-        this.scaleY = this.resolvedOptions.priceScale.inverted ? magnitude : -magnitude;
-        this.offsetY = this.resolvedOptions.priceScale.inverted
-            ? pricePane.y + low * magnitude
-            : pricePane.y + pricePane.height - low * magnitude;
+        this.applyVerticalFit(
+            toScaleSpace(range[0], scale),
+            toScaleSpace(range[1], scale),
+            this.pricePaneRect(),
+        );
     }
 
     /** The price pane's rect: pane 0 of the current layout, or the whole plot. */
