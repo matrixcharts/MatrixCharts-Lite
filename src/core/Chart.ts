@@ -22,9 +22,16 @@ import type {
     ChartTheme,
     ResolvedCandleColors,
     ResolvedChartOptions,
+    Rgba,
 } from './options.js';
-import { mergeOptionPartials, resolveCandleColors, resolveOptions } from './options.js';
+import { mergeOptionPartials, parseCssColor, resolveCandleColors, resolveOptions } from './options.js';
 import { resolveChartContainer } from './resolveChartContainer.js';
+import {
+    bucketOverlay,
+    resolveOverlays,
+    type OverlaySpec,
+    type ResolvedOverlay,
+} from './overlays.js';
 import type {
     ChartClickEvent,
     CrosshairMoveEvent,
@@ -97,6 +104,7 @@ export class Chart {
     private candlePyramid: OHLCPyramid = new OHLCPyramid();
     private displayedCandles: Float32Array = new Float32Array(0);
     private candleTimes: number[] = [];
+    private overlays: ResolvedOverlay[] = [];
     private followsLiveEdge: boolean = true;
     private scheduledViewportFrame: number | null = null;
     private readonly maxRetainedCandles: number;
@@ -745,13 +753,67 @@ export class Chart {
         };
     }
 
+    /**
+     * Replaces the chart's overlay series.
+     *
+     * Overlays are values supplied from outside the library, drawn on the candle
+     * time index. There is no indicator maths here: an EMA, a band, or anything
+     * else is computed elsewhere and arrives as plain points. Every point's
+     * timestamp must match a candle exactly, and an unmatched one is rejected
+     * rather than snapped to the nearest bar, because a line drawn half a bar out
+     * of place is worse than one that refuses to draw.
+     *
+     * Passing an empty array removes every overlay. The whole set is replaced
+     * rather than merged, so a call is idempotent and the chart's overlay state is
+     * always exactly what was last supplied.
+     */
+    public setOverlays(overlays: readonly OverlaySpec[]): void {
+        this.assertAlive();
+        // Resolved before any mutation, so a rejected overlay leaves the chart as
+        // it was rather than half-applied.
+        this.overlays = resolveOverlays(
+            overlays,
+            this.candleTimes,
+            (spec: OverlaySpec): Rgba => (
+                spec.color === undefined
+                    ? this.resolvedOptions.candlestick.lineColor
+                    : parseCssColor(spec.color, `overlay ${spec.id}.color`)
+            ),
+            (spec: OverlaySpec, cssColor: string): Rgba => (
+                parseCssColor(cssColor, `overlay ${spec.id} point color`)
+            ),
+        );
+        this.updateViewport();
+    }
+
+    /** The overlay ids currently supplied, in the order they were given. */
+    public getOverlayIds(): string[] {
+        this.assertAlive();
+        return this.overlays.map((overlay: ResolvedOverlay): string => overlay.id);
+    }
+
+    /**
+     * The value of one overlay at a candle index, or `null` when the overlay does
+     * not cover that candle — including the bars before an indicator's warm-up.
+     * Read at full resolution, so this is the caller's own value rather than a
+     * reduced one.
+     */
+    public getOverlayValueAt(id: string, index: number): number | null {
+        this.assertAlive();
+        const overlay = this.overlays.find((entry: ResolvedOverlay): boolean => entry.id === id);
+        if (!overlay) return null;
+        if (!Number.isInteger(index) || index < 0 || index >= overlay.values.length) return null;
+        if (index < overlay.firstIndex || index > overlay.lastIndex) return null;
+        return overlay.values[index];
+    }
+
     /** Newest retained candle, or `null` when the chart has no data. */
     public getLastCandle(): CandleData | null {
         this.assertAlive();
         return this.getCandleAt(this.candlePyramid.candleCount - 1);
     }
 
-    /** Screen x of a candle index. */
+    /** Screen x of a candle index, measured from the canvas's left edge. */
     public indexToCoordinate(index: number): number {
         this.assertAlive();
         return indexToCoordinate(this.viewport, index);
@@ -1254,6 +1316,13 @@ export class Chart {
         }
     }
 
+    /**
+     * The factor the candle pyramid is currently drawing at, captured while the
+     * level is chosen so overlays reduce to the very same buckets. Zero until the
+     * first pass, which is harmless because there is nothing to draw then.
+     */
+    private overlayAggregationFactor: number = 1;
+
     private updateVisibleCandles(): void {
         const viewport: ChartViewport = this.viewport;
         if (this.candlePyramid.candleCount === 0) {
@@ -1268,6 +1337,7 @@ export class Chart {
             }
 
             const aggregationFactor: number = Math.pow(2, levelIndex);
+            this.overlayAggregationFactor = aggregationFactor;
             const level: Float32Array = this.candlePyramid.getLevelData(levelIndex);
             const levelCount: number = this.candlePyramid.getLevelCount(levelIndex);
             const visibleMinX: number = coordinateToIndex(viewport, viewport.plot.x);
@@ -1307,7 +1377,47 @@ export class Chart {
             });
         }
         this.uploadVisibleVolume();
+        this.uploadVisibleOverlays();
         this.emitter.emit('data', { times: this.candleTimes });
+    }
+
+    /**
+     * Uploads every overlay, reduced to the same buckets as the candles.
+     *
+     * `aggregationFactor` is the factor the candle pyramid is currently drawing at,
+     * so an overlay point lands on exactly the same x as the candle it belongs to.
+     * Reducing them independently would let the two drift apart as the chart zooms,
+     * which reads as the overlay lagging the price rather than as a bug.
+     */
+    private uploadVisibleOverlays(): void {
+        const active = new Set<string>();
+        if (this.overlays.length === 0 || this.displayedCandles.length === 0) {
+            this.dataRenderer.retainOverlays(active);
+            return;
+        }
+        const factor: number = this.overlayAggregationFactor;
+        const sourceCount: number = this.candlePyramid.candleCount;
+        for (const overlay of this.overlays) {
+            if (!overlay.visible) continue;
+            active.add(overlay.id);
+            const bucketed = bucketOverlay(
+                overlay.values,
+                factor,
+                sourceCount,
+                overlay.firstIndex,
+                overlay.lastIndex,
+                overlay.pointColors,
+            );
+            // Shares the price scale, so an overlay is read against the same axis.
+            this.dataRenderer.drawOverlay(
+                overlay.id,
+                bucketed.points,
+                bucketed.stride,
+                overlay.color,
+                null,
+            );
+        }
+        this.dataRenderer.retainOverlays(active);
     }
 
     /**

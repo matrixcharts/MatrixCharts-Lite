@@ -143,6 +143,15 @@
                 <option value="true">on</option>
             </select>
         </label>
+        <label class="swatch">Overlay
+            <select id="overlay-style" aria-label="Overlay series">
+                <option value="off">off</option>
+                <option value="ema">EMA 21</option>
+                <option value="bands">Bollinger</option>
+                <option value="stops">Supertrend</option>
+                <option value="mixed">per-point colour</option>
+            </select>
+        </label>
         <label class="swatch">Cross
             <select id="crosshair-visible" aria-label="Crosshair visibility">
                 <option value="true">on</option>
@@ -355,6 +364,12 @@
             disconnectButton.disabled = false;
         });
 
+        // The feed appends on its own, so the overlay is rebuilt on a timer from
+        // whatever the chart currently holds rather than wired to one event.
+        setInterval(() => {
+            if (overlayInput.value !== 'off') setOverlays(overlayInput.value);
+        }, 500);
+
         disconnectButton.addEventListener('click', () => {
             if (feedController) feedController.dispose();
             feedController = null;
@@ -364,6 +379,95 @@
             connectButton.disabled = false;
             disconnectButton.disabled = true;
         });
+
+        // Overlays are values computed elsewhere and handed to the chart as
+        // { time, value } points. There is no indicator maths in the library, so
+        // the demo computes its own and shows the shape a real indicator library
+        // would produce: a warm-up, then a contiguous run.
+        const sma = (values, period) => {
+            const out = [];
+            let sum = 0;
+            for (let i = 0; i < values.length; i++) {
+                sum += values[i];
+                if (i >= period) sum -= values[i - period];
+                if (i >= period - 1) out.push(sum / period);
+            }
+            return out;
+        };
+        const stddev = (values, period) => {
+            const out = [];
+            for (let i = period - 1; i < values.length; i++) {
+                const window_ = values.slice(i - period + 1, i + 1);
+                const mean = window_.reduce((a, b) => a + b, 0) / period;
+                const variance = window_.reduce((a, b) => a + (b - mean) ** 2, 0) / period;
+                out.push(Math.sqrt(variance));
+            }
+            return out;
+        };
+
+        const overlayInput = document.querySelector('#overlay-style');
+        const setOverlays = (kind) => {
+            const count = chart.getCandleCount();
+            if (count === 0 || kind === 'off') {
+                chart.setOverlays([]);
+                return;
+            }
+            // The chart's own candles are the source, read through public API.
+            const closes = [];
+            const times = [];
+            for (let i = 0; i < count; i++) {
+                const candle = chart.getCandleAt(i);
+                if (!candle) continue;
+                closes.push(candle.close);
+                times.push(candle.time);
+            }
+            // The period tracks the visible window so the overlay always has
+            // enough history to draw at any zoom.
+            const period = Math.max(4, Math.min(40, Math.round(closes.length / 12)));
+            const means = sma(closes, period);
+            const start = closes.length - means.length;
+            const at = (offset) => ({ time: times[start + offset], value: means[offset] });
+
+            if (kind === 'ema') {
+                chart.setOverlays([{ id: 'sma', points: means.map((_, i) => at(i)), color: '#ff9f0a' }]);
+                return;
+            }
+            if (kind === 'bands') {
+                const deviations = stddev(closes, period);
+                const factor = 2;
+                chart.setOverlays([
+                    { id: 'upper', points: means.map((v, i) => ({ ...at(i), value: v + factor * deviations[i] })), color: '#5ac8fa' },
+                    { id: 'basis', points: means.map((v, i) => at(i)), color: '#ff9f0a' },
+                    { id: 'lower', points: means.map((v, i) => ({ ...at(i), value: v - factor * deviations[i] })), color: '#5ac8fa' },
+                ]);
+                return;
+            }
+            if (kind === 'stops') {
+                // A stop level that flips colour with the side, which is what a
+                // per-point colour is for.
+                const period_ = Math.max(2, Math.round(period / 2));
+                const points = means.map((value, i) => ({
+                    ...at(i),
+                    value: value + (i % 2 === 0 ? 1 : -1) * period_ * 0.1,
+                    color: i % 2 === 0 ? '#30d158' : '#ff453a',
+                }));
+                chart.setOverlays([{ id: 'stops', points }]);
+                return;
+            }
+            // 'mixed': two overlays at once, one flat and one per-point.
+            chart.setOverlays([
+                { id: 'basis', points: means.map((_, i) => at(i)), color: '#ff9f0a' },
+                {
+                    id: 'signed',
+                    points: means.map((value, i) => ({
+                        ...at(i),
+                        value: value + (i % 2 === 0 ? 1 : -1) * 0.5,
+                        color: i % 2 === 0 ? '#00ffff' : '#ff00ff',
+                    })),
+                },
+            ]);
+        };
+        overlayInput.addEventListener('change', () => setOverlays(overlayInput.value));
 
         window.addEventListener('beforeunload', () => {
             if (feedController) feedController.dispose();

@@ -12,6 +12,7 @@ export type {
     TimeScaleOptions,
 } from './core/options.js';
 export type { LogicalRange, TimeRange } from './core/coordinates.js';
+export type { OverlayPoint, OverlaySpec } from './core/overlays.js';
 export type {
     ChartClickEvent,
     CrosshairCleared,

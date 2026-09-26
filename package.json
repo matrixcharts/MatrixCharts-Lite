@@ -30,7 +30,7 @@
     "build:esm": "tsc -p tsconfig.json",
     "build:cjs": "tsc -p tsconfig.cjs.json && node scripts/write-dual-package-json.cjs",
     "prepack": "npm run build",
-    "test": "tsc -p tsconfig.test.json && node scripts/write-dual-package-json.cjs && node --test tests/OHLCPyramid.test.cjs tests/CandleFeed.test.cjs tests/FeedBoundary.test.cjs tests/StreamingIntegration.test.cjs tests/CandlestickLayout.test.cjs tests/Coordinates.test.cjs tests/Options.test.cjs tests/PublicApi.test.cjs tests/ChartContainer.test.cjs",
+    "test": "tsc -p tsconfig.test.json && node scripts/write-dual-package-json.cjs && node --test tests/OHLCPyramid.test.cjs tests/CandleFeed.test.cjs tests/FeedBoundary.test.cjs tests/StreamingIntegration.test.cjs tests/CandlestickLayout.test.cjs tests/Coordinates.test.cjs tests/Options.test.cjs tests/Overlays.test.cjs tests/PublicApi.test.cjs tests/ChartContainer.test.cjs",
     "verify:package": "npm run build && node scripts/verify-package.mjs",
     "verify": "npm test && npm run verify:package",
     "benchmark": "tsc -p tsconfig.test.json && node scripts/write-dual-package-json.cjs && node benchmarks/sustained-feed.cjs"

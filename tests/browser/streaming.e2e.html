@@ -1242,6 +1242,191 @@
                 };
             }
 
+            // --- Overlays on the shared time index -----------------------
+            // An overlay is external values drawn against the candle index. What
+            // matters is that it lands on the same x as the candles at every zoom,
+            // and that it starts where its data starts rather than trailing in
+            // from zero over the indicator's warm-up.
+            let overlayReport = null;
+            {
+                const t0 = Date.UTC(2025, 6, 1);
+                // Short enough that the warm-up region stays on screen at every
+                // zoom tested. With a long series the chart sits at the live edge,
+                // the first covered bar is far off-screen left, and the test would
+                // only be measuring where the overlay is clipped.
+                const count = 60;
+                const series = Array.from({ length: count }, (_, i) => {
+                    const open = 100 + Math.sin(i / 9) * 6;
+                    const close = open + ((i % 5) - 2) * 0.4;
+                    return {
+                        time: t0 + i * 60_000, open, close,
+                        high: Math.max(open, close) + 0.5, low: Math.min(open, close) - 0.5,
+                    };
+                });
+                // Shaped like an indicator with a warm-up: it starts 20 bars in and
+                // runs to the end, which is what a 21-period EMA produces.
+                const warmup = 20;
+                const ema = series.slice(warmup).map((bar, i) => ({
+                    time: bar.time,
+                    value: 100 + Math.sin((i + warmup) / 9) * 6,
+                }));
+
+                const host = document.createElement('div');
+                host.style.cssText = 'position:absolute;left:-9999px;width:700px;height:340px';
+                document.body.appendChild(host);
+                const chart = new Chart(host, { theme: 'dark' });
+                chart.setData(series);
+                chart.setOverlays([{ id: 'ema', points: ema, color: '#ff9f0a' }]);
+
+                if (chart.getOverlayIds().join(',') !== 'ema') {
+                    throw new Error(`Overlay ids are ${chart.getOverlayIds().join(',')}, expected ema.`);
+                }
+                if (chart.getOverlayValueAt('ema', warmup) === null) {
+                    throw new Error('The overlay has no value at the first covered candle.');
+                }
+                if (chart.getOverlayValueAt('ema', warmup - 1) !== null) {
+                    throw new Error('The overlay reports a value over its own warm-up.');
+                }
+                // A timestamp between candles is refused outright.
+                let refused = '';
+                try {
+                    chart.setOverlays([{ id: 'bad', points: [{ time: t0 + 30_000, value: 1 }] }]);
+                } catch (error) {
+                    refused = error instanceof Error ? error.message : String(error);
+                }
+                if (!refused.includes('no candle at')) {
+                    throw new Error(`An unaligned overlay was not refused: ${refused || 'no error'}`);
+                }
+                if (chart.getOverlayIds().join(',') !== 'ema') {
+                    throw new Error('A refused overlay replaced the existing one.');
+                }
+
+                const gl = host.querySelectorAll('canvas')[1].getContext('webgl2');
+                const W = gl.drawingBufferWidth, H = gl.drawingBufferHeight;
+                const dpr = W / host.querySelectorAll('canvas')[1].clientWidth;
+
+                // Measured at several zooms: the overlay must stay glued to the
+                // candles rather than drifting as the pyramid aggregates.
+                const gutter = Math.round(78 * dpr);
+                // A second overlay whose points each carry their own colour, which
+                // is the shape an indicator library produces when a series is
+                // signed by side. It renders as its own line, not over the first.
+                const sign = series.slice(30).map((bar, i) => ({
+                    time: bar.time,
+                    value: 100 + Math.cos((i + 30) / 7) * 3,
+                    // Cyan and magenta: the dark theme's own up/down colours are
+                    // green and red, and candle pixels would otherwise be able to
+                    // satisfy this check on their own.
+                    color: i % 2 === 0 ? '#00ffff' : '#ff00ff',
+                }));
+                chart.setOverlays([
+                    { id: 'ema', points: ema, color: '#ff9f0a' },
+                    { id: 'sign', points: sign },
+                ]);
+                if (chart.getOverlayIds().join(',') !== 'ema,sign') {
+                    throw new Error(`Overlay ids are ${chart.getOverlayIds().join(',')}, expected ema,sign.`);
+                }
+
+                const drift = [];
+                for (const barSpacing of [8, 5, 3]) {
+                    chart.applyOptions({ timeScale: { barSpacing } });
+                    await waitFrame();
+                    // indexToCoordinate is canvas-relative, so the plot's left edge
+                    // is the gutter and no offset is added here. Comparing in
+                    // device pixels from here on.
+                    const expectedX = Math.round(chart.indexToCoordinate(warmup) * dpr);
+                    if (expectedX <= gutter) {
+                        throw new Error(`The first covered bar is off-screen at bar spacing ${barSpacing}; `
+                            + 'the test would be measuring clipping, not alignment.');
+                    }
+                    // Find the leftmost orange pixel: that is the overlay's start.
+                    let leftmost = Infinity;
+                    let buf = null;
+                    const oa = gl.drawArrays.bind(gl);
+                    const oe = gl.drawElements.bind(gl);
+                    gl.drawArrays = (...a) => {
+                        const o = oa(...a);
+                        buf = new Uint8Array(W * H * 4);
+                        gl.readPixels(0, 0, W, H, gl.RGBA, gl.UNSIGNED_BYTE, buf);
+                        return o;
+                    };
+                    gl.drawElements = (...a) => {
+                        const o = oe(...a);
+                        buf = new Uint8Array(W * H * 4);
+                        gl.readPixels(0, 0, W, H, gl.RGBA, gl.UNSIGNED_BYTE, buf);
+                        return o;
+                    };
+                    chart.applyOptions({ crosshair: { visible: true } });
+                    await waitFrame();
+                    gl.drawArrays = oa; gl.drawElements = oe;
+                    if (!buf) throw new Error(`No pixels captured at bar spacing ${barSpacing}.`);
+
+                    for (let y = 0; y < H; y++) {
+                        for (let x = gutter; x < W; x++) {
+                            const i = (y * W + x) * 4;
+                            // #ff9f0a, opaque, against green/red candles.
+                            if (buf[i + 3] < 128) continue;
+                            if (buf[i] > 180 && buf[i + 1] > 110 && buf[i + 1] < 190 && buf[i + 2] < 90) {
+                                if (x < leftmost) leftmost = x;
+                            }
+                        }
+                    }
+                    if (leftmost === Infinity) throw new Error(`Overlay drew no pixels at bar spacing ${barSpacing}.`);
+                    // The overlay must begin at its first covered candle, to within
+                    // half a bar: this is the assertion that catches drift.
+                    const tolerance = Math.max(2, Math.ceil(barSpacing * dpr / 2) + 1);
+                    const off = leftmost - expectedX;
+                    if (off < -tolerance || off > tolerance) {
+                        throw new Error(`Overlay starts at x=${leftmost} but its first covered candle is at `
+                            + `${expectedX} (off by ${off}, tolerance ${tolerance}) at bar spacing ${barSpacing}.`);
+                    }
+                    drift.push({ barSpacing, overlayStartX: leftmost, expectedStartX: expectedX, off });
+                }
+
+                // Both point colours must actually reach the screen. A field that
+                // is accepted and validated but never drawn would pass every check
+                // above, because those overlays are drawn in a single flat colour.
+                const pointColours = await (async () => {
+                    let buf = null;
+                    const ga = gl.drawArrays.bind(gl);
+                    gl.drawArrays = (...a) => {
+                        const o = ga(...a);
+                        buf = new Uint8Array(W * H * 4);
+                        gl.readPixels(0, 0, W, H, gl.RGBA, gl.UNSIGNED_BYTE, buf);
+                        return o;
+                    };
+                    chart.applyOptions({ crosshair: { visible: true } });
+                    await waitFrame();
+                    gl.drawArrays = ga;
+                    if (!buf) throw new Error('No pixels captured for the per-point colour check.');
+                    let cyan = 0, magenta = 0;
+                    for (let y = 0; y < H; y++) {
+                        for (let x = gutter; x < W; x++) {
+                            const i = (y * W + x) * 4;
+                            if (buf[i + 3] < 128) continue;
+                            // #00ffff and #ff00ff.
+                            if (buf[i] < 90 && buf[i + 1] > 170 && buf[i + 2] > 170) cyan++;
+                            if (buf[i] > 170 && buf[i + 1] < 90 && buf[i + 2] > 170) magenta++;
+                        }
+                    }
+                    return { cyan, magenta };
+                })();
+                if (pointColours.cyan === 0 || pointColours.magenta === 0) {
+                    throw new Error(`Per-point colours did not both render: ${JSON.stringify(pointColours)}.`);
+                }
+
+                // Removing every overlay must release the series rather than
+                // leaving an invisible one alive.
+                chart.setOverlays([]);
+                if (chart.getOverlayIds().length !== 0) throw new Error('Overlays were not removed.');
+                chart.applyOptions({ crosshair: { visible: true } });
+                await waitFrame();
+
+                overlayReport = { warmup, drift, pointColours };
+                chart.destroy();
+                host.remove();
+            }
+
             // --- Axis gutters ---------------------------------------------
             // Series are confined to the plot rect, and the axis labels live in
             // the gutters outside it. A bar scrolled part-way past an edge must
@@ -1723,6 +1908,7 @@
                 lineSeries: lineReport,
                 volumeHistogram: volumeReport,
                 candleStyles: styleReport,
+                overlays: overlayReport,
                 barSpacing: chart.getBarSpacing(),
                 visibleLogicalRange: feedRange,
                 visibleTimeRange: {

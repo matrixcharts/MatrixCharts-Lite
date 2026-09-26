@@ -4,7 +4,13 @@ import type { IRenderer } from '../core/IRenderer.js';
 import type { EventEmitter, ChartEvents } from '../core/EventEmitter.js';
 import type { PlotRect } from '../core/coordinates.js';
 import { candlestickBodyEdgesData } from '../math/candlestickBodyWidth.js';
-import { WebGLSeries, VERTEX_STRIDE, type SeriesPass, type SeriesUniforms } from './WebGLSeries.js';
+import {
+    WebGLSeries,
+    VERTEX_STRIDE,
+    type SeriesPass,
+    type SeriesUniforms,
+    type VerticalTransform,
+} from './WebGLSeries.js';
 import {
     CANDLE_CLOSE,
     CANDLE_HIGH,
@@ -73,6 +79,8 @@ export class WebGL2Renderer implements IRenderer {
     private lineSeries: WebGLSeries | null = null;
     private volumeSeries: WebGLSeries | null = null;
     private areaSeries: WebGLSeries | null = null;
+    /** One batch per named overlay, created on first draw and kept until removed. */
+    private overlaySeries: Map<string, WebGLSeries> = new Map<string, WebGLSeries>();
 
     private currentOffset: [number, number] = [0, 0];
     private currentScale: [number, number] = [1, 1];
@@ -226,9 +234,6 @@ export class WebGL2Renderer implements IRenderer {
      * colour is expanded to match. Positions go through the same device-pixel
      * transform as every other series, which is what makes a line land where the
      * candles are at any pixel ratio.
-     *
-     * No caller yet: an overlay series supplies its own downsampled points in a
-     * later phase. What exists now is the batch, its buffers, and its pass.
      */
     public drawLine(points: Float32Array, color: [number, number, number, number]): void {
         const series = this.lineSeries;
@@ -263,6 +268,77 @@ export class WebGL2Renderer implements IRenderer {
             indexed: false,
             snapOffset: 0.5,
         }]);
+    }
+
+    /**
+     * Uploads one named overlay as its own line series, so overlays cannot
+     * overwrite each other's geometry and each keeps an independent pass.
+     *
+     * The batch is created on first use and kept: overlays are re-uploaded every
+     * frame, but their buffers are not, and recreating a vertex array per frame
+     * per overlay is exactly the cost this design set out to avoid.
+     */
+    public drawOverlay(
+        id: string,
+        points: Float32Array,
+        stride: 2 | 6,
+        color: Rgba,
+        vertical: VerticalTransform | null,
+    ): void {
+        const gl: WebGL2RenderingContext = this.requireContext();
+        let series: WebGLSeries | undefined = this.overlaySeries.get(id);
+        if (!series) {
+            if (!this.program) return;
+            series = new WebGLSeries(
+                gl, this.program, this.positionLocation, this.colorLocation, `overlay:${id}`,
+            );
+            this.overlaySeries.set(id, series);
+            // Appended so overlays draw over the candles but under nothing else.
+            this.series.splice(this.series.length - 1, 0, series);
+        }
+        series.setVerticalTransform(vertical);
+
+        const pointCount = Math.floor(points.length / stride);
+        if (pointCount < 2) {
+            series.setPasses([]);
+            return;
+        }
+        const vertices = new Float32Array(pointCount * VERTEX_STRIDE);
+        for (let index = 0; index < pointCount; index++) {
+            const source = index * stride;
+            const target = index * VERTEX_STRIDE;
+            vertices[target] = points[source];
+            vertices[target + 1] = points[source + 1];
+            // A stride of 6 carries this point's own colour; otherwise the whole
+            // overlay is the one colour the caller supplied.
+            const hasOwn = stride === 6;
+            vertices[target + 2] = hasOwn ? points[source + 2] : color[0];
+            vertices[target + 3] = hasOwn ? points[source + 3] : color[1];
+            vertices[target + 4] = hasOwn ? points[source + 4] : color[2];
+            vertices[target + 5] = hasOwn ? points[source + 5] : color[3];
+        }
+        series.upload(vertices, null);
+        series.setPasses([{
+            primitive: gl.LINE_STRIP,
+            count: pointCount,
+            first: 0,
+            indexed: false,
+            snapOffset: 0.5,
+        }]);
+    }
+
+    /**
+     * Drops overlays that are no longer supplied, so removing one releases its
+     * buffers instead of leaving an invisible series alive for the chart's life.
+     */
+    public retainOverlays(activeIds: ReadonlySet<string>): void {
+        for (const [id, series] of Array.from(this.overlaySeries.entries())) {
+            if (activeIds.has(id)) continue;
+            const index = this.series.indexOf(series);
+            if (index >= 0) this.series.splice(index, 1);
+            series.destroy();
+            this.overlaySeries.delete(id);
+        }
     }
 
     /**
@@ -965,6 +1041,8 @@ export class WebGL2Renderer implements IRenderer {
         if (this.emitter) {
             this.emitter.off('viewport', this.handleViewportEvent);
         }
+        for (const entry of this.overlaySeries.values()) entry.destroy();
+        this.overlaySeries.clear();
         for (const entry of this.series) entry.destroy();
         this.series = [];
         this.candleSeries = null;

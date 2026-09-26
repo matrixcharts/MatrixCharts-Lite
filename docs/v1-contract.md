@@ -312,7 +312,40 @@ A present `volume` on the wire is validated and carried through by `WebSocketCan
 
 Recolouring reaches the GPU without touching the data: `applyOptions` repaints from the existing vertex buffers, and `getCandleCount()` is unchanged.
 
+## Overlays on the shared time index
 
+An overlay is **external values drawn against the candle time index**. There is no indicator maths in the library: an EMA, a band, or a stop level is computed elsewhere and arrives as plain points. This is deliberate — the maths belongs to whoever already owns it, and a second implementation would only be a second thing to keep correct.
+
+`setOverlays(overlays)` replaces the whole set; each call is idempotent and the chart's overlay state is exactly what was last supplied. Passing an empty array removes every overlay and releases its buffers rather than leaving an invisible series alive. The whole set is validated before any of it is applied, so a rejected overlay leaves the chart exactly as it was rather than half-applied.
+
+A point is `{ time, value }`, and `time` must match a candle timestamp **exactly**. Snapping to the nearest candle — which is what the coordinate layer does for a pointer position or an arbitrary timestamp — would let a misaligned overlay look correct, and a line drawn half a bar out of place is the kind of defect that reaches a trading desk rather than a bug report. An unmatched timestamp is refused, naming the offending time. Times must also strictly increase, and ids must be non-empty and unique.
+
+**An indicator's warm-up is part of its shape.** Most indicators emit nothing until they have enough history, so a 21-period EMA over 1000 bars covers a suffix of the series, not all of it. The uncovered leading bars hold no value and are **not drawn**: treating them as zero would draw a line from price zero up to the first real value, which is the single most destructive thing an overlay could do to a chart. `getOverlayValueAt` returns `null` across the warm-up for the same reason, rather than a zero that reads like data.
+
+An overlay is reduced to **the same buckets as the candle pyramid, at the factor the pyramid is currently drawing at**, and the bucket x is computed with the pyramid's own formula. The two are therefore not merely close at a given zoom, they are identical, and an overlay cannot drift from its candles as the chart zooms. A bucket takes the last value in its group, which is the conventional choice for a line and keeps the visible end anchored; it does drop intra-bucket extremes, so an overlay whose peaks matter more than its shape should be sampled at a finer level than the candles.
+
+Interior omissions are **not** supported: a `LINE_STRIP` cannot express a break, so a value missing between two covered ones is drawn as a straight line across the gap. Indicators that emit a contiguous run, which is what a warm-up produces, are unaffected.
+
+Line width is not exposed. WebGL only guarantees `lineWidth` of 1 and most implementations silently clamp anything larger, so an option that appeared to work and did not would be worse than its absence.
+
+Overlays are drawn in the order supplied, over the candles.
+
+### Interoperating with an indicator library
+
+`OverlayPoint` is `{ time, value, color? }`, which is the shape an indicator library's per-plot point type has. A plot therefore satisfies `OverlaySpec.points` structurally, with no adapter and no dependency in either direction:
+
+```ts
+const output = myIndicator.calculate(bars, params);
+chart.setOverlays(Object.entries(output.plots).map(([id, points]) => ({
+    id,
+    points,
+    color: output.plotConfigs?.[id]?.color,
+})));
+```
+
+`plotConfigs[].type` is not consulted in this release: an overlay is drawn as a line. An indicator whose plots are histograms wants its own pane rather than the price axis, which is a later phase. `plotConfigs[].lineWidth` is not honoured, for the reason above.
+
+A point may carry its own `color`, which overrides the overlay's colour for that point and lets one overlay change colour along its length — a MACD histogram signed by side, a stop level that flips between bullish and bearish. This is honoured rather than declared-and-ignored, and it costs nothing for the common case: an overlay whose points are all one colour carries no per-point colour array at all, and the renderer expands the single colour itself.
 
 ## Feed v1
 
