@@ -160,6 +160,34 @@
             if (dataCanvas.width !== Math.round(dataCanvas.clientWidth * window.devicePixelRatio)) {
                 throw new Error('WebGL canvas backing resolution does not match DPR.');
             }
+
+            const gapHost = document.createElement('div');
+            gapHost.id = 'closed-session-time-check';
+            gapHost.style.cssText = 'position:fixed;left:20px;top:20px;width:400px;height:240px';
+            document.body.appendChild(gapHost);
+            const gapChart = new Chart(gapHost.id);
+            const friday = Date.UTC(2025, 0, 3, 20);
+            const monday = Date.UTC(2025, 0, 6, 14, 30);
+            const tuesday = Date.UTC(2025, 0, 7, 14, 30);
+            const sessionCandle = (time, price) => ({ time, open: price, high: price + 1, low: price - 1, close: price + 0.5 });
+            gapChart.setData([
+                sessionCandle(friday, 100),
+                sessionCandle(monday, 101),
+                sessionCandle(tuesday, 102),
+            ]);
+            const timeRenderer = gapChart.renderers[2];
+            const fridayLabel = timeRenderer.formatTimeAtIndex(0.4);
+            const mondayLabel = timeRenderer.formatTimeAtIndex(0.6);
+            const axisDateFormat = new Intl.DateTimeFormat(undefined, { month: 'short', day: '2-digit' });
+            if (fridayLabel !== axisDateFormat.format(new Date(friday))) {
+                throw new Error('Time axis interpolated a closed-session timestamp before Monday.');
+            }
+            if (mondayLabel !== axisDateFormat.format(new Date(monday))) {
+                throw new Error('Time axis did not snap to the real Monday candle timestamp.');
+            }
+            gapChart.destroy();
+            gapHost.remove();
+
             if (errors.length > 0) throw new Error(errors.join('\n'));
 
             resultNode.textContent = JSON.stringify({

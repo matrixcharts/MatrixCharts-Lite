@@ -296,23 +296,23 @@ public init(canvas: HTMLCanvasElement, emitter: EventEmitter<ChartEvents>): void
     private formatTimeAtIndex(index: number): string {
         if (this.timeValues.length === 0) return this.formatAxisValue(index);
 
-        const clampedIndex: number = Math.max(0, Math.min(this.timeValues.length - 1, index));
-        const lowerIndex: number = Math.floor(clampedIndex);
-        const upperIndex: number = Math.min(lowerIndex + 1, this.timeValues.length - 1);
-        const fraction: number = clampedIndex - lowerIndex;
-        const timestamp: number = this.timeValues[lowerIndex] +
-            (this.timeValues[upperIndex] - this.timeValues[lowerIndex]) * fraction;
+        const candleIndex: number = this.nearestCandleIndex(index);
+        const timestamp: number = this.timeValues[candleIndex];
         const date: Date = new Date(timestamp);
-        const dataSpan: number = this.timeValues[this.timeValues.length - 1] - this.timeValues[0];
-        const averageInterval: number = dataSpan / Math.max(this.timeValues.length - 1, 1);
         const cssWidth: number = this.canvas.width / this.devicePixelRatio;
-        const visibleSpan: number = averageInterval * cssWidth / this.scaleX;
+        const firstVisibleIndex: number = this.nearestCandleIndex(-this.offsetX / this.scaleX);
+        const lastVisibleIndex: number = this.nearestCandleIndex((cssWidth - this.offsetX) / this.scaleX);
+        const visibleSpan: number = Math.abs(this.timeValues[lastVisibleIndex] - this.timeValues[firstVisibleIndex]);
         const options: Intl.DateTimeFormatOptions = visibleSpan < 2 * 24 * 60 * 60 * 1000
             ? { month: 'short', day: '2-digit', hour: '2-digit', minute: '2-digit' }
             : visibleSpan < 365 * 24 * 60 * 60 * 1000
                 ? { month: 'short', day: '2-digit' }
                 : { year: 'numeric', month: 'short' };
         return new Intl.DateTimeFormat(undefined, options).format(date);
+    }
+
+    private nearestCandleIndex(index: number): number {
+        return Math.max(0, Math.min(this.timeValues.length - 1, Math.round(index)));
     }
 
     private niceStep(targetStep: number): number {

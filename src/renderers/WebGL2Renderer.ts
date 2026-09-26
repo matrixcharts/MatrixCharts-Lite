@@ -276,9 +276,9 @@ export class WebGL2Renderer implements IRenderer {
             if (!Number.isFinite(neighborSpacing)) neighborSpacing = width;
 
             const spacingPixels: number = neighborSpacing * scaleX * this.devicePixelRatio;
-            const maximumBodyPixels: number = Math.max(1, spacingPixels * 0.78);
+            const maximumBodyPixels: number = Math.max(1, spacingPixels * 0.83);
             const minimumBodyPixels: number = Math.min(2, maximumBodyPixels);
-            const requestedBodyPixels: number = width * scaleX * this.devicePixelRatio;
+            const requestedBodyPixels: number = width * scaleX * this.devicePixelRatio * 1.15;
             const bodyWidthData: number = Math.min(
                 maximumBodyPixels,
                 Math.max(minimumBodyPixels, requestedBodyPixels),
@@ -301,16 +301,16 @@ export class WebGL2Renderer implements IRenderer {
             const physicalBottom: number = Math.floor(
                 (bodyBottom * this.currentScale[1] + this.currentOffset[1]) * this.devicePixelRatio + 0.5,
             );
-            const upperPixelCenter: number = physicalTop - 0.5;
-            const lowerPixelCenter: number = physicalBottom + 0.5;
+            const upperPixelCenter: number = physicalTop + 1.5;
+            const lowerPixelCenter: number = physicalBottom - 1.5;
             const upperWickBoundary: number = (
                 upperPixelCenter / this.devicePixelRatio - this.currentOffset[1]
             ) / this.currentScale[1];
             const lowerWickBoundary: number = (
                 lowerPixelCenter / this.devicePixelRatio - this.currentOffset[1]
             ) / this.currentScale[1];
-            const upperWickEnd: number = Math.min(high, Math.max(bodyTop, upperWickBoundary));
-            const lowerWickStart: number = Math.max(low, Math.min(bodyBottom, lowerWickBoundary));
+            const upperWickEnd: number = Math.max(bodyBottom, Math.min(high, upperWickBoundary));
+            const lowerWickStart: number = Math.min(bodyTop, Math.max(low, lowerWickBoundary));
 
             // Upper wick ends above the body; lower wick starts below it to avoid overdraw seams.
             vertices[wickIndex++] = x; vertices[wickIndex++] = high;

@@ -4,6 +4,8 @@
 
 `CandleData.time` is a Unix timestamp in milliseconds (UTC). Use `Date.UTC(...)` or epoch milliseconds from the provider; do not pass local-time strings or seconds. Input series must have strictly increasing timestamps. Corrections are only accepted for the current last candle through `updateLast()`. Historical corrections require an authoritative `replaceData()`/snapshot.
 
+The horizontal coordinate is the candle's ordinal index, not elapsed wall-clock time. Therefore closed intervals with no candles (overnight sessions, weekends, and holidays) are compressed. Axis and crosshair labels snap to real candle timestamps; they do not interpolate timestamps through those closed intervals.
+
 The chart does not apply exchange calendars, daylight-saving rules, session breaks, or synthetic gap candles. Feed adapters/providers must define session boundaries and repair missing bars before sending a snapshot or append. Missing market intervals remain missing; the chart never invents OHLC values.
 
 ## Retention and Memory
