@@ -18,7 +18,7 @@ import {
 } from '../core/coordinates.js';
 import { paneValueAt, type PaneLayout } from '../core/panes.js';
 import { fromScaleSpace, priceTicks, toScaleSpace, type PriceScale, type Tick } from '../core/priceScale.js';
-import { indexAtSlot } from '../core/sessionScale.js';
+import { contiguousRuns, indexAtSlot } from '../core/sessionScale.js';
 import {
     LABEL_PRIORITY,
     layoutLabels,
@@ -782,12 +782,6 @@ public init(canvas: HTMLCanvasElement, emitter: EventEmitter<ChartEvents>): void
         const drawn: PlacedZone[] = zonesWithinBudget(this.zones);
 
         for (const zone of drawn) {
-            const x0: number = zone.extendLeft
-                ? plot.x
-                : indexToCoordinate(viewport, zone.fromIndex) - viewport.scaleX / 2;
-            const x1: number = zone.toIndex === null
-                ? plot.x + plot.width
-                : indexToCoordinate(viewport, zone.toIndex) + viewport.scaleX / 2;
             const yTop: number = this.pricePaneY(zone.top);
             const yBottom: number = this.pricePaneY(zone.bottom);
             if (yTop === yBottom) continue;
@@ -796,46 +790,71 @@ public init(canvas: HTMLCanvasElement, emitter: EventEmitter<ChartEvents>): void
             // partially visible one is right; drawing a whole off-screen one is not.
             if (yTop < plot.y || yBottom > plot.y + plot.height) continue;
 
-            const left: number = Math.max(x0, plot.x);
-            const right: number = Math.min(x1, plot.x + plot.width);
-            if (right <= left) continue;
+            // Split at the breaks inside the zone, so a level laid down on Friday and
+            // still valid on Monday is drawn in both sessions and absent in the gap.
+            // One rectangle spanning the whole thing is a claim that the level was
+            // occupied continuously, including while the market was shut, and that is
+            // the same claim the break exists to stop the chart making.
+            const lastIndex: number = zone.toIndex ?? this.timeValues.length - 1;
+            const runs: Array<[number, number]> = contiguousRuns(
+                this.slotOffsets,
+                zone.fromIndex,
+                lastIndex,
+                this.timeValues.length,
+            );
 
-            this.ctx.save();
-            this.ctx.beginPath();
-            this.ctx.rect(left, Math.min(yTop, yBottom), right - left, Math.abs(yBottom - yTop));
-            this.ctx.clip();
-            if (zone.fill[3] > 0) {
-                this.ctx.fillStyle = this.cssColor(zone.fill);
-                this.ctx.fill();
-            }
-            this.ctx.restore();
+            for (const [runStart, runEnd] of runs) {
+                const x0: number = zone.extendLeft && runStart === runs[0][0]
+                    ? plot.x
+                    : indexToCoordinate(viewport, runStart) - viewport.scaleX / 2;
+                const x1: number = zone.toIndex === null && runEnd === runs[runs.length - 1][1]
+                    ? plot.x + plot.width
+                    : indexToCoordinate(viewport, runEnd) + viewport.scaleX / 2;
 
-            this.ctx.save();
-            this.ctx.strokeStyle = this.cssColor(zone.border);
-            // One CSS pixel, snapped to a device boundary. A 2px border is the
-            // clearest tell that something is a web control rather than an
-            // instrument.
-            this.ctx.lineWidth = 1;
-            if (zone.borderStyle === 'dashed') this.ctx.setLineDash([3, 3]);
-            const leftEdge: number = Math.floor(left) + 0.5;
-            const rightEdge: number = Math.round(right) - 0.5;
-            const topEdge: number = Math.round(Math.min(yTop, yBottom)) + 0.5;
-            const bottomEdge: number = Math.round(Math.max(yTop, yBottom)) - 0.5;
-            this.ctx.beginPath();
-            this.ctx.moveTo(leftEdge, topEdge);
-            this.ctx.lineTo(rightEdge, topEdge);
-            this.ctx.moveTo(leftEdge, bottomEdge);
-            this.ctx.lineTo(rightEdge, bottomEdge);
-            this.ctx.moveTo(leftEdge, topEdge);
-            this.ctx.lineTo(leftEdge, bottomEdge);
-            if (zone.toIndex !== null) this.ctx.lineTo(rightEdge, bottomEdge);
-            this.ctx.stroke();
-            this.ctx.restore();
+                const left: number = Math.max(x0, plot.x);
+                const right: number = Math.min(x1, plot.x + plot.width);
+                if (right <= left) continue;
 
-            if (zone.label.length > 0) {
-                // Above the zone, not inside it: a label inside a 6px zone is
-                // unreadable, which is the same reason zone labels are off by default.
-                this.drawLabel(zone.label, left + 4, topEdge - 8, 'left');
+                this.ctx.save();
+                this.ctx.beginPath();
+                this.ctx.rect(left, Math.min(yTop, yBottom), right - left, Math.abs(yBottom - yTop));
+                this.ctx.clip();
+                if (zone.fill[3] > 0) {
+                    this.ctx.fillStyle = this.cssColor(zone.fill);
+                    this.ctx.fill();
+                }
+                this.ctx.restore();
+
+                this.ctx.save();
+                this.ctx.strokeStyle = this.cssColor(zone.border);
+                // One CSS pixel, snapped to a device boundary. A 2px border is the
+                // clearest tell that something is a web control rather than an
+                // instrument.
+                this.ctx.lineWidth = 1;
+                if (zone.borderStyle === 'dashed') this.ctx.setLineDash([3, 3]);
+                const leftEdge: number = Math.floor(left) + 0.5;
+                const rightEdge: number = Math.round(right) - 0.5;
+                const topEdge: number = Math.round(Math.min(yTop, yBottom)) + 0.5;
+                const bottomEdge: number = Math.round(Math.max(yTop, yBottom)) - 0.5;
+                this.ctx.beginPath();
+                this.ctx.moveTo(leftEdge, topEdge);
+                this.ctx.lineTo(rightEdge, topEdge);
+                this.ctx.moveTo(leftEdge, bottomEdge);
+                this.ctx.lineTo(rightEdge, bottomEdge);
+                this.ctx.moveTo(leftEdge, topEdge);
+                this.ctx.lineTo(leftEdge, bottomEdge);
+                if (zone.toIndex !== null) this.ctx.lineTo(rightEdge, bottomEdge);
+                this.ctx.stroke();
+                this.ctx.restore();
+
+                if (zone.label.length > 0 && runStart === runs[0][0]) {
+                    // Above the zone, not inside it: a label inside a 6px zone is
+                    // unreadable, which is the same reason zone labels are off by
+                    // default. Once per zone rather than once per run, because a zone
+                    // surviving a weekend is one level, and three labels saying so
+                    // reads as three separate zones.
+                    this.drawLabel(zone.label, left + 4, topEdge - 8, 'left');
+                }
             }
         }
     }

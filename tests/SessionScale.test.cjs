@@ -7,6 +7,7 @@ const { test } = require('node:test');
 
 const {
     computeSlotOffsets,
+    contiguousRuns,
     DEFAULT_COLLAPSED_SLOTS,
     findSessionBreaks,
     indexAtSlot,
@@ -240,4 +241,64 @@ test('a timestamp inside a break belongs to the nearer side', () => {
     assert.equal(indexAtTime(times, 0), 0);
     assert.equal(indexAtTime(times, Number.MAX_SAFE_INTEGER), times.length - 1);
     assert.equal(indexAtTime([], offsets, 0), -1);
+});
+
+// A zone laid down before a break and still valid after it must be drawn in both
+// sessions and absent in the gap. One rectangle spanning the whole thing is a claim
+// that the level was occupied continuously, including while the market was shut.
+test('a decoration spanning a break is split at it', () => {
+    // Five bars, one collapsed break before bar 3.
+    const offsets = Float64Array.from([0, 1, 2, 3.5, 4.5, 5.5]);
+    assert.deepEqual(contiguousRuns(offsets, 1, 4, 5), [[1, 2], [3, 4]]);
+});
+
+test('a decoration entirely inside one session is one run', () => {
+    const offsets = Float64Array.from([0, 1, 2, 3.5, 4.5, 5.5]);
+    assert.deepEqual(contiguousRuns(offsets, 0, 2, 5), [[0, 2]]);
+    assert.deepEqual(contiguousRuns(offsets, 3, 4, 5), [[3, 4]]);
+});
+
+test('a decoration spanning several breaks is split at each', () => {
+    // Breaks before bars 2 and 6. Every step is at least one slot: a smaller step
+    // would mean two bars overlapping, which the model cannot produce, and the split
+    // rule keys on a step *greater* than one precisely so ordinary bars are never
+    // treated as a break.
+    const offsets = Float64Array.from([0, 1, 2.5, 3.5, 4.5, 5.5, 7, 8]);
+    assert.deepEqual(contiguousRuns(offsets, 0, 7, 8), [[0, 1], [2, 5], [6, 7]]);
+});
+
+test('an unbroken series is a single run, whatever the range', () => {
+    assert.deepEqual(contiguousRuns(null, 3, 9, 20), [[3, 9]]);
+    // The identity has to be the identity here too, or every zone on an unbroken
+    // chart would gain a border seam it never had.
+    assert.deepEqual(contiguousRuns(null, 0, 0, 1), [[0, 0]]);
+});
+
+test('a collapsed break still splits, because it is wider than a bar', () => {
+    // The step across a half-slot break is 1.5. Treating that as contiguous is what
+    // would leave a decoration painted over the gap it is meant to respect, and it
+    // is the exact case the default mode produces.
+    const offsets = Float64Array.from([0, 1, 2, 3.5]);
+    assert.equal(contiguousRuns(offsets, 0, 3, 4).length, 2);
+});
+
+test('runs are clamped to the series and never inverted', () => {
+    const offsets = Float64Array.from([0, 1, 2, 3.5, 4.5]);
+    // Clamped to bars 0..4, and still split at the break inside that clamped range:
+    // clamping the ends is not the same as forgetting what is between them.
+    assert.deepEqual(contiguousRuns(offsets, -5, 99, 5), [[0, 2], [3, 4]]);
+    assert.deepEqual(contiguousRuns(offsets, 4, 1, 5), []);
+    assert.deepEqual(contiguousRuns(offsets, 0, 3, 0), []);
+});
+
+test('every bar in the requested range appears in exactly one run', () => {
+    const offsets = Float64Array.from([0, 1, 2.5, 3.5, 4.5, 5.5, 7, 8]);
+    const seen = new Set();
+    for (const [start, end] of contiguousRuns(offsets, 0, 7, 8)) {
+        for (let i = start; i <= end; i++) {
+            assert.ok(!seen.has(i), `bar ${i} is in two runs`);
+            seen.add(i);
+        }
+    }
+    assert.equal(seen.size, 8, 'a bar was dropped between two runs');
 });

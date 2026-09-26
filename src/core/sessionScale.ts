@@ -251,6 +251,44 @@ export function indexAtSlot(offsets: Float64Array | null, slot: number): number 
 }
 
 /**
+ * Inclusive `[start, end]` bar runs covering `[fromIndex, toIndex]`, split at every
+ * session break inside it.
+ *
+ * Bars are adjacent in slot space except across a break, where a bar is more than one
+ * slot after its predecessor, so a run ends wherever the slot step exceeds one. With
+ * no table there is one run, which is the whole of the behaviour that shipped before
+ * decorations could span a break.
+ *
+ * Zero-width runs are dropped and the result is clamped to the series, so a caller
+ * can hand over whatever index range it holds without pre-validating it.
+ */
+export function contiguousRuns(
+    offsets: Float64Array | null,
+    fromIndex: number,
+    toIndex: number,
+    count: number,
+): Array<[number, number]> {
+    const first: number = Math.max(0, Math.min(count - 1, Math.trunc(fromIndex)));
+    const last: number = Math.max(0, Math.min(count - 1, Math.trunc(toIndex)));
+    if (count <= 0 || first > last) return [];
+
+    const runs: Array<[number, number]> = [];
+    let start: number = first;
+    for (let index = first; index < last; index++) {
+        const step: number = offsets === null ? 1 : offsets[index + 1] - offsets[index];
+        // Greater than one, not merely greater than zero. A collapsed break is half a
+        // bar, so the step across it is 1.5, and treating that as contiguous is what
+        // would leave a zone painted over the gap it is supposed to respect.
+        if (step > 1) {
+            runs.push([start, index]);
+            start = index + 1;
+        }
+    }
+    runs.push([start, last]);
+    return runs;
+}
+
+/**
  * How many bars have their left edge strictly before `slot`.
  *
  * A separate question from `indexAtSlot`, and the two have different answers at a
