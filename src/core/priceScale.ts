@@ -180,7 +180,16 @@ export function logTicks(minimum: number, maximum: number, targetCount: number):
     // thinning outright, because asking for many labels makes the ladder look
     // inadequate on a range it is labelling perfectly well.
     if (ticks.length < 2) {
-        return linearTicks(minimum, maximum, wanted);
+        // The fallback's values are *prices*, and on a log axis a tick's value has to
+        // be in the space the axis is affine over, which is the log of the price.
+        // Handing the price straight back puts every label and gridline for a
+        // sub-decade range at roughly y = -930000, which is silently off the pane
+        // rather than visibly wrong: the candles draw, the last-price tag places, and
+        // the axis is simply blank.
+        return linearTicks(minimum, maximum, wanted).map((tick) => ({
+            value: Math.log(tick.price),
+            price: tick.price,
+        }));
     }
     return ticks;
 }

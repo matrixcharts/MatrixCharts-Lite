@@ -125,6 +125,36 @@ test('a log tick maps to the same scale-space value as the price does', () => {
     }
 });
 
+test('a tick from the sub-decade fallback is in scale space too', () => {
+    // The same invariant has to survive the fallback, and it is the more likely place
+    // to break it: the fallback is a linear generator, whose values are prices, while
+    // a log axis is affine over logs. Getting this wrong does not throw and does not
+    // look wrong — it puts every label and gridline at a y of about -930000, which is
+    // off the pane, so a sub-decade log chart renders its candles and its last-price
+    // tag with no price axis at all and nothing to indicate why.
+    const ticks = logTicks(104.1857, 108.9104, 8);
+    assert.ok(ticks.length >= 2, 'the fallback produced nothing to check');
+    for (const tick of ticks) {
+        near(tick.value, toScaleSpace(tick.price, 'log'), `fallback tick ${tick.price}`, 1e-12);
+    }
+});
+
+test('sub-decade log tick values sit inside the visible log range', () => {
+    // A weaker, more direct statement of the same thing, in the units the renderer
+    // actually works in: whatever the generator is handed, every value it returns has
+    // to land between the pane's two ends, or the draw loop skips it as off-screen.
+    const minimum = 104.1857;
+    const maximum = 108.9104;
+    const low = toScaleSpace(minimum, 'log');
+    const high = toScaleSpace(maximum, 'log');
+    for (const tick of logTicks(minimum, maximum, 8)) {
+        assert.ok(
+            tick.value >= low - 1e-9 && tick.value <= high + 1e-9,
+            `value ${tick.value} for price ${tick.price} is outside [${low}, ${high}]`,
+        );
+    }
+});
+
 test('a degenerate range produces no ticks rather than spinning', () => {
     // Ascending only: a range that is empty, reversed, or not a number has no ticks.
     // A range containing zero, or spanning negative prices, is fine on a linear axis

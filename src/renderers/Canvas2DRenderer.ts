@@ -458,7 +458,13 @@ public init(canvas: HTMLCanvasElement, emitter: EventEmitter<ChartEvents>): void
             // over. Passing a price here is the mistake this indirection exists to
             // make impossible.
             y: (value: number): number => transform.offsetY + value * transform.scaleY,
-            ticks: priceTicks(low, high, scale, target, isPricePane ? this.options.priceFormat.minMove : 0),
+            ticks: priceTicks(
+                low,
+                high,
+                scale,
+                target,
+                isPricePane ? this.options.priceFormat.minMove : 0,
+            ),
         };
     }
 
