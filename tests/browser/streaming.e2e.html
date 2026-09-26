@@ -874,6 +874,216 @@
             frameChart.destroy();
             frameHost.remove();
 
+            let borderPixelRatiosChecked = 0;
+
+            // --- Axis gutters ---------------------------------------------
+            // Series are confined to the plot rect, and the axis labels live in
+            // the gutters outside it. A bar scrolled part-way past an edge must
+            // be clipped rather than painting over the price labels, which is
+            // only observable by reading both layers.
+            let gutterReport = null;
+            {
+                const layout = optionsChart.options().layout;
+                const gridCanvas = optionsHost.querySelectorAll('canvas')[0];
+                const dataCtx = optionsHost.querySelectorAll('canvas')[1].getContext('webgl2');
+                const gridCtx = gridCanvas.getContext('2d');
+                const priceGutter = layout.priceAxisWidth;
+                const timeGutter = layout.timeAxisHeight;
+                // Everything below is in DEVICE pixels. The canvas backing stores
+                // are sized by the pixel ratio while the options are CSS pixels, so
+                // mixing the two silently halves every threshold at dpr 2.
+                const devW = gridCanvas.width;
+                const devH = gridCanvas.height;
+                const dpr = devW / gridCanvas.clientWidth;
+                const gutterPx = Math.round(priceGutter * dpr);
+                const timePx = Math.round(timeGutter * dpr);
+
+                let pixels = null, bufW = 0, bufH = 0;
+                const originalElements = dataCtx.drawElements.bind(dataCtx);
+                dataCtx.drawElements = (...args) => {
+                    const out = originalElements(...args);
+                    bufW = dataCtx.drawingBufferWidth;
+                    bufH = dataCtx.drawingBufferHeight;
+                    pixels = new Uint8Array(bufW * bufH * 4);
+                    dataCtx.readPixels(0, 0, bufW, bufH, dataCtx.RGBA, dataCtx.UNSIGNED_BYTE, pixels);
+                    return out;
+                };
+                optionsChart.applyOptions({ crosshair: { visible: true } });
+                await waitFrame();
+                dataCtx.drawElements = originalElements;
+                if (!pixels) throw new Error('No data-layer pixels were captured for the gutter check.');
+                if (bufW !== devW || bufH !== devH) {
+                    throw new Error(`Data layer is ${bufW}x${bufH} but the axis layer is ${devW}x${devH}.`);
+                }
+
+                // readPixels is bottom-up; canvas rows run top-down.
+                let leftGutterData = 0, bottomGutterData = 0, totalData = 0;
+                for (let y = 0; y < bufH; y++) {
+                    for (let x = 0; x < bufW; x++) {
+                        if (pixels[(y * bufW + x) * 4 + 3] <= 16) continue;
+                        totalData++;
+                        if (x < gutterPx) leftGutterData++;
+                        if (y < timePx) bottomGutterData++;
+                    }
+                }
+                if (totalData === 0) throw new Error('The chart drew no data to check against the gutters.');
+                if (leftGutterData > 0) {
+                    throw new Error(`${leftGutterData} data pixels are inside the ${priceGutter}px price gutter; series are not clipped to the plot.`);
+                }
+                if (bottomGutterData > 0) {
+                    throw new Error(`${bottomGutterData} data pixels are inside the ${timeGutter}px time gutter; series are not clipped to the plot.`);
+                }
+
+                // Labels must sit in the gutter, not over the plot.
+                const image = gridCtx.getImageData(0, 0, devW, devH).data;
+                const pixelAt = (x, y) => {
+                    const i = (y * devW + x) * 4;
+                    return { r: image[i], g: image[i + 1], b: image[i + 2] };
+                };
+                const background = pixelAt(2, 2);
+                const isInk = (c) => Math.abs(c.r - background.r) + Math.abs(c.g - background.g) + Math.abs(c.b - background.b) > 40;
+
+                let priceLabelInk = 0;
+                for (let y = 4; y < devH - timePx - 2; y++) {
+                    for (let x = 0; x < gutterPx; x++) if (isInk(pixelAt(x, y))) priceLabelInk++;
+                }
+                if (priceLabelInk === 0) throw new Error('No price labels were drawn in the price gutter.');
+
+                let timeLabelInk = 0;
+                for (let y = devH - timePx; y < devH; y++) {
+                    for (let x = 0; x < devW; x++) if (isInk(pixelAt(x, y))) timeLabelInk++;
+                }
+                if (timeLabelInk === 0) throw new Error('No time labels were drawn in the time gutter.');
+
+                gutterReport = {
+                    priceAxisPx: priceLabelInk,
+                    timeAxisPx: timeLabelInk,
+                    dataPixels: totalData,
+                    priceAxisWidth: priceGutter,
+                    timeAxisHeight: timeGutter,
+                    dpr,
+                };
+            }
+
+            // --- Border frame across pixel ratios ---------------------------
+            // The body edges are snapped to whole device pixels, and the snap is
+            // floor(device + 0.5). A body edge sitting on a whole CSS pixel puts
+            // `position * pixelRatio` on a half-integer at every odd-tenth ratio,
+            // where that snap is knife-edge: the two edges of a one-pixel frame
+            // then round independently and the frame comes out two pixels thick
+            // or not at all. This sweeps the ratio so that cannot regress, and
+            // checks the frame is exactly the body perimeter with the body bounds
+            // and footprint untouched by turning it on.
+            {
+                const sweepOptions = {
+                    upColor: '#00ff00', borderUpColor: '#ff0000',
+                    downColor: '#0000ff', borderDownColor: '#ff00ff',
+                    wickVisible: false, borderVisible: true,
+                };
+                // A bearish sibling in blue with a magenta frame sets the vertical
+                // scale and stays separable from the green target at any ratio.
+                const sweepCandles = [
+                    { time: baseTime, open: 140, high: 140, low: 60, close: 60 },
+                    { time: baseTime + 60000, open: 90, high: 110, low: 90, close: 110 },
+                ];
+                const sweepHost = document.createElement('div');
+                sweepHost.style.cssText = 'position:absolute;left:-9999px;width:401px;height:240px';
+                document.body.appendChild(sweepHost);
+
+                const readBody = async (borderVisible) => {
+                    const chart = new Chart(sweepHost, {
+                        theme: 'dark',
+                        candlestick: { ...sweepOptions, borderVisible },
+                    });
+                    chart.setData(sweepCandles);
+                    const canvas = sweepHost.querySelectorAll('canvas')[1];
+                    const gl = canvas.getContext('webgl2');
+                    let result = null;
+                    const draw = gl.drawElements.bind(gl);
+                    gl.drawElements = (...args) => {
+                        const out = draw(...args);
+                        const W = gl.drawingBufferWidth, H = gl.drawingBufferHeight;
+                        const px = new Uint8Array(W * H * 4);
+                        gl.readPixels(0, 0, W, H, gl.RGBA, gl.UNSIGNED_BYTE, px);
+                        const at = (x, y) => {
+                            const i = (y * W + x) * 4;
+                            return { r: px[i], g: px[i + 1], b: px[i + 2], a: px[i + 3] };
+                        };
+                        // The target is the only green fill or red frame on the layer.
+                        const inTarget = (c) => (c.a > 200 && c.r > 200 && c.g < 60 && c.b < 60)
+                            || (c.a > 200 && c.g > 200 && c.r < 60 && c.b < 60);
+                        let minX = Infinity, maxX = -1, minY = Infinity, maxY = -1;
+                        for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
+                            if (!inTarget(at(x, y))) continue;
+                            if (x < minX) minX = x; if (x > maxX) maxX = x;
+                            if (y < minY) minY = y; if (y > maxY) maxY = y;
+                        }
+                        if (maxX < 0) return out;
+                        let frame = 0, interior = 0, footprint = 0;
+                        for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
+                            const c = at(x, y);
+                            if (c.a > 16) footprint++;
+                            if (!(c.a > 200 && c.r > 200 && c.g < 60 && c.b < 60)) continue;
+                            frame++;
+                            if (x > minX && x < maxX && y > minY && y < maxY) interior++;
+                        }
+                        result = {
+                            w: maxX - minX + 1, h: maxY - minY + 1,
+                            frame, interior, footprint,
+                        };
+                        return out;
+                    };
+                    await waitFrame();
+                    chart.applyOptions({ crosshair: { visible: true } });
+                    await waitFrame();
+                    const measured = result;
+                    chart.destroy();
+                    return measured;
+                };
+
+                const ratios = [];
+                for (let r = 1; r <= 3.0001; r += 0.25) ratios.push(Math.round(r * 100) / 100);
+                // The ratios that broke before: odd tenths and a half-steps.
+                ratios.push(1.1, 1.15, 1.3, 1.7, 2.1, 2.3, 2.5, 2.75, 3.5, 4);
+
+                const realRatio = window.devicePixelRatio;
+                const frameFailures = [];
+                let frameChecked = 0;
+                for (const ratio of ratios) {
+                    Object.defineProperty(window, 'devicePixelRatio', { configurable: true, value: ratio });
+                    const on = await readBody(true);
+                    const off = await readBody(false);
+                    if (!on || !off) { frameFailures.push(`ratio ${ratio}: body not found`); continue; }
+                    frameChecked++;
+                    const perimeter = 2 * (on.w + on.h) - 4;
+                    if (on.frame !== perimeter) {
+                        frameFailures.push(
+                            `ratio ${ratio}: frame ${on.frame}px, expected the ${perimeter}px perimeter of ${on.w}x${on.h}`,
+                        );
+                    }
+                    if (on.interior > 0) {
+                        frameFailures.push(`ratio ${ratio}: ${on.interior} frame pixels inside the body`);
+                    }
+                    if (on.w !== off.w || on.h !== off.h) {
+                        frameFailures.push(`ratio ${ratio}: body bounds moved ${off.w}x${off.h} -> ${on.w}x${on.h}`);
+                    }
+                    if (on.footprint !== off.footprint) {
+                        frameFailures.push(`ratio ${ratio}: footprint changed ${off.footprint} -> ${on.footprint}`);
+                    }
+                }
+                Object.defineProperty(window, 'devicePixelRatio', { configurable: true, value: realRatio });
+                sweepHost.remove();
+                if (frameChecked !== ratios.length) {
+                    throw new Error(
+                        `Pixel-ratio sweep measured ${frameChecked} of ${ratios.length} configurations.`,
+                    );
+                }
+                if (frameFailures.length) {
+                    throw new Error(`Border frame is not pixel-exact:\n  ${frameFailures.join('\n  ')}`);
+                }
+                borderPixelRatiosChecked = frameChecked;
+            }
+
             // Grid toggles.
             optionsChart.applyOptions({ grid: { vertLines: false, horzLines: false } });
             assertEqual(optionsChart.options().grid.vertLines, false, 'grid vertLines');
@@ -1098,13 +1308,16 @@
                 throw new Error('Feed chart logical and time ranges disagree at the right edge.');
             }
             // floor at the left edge and ceil at the right edge mean the visible
-            // bars cover the window, plus at most one bar of rounding per side.
-            const feedWidth = document.getElementById('chart').clientWidth;
+            // bars cover the plot, plus at most one bar of rounding per side. The
+            // plot is the canvas less the price gutter, not the canvas itself.
+            const feedLayout = chart.options().layout;
+            const feedPlotWidth = document.getElementById('chart').clientWidth - feedLayout.priceAxisWidth;
             const feedSpan = (feedRange.to - feedRange.from) * chart.getBarSpacing();
-            if (feedSpan < feedWidth || feedSpan >= feedWidth + 2 * chart.getBarSpacing()) {
+            if (feedSpan < feedPlotWidth || feedSpan >= feedPlotWidth + 2 * chart.getBarSpacing()) {
                 throw new Error(
-                    `Feed chart visible range spans ${feedSpan}px of a ${feedWidth}px window `
-                    + `at ${chart.getBarSpacing()}px per bar.`,
+                    `Feed chart visible range spans ${feedSpan}px of a ${feedPlotWidth}px plot `
+                    + `(canvas ${document.getElementById('chart').clientWidth}px less a `
+                    + `${feedLayout.priceAxisWidth}px price gutter) at ${chart.getBarSpacing()}px per bar.`,
                 );
             }
 
@@ -1124,6 +1337,8 @@
                 dpr: window.devicePixelRatio,
                 filledBodyPixels: mainPixels.bodyPixels,
                 widestBodyPixelRun: mainPixels.widestRun,
+                borderPixelRatios: borderPixelRatiosChecked,
+                gutters: gutterReport,
                 barSpacing: chart.getBarSpacing(),
                 visibleLogicalRange: feedRange,
                 visibleTimeRange: {

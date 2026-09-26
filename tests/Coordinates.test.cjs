@@ -10,25 +10,46 @@ const {
     clampCandleIndex,
     coordinateToIndex,
     coordinateToPrice,
+    fullPlotRect,
     indexToCoordinate,
     isAtLiveEdgeOffset,
     isSameVisibleRange,
     liveEdgeOffsetX,
     nearestCandleIndex,
     nearestCandleIndexByTime,
+    plotCentreX,
+    plotRight,
     priceToCoordinate,
     visibleLogicalRange,
     visiblePriceRange,
 } = require('../.test-build/core/coordinates.js');
 
-const viewport = (overrides = {}) => ({
-    offsetX: 0,
-    offsetY: 0,
-    scaleX: 8,
-    scaleY: -2,
+// The plot rect defaults to the canvas and follows any cssWidth/cssHeight
+// override, because that is the chart's default layout: nothing is reserved for
+// the axes. A test that narrows the canvas must narrow the plot with it, or it is
+// no longer describing a chart that exists.
+const viewport = (overrides = {}) => {
+    const base = {
+        offsetX: 0,
+        offsetY: 0,
+        scaleX: 8,
+        scaleY: -2,
+        cssWidth: 800,
+        cssHeight: 500,
+        ...overrides,
+    };
+    return {
+        ...base,
+        plot: overrides.plot ?? { x: 0, y: 0, width: base.cssWidth, height: base.cssHeight },
+    };
+};
+
+/** A viewport whose plot is inset, as it would be with axis gutters reserved. */
+const insetViewport = (overrides = {}) => viewport({
     cssWidth: 800,
     cssHeight: 500,
     ...overrides,
+    plot: overrides.plot ?? { x: 70, y: 12, width: 730, height: 470 },
 });
 
 const closeTo = (actual, expected, message) => {
@@ -56,6 +77,75 @@ test('price and coordinate conversions invert each other', () => {
     for (const y of [0, 42.25, 499, 900]) {
         closeTo(priceToCoordinate(view, coordinateToPrice(view, y)), y, `y ${y}`);
     }
+});
+
+test('the default plot rect is the whole canvas', () => {
+    // The geometry here is layout-independent: it is the consumer functions that
+    // must read the plot rect rather than the canvas. fullPlotRect is the
+    // no-gutter case, kept as a named constructor for tests and for callers that
+    // genuinely want an un-inset rect.
+    assert.deepEqual(fullPlotRect(800, 500), { x: 0, y: 0, width: 800, height: 500 });
+    const view = viewport();
+    assert.equal(plotRight(view), view.cssWidth);
+    assert.equal(plotCentreX(view), view.cssWidth / 2);
+    assert.deepEqual(visibleLogicalRange(view, 100), { from: 0, to: 100 });
+    // offsetY 1000 at -2 px per unit puts price 500 at the top and 250 at the bottom.
+    assert.deepEqual(visiblePriceRange(viewport({ offsetY: 1000 })), [250, 500]);
+    assert.equal(liveEdgeOffsetX(plotRight(view), 10, 8), 800 - 9.5 * 8);
+});
+
+test('an inset plot rect narrows the visible range without moving the transform', () => {
+    // A left gutter hides bars, but the data transform stays anchored to the same
+    // offsetX/scaleX: the plot rect says what is visible, not where data lives.
+    const plain = viewport({ offsetX: 0, scaleX: 10 });
+    const inset = insetViewport({ offsetX: 0, scaleX: 10 });
+
+    assert.deepEqual(visibleLogicalRange(plain, 200), { from: 0, to: 80 });
+    // Plot x 70 at 10px per bar starts at index 7; plot right 800 still ends at 80.
+    assert.deepEqual(visibleLogicalRange(inset, 200), { from: 7, to: 80 });
+
+    assert.equal(indexToCoordinate(plain, 10), indexToCoordinate(inset, 10));
+    assert.equal(indexToCoordinate(inset, 10), 100);
+    assert.equal(nearestCandleIndex(inset, 100, 200), 10);
+});
+
+test('an inset plot rect bounds the visible price range to the plot', () => {
+    const plain = viewport({ offsetY: 1000, scaleY: -2 });
+    const inset = insetViewport({ offsetY: 1000, scaleY: -2 });
+
+    // Plot top is 12, bottom is 12 + 470 = 482.
+    assert.deepEqual(visiblePriceRange(inset), [259, 494]);
+    // The canvas edges lie outside the plot, so they are not the visible bounds.
+    assert.deepEqual(visiblePriceRange(plain), [250, 500]);
+    // price 400 still maps to the same y: the transform did not move.
+    assert.equal(priceToCoordinate(inset, 400), priceToCoordinate(plain, 400));
+});
+
+test('an empty or degenerate plot rect reports empty ranges rather than throwing', () => {
+    const collapsed = viewport({ plot: { x: 0, y: 0, width: 0, height: 0 } });
+    assert.deepEqual(visibleLogicalRange(collapsed, 50), { from: 0, to: 0 });
+    // A zero-height plot divides to -0. That is not an error, so the assertion
+    // checks magnitude rather than the sign of zero.
+    const collapsedRange = visiblePriceRange(collapsed);
+    assert.equal(collapsedRange.length, 2);
+    assert.ok(Math.abs(collapsedRange[0]) === 0, `low was ${collapsedRange[0]}`);
+    assert.ok(Math.abs(collapsedRange[1]) === 0, `high was ${collapsedRange[1]}`);
+});
+
+test('the live edge is an absolute plot edge, not a width', () => {
+    // A left gutter shifts the plot right, so the live edge has to move with it.
+    // Passing the plot width instead of its right edge would park the newest bar
+    // 70px short, which is the bug this pins.
+    const scaleX = 8;
+    const count = 20;
+    const right = 70 + 730;
+    const offset = liveEdgeOffsetX(right, count, scaleX);
+    assert.equal(indexToCoordinate(insetViewport({ offsetX: offset, scaleX }), count - 1), right - 4);
+    assert.equal(isAtLiveEdgeOffset(offset, scaleX, count, right), true);
+    // The stale width-based value is genuinely short, and is not at the edge.
+    const widthBased = liveEdgeOffsetX(730, count, scaleX);
+    assert.equal(indexToCoordinate(insetViewport({ offsetX: widthBased, scaleX }), count - 1), right - 4 - 70);
+    assert.equal(isAtLiveEdgeOffset(widthBased, scaleX, count, right), false);
 });
 
 test('conversions are identical at dpr 1 and dpr 2', () => {
@@ -281,7 +371,10 @@ test('panning inside one bar can leave the visible range untouched', () => {
     // 8px bars in a 128px window. The visible set only changes when a pan moves
     // an edge across a bar boundary, which is sticky because the left edge floors
     // and the right edge ceils. Between boundaries a multi-pixel drag is silent.
-    const viewport = (offsetX) => ({ offsetX, offsetY: 0, scaleX: 8, scaleY: -2, cssWidth: 128, cssHeight: 400 });
+    const viewport = (offsetX) => ({
+        offsetX, offsetY: 0, scaleX: 8, scaleY: -2, cssWidth: 128, cssHeight: 400,
+        plot: { x: 0, y: 0, width: 128, height: 400 },
+    });
     assert.deepEqual(visibleLogicalRange(viewport(-35), 100), { from: 4, to: 21 });
     assert.deepEqual(visibleLogicalRange(viewport(-38), 100), { from: 4, to: 21 });
 

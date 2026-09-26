@@ -215,6 +215,8 @@ chart.setTheme(theme: ChartTheme): void   // same as applyOptions({ theme })
 | `priceFormat.minMove` | positive number | `0.01` |
 | `layout.background` | CSS colour | theme preset |
 | `layout.textColor` | CSS colour | theme preset |
+| `layout.priceAxisWidth` | non-negative number (additive in 1.x) | `78` |
+| `layout.timeAxisHeight` | non-negative number (additive in 1.x) | `22` |
 | `grid.vertLines` / `grid.horzLines` | boolean | `true` |
 | `grid.color` | CSS colour, alpha honoured | theme preset |
 | `crosshair.visible` | boolean | `true` |
@@ -249,9 +251,17 @@ chart.applyOptions({ priceFormat: { precision: 0, minMove: 1 } });
 
 **Time labels default to UTC** so they do not depend on the viewer's zone. `locale` and `timeZone` feed `Intl.DateTimeFormat` and `Intl.NumberFormat`; price labels use `precision` and locale separators.
 
+**The plot is the canvas less two reserved gutters.** `layout.priceAxisWidth` (default 78) is reserved on the left for price labels and `layout.timeAxisHeight` (default 22) along the bottom for time labels. Both are CSS pixels, both are non-negative, and zero restores the old behaviour of drawing labels over the data. Every part of the geometry derives from one plot rect: the visible logical and time ranges, the live edge, the zoom anchor, the vertical fit, the grid lines, the axis frame, and the crosshair rules. Nothing measures the canvas directly to decide what is visible.
+
+Series are **clipped to the plot rect** with a scissor box, so a bar scrolled part-way past an edge is cut at the plot boundary instead of painting over the price labels. Clipping is applied per draw and cleared afterwards, and the clear runs with clipping off so the gutters cannot retain stale pixels.
+
+The gutter widths are a fixed size rather than measured from the label text, because the widest label depends on the visible price range, which depends on the plot height, which depends on the gutter. The default fits a separated price of up to six digits with two decimals; widen `priceAxisWidth` for instruments quoted with more digits.
+
 **`candlestick.wickVisible: false`** skips generating and drawing the wick segments. **`borderVisible: true`** draws a 1 device-pixel frame inside the body outline and insets the fill to match, in the same indexed pass with no extra shader or draw call. The body is never grown, so the gutter between bars is unchanged, and the frame is skipped on bodies too small to hold it.
 
 The border is a frame of four strips, never a quad underneath the body. That matters for translucent fills: the fill always composites against the plot background, never against the border colour, so `borderVisible` cannot tint the interior of a candle. Verified by construction, since a body covered by the border quad would blend to the border's hue wherever the fill has alpha.
+
+The frame is exactly one device pixel at any `devicePixelRatio`. Every body edge is resolved to a whole device pixel on the CPU and then emitted as the data value whose device position is that exact pixel, so the shader's `floor(device + 0.5)` snap is never near a rounding boundary. This is not a formality: a body edge landing on a whole CSS pixel puts `position * pixelRatio` on a half-integer at every odd-tenth ratio, where that snap is knife-edge, and the two edges of a one-pixel frame then round independently and produce a two-pixel or zero-pixel frame. The row is computed in `float32` to match the uniforms the GPU actually receives, because a `pixelRatio` such as `2.3` is not representable in `float32` and a row chosen in double precision can be the row the body was never drawn on.
 
 Recolouring reaches the GPU without touching the data: `applyOptions` repaints from the existing vertex buffers, and `getCandleCount()` is unchanged.
 

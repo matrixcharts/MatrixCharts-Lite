@@ -1,9 +1,17 @@
 // src/core/EventEmitter.ts
 import type { CandleData } from './CandleData.js';
+import type { PlotRect } from './coordinates.js';
 import type { ResolvedChartOptions } from './options.js';
 
 export interface ChartEvents {
-    'viewport': { offsetX: number; offsetY: number; scaleX: number; scaleY: number };
+    'viewport': {
+        offsetX: number;
+        offsetY: number;
+        scaleX: number;
+        scaleY: number;
+        /** Region series occupy, in CSS pixels relative to the canvas. */
+        plot: PlotRect;
+    };
     /**
      * Retained candle timestamps, used by the axis renderer to label ticks. The
      * candle buffer itself is passed straight to the WebGL renderer rather than

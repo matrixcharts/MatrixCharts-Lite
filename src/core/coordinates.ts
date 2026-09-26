@@ -7,6 +7,40 @@
 // backing store; every conversion below is CSS-pixel to CSS-pixel, so results
 // are identical at dpr 1, 2, or 3.
 
+/**
+ * The rectangle series are drawn into, in CSS pixels relative to the canvas.
+ *
+ * The container size and the plot rect are deliberately separate. `cssWidth` and
+ * `cssHeight` describe the canvas, which is also where axes, labels, and the
+ * crosshair live; the plot rect describes the part of it that holds data. They
+ * are equal only while the chart reserves nothing for the axes, which is the
+ * current behaviour, so anything that must not spill into the axis gutters has
+ * to read the plot rect rather than the canvas.
+ */
+export interface PlotRect {
+    /** Left edge, CSS pixels from the canvas left. */
+    x: number;
+    /** Top edge, CSS pixels from the canvas top. */
+    y: number;
+    width: number;
+    height: number;
+}
+
+/** A plot rect covering the whole canvas, ignoring any axis gutters. */
+export function fullPlotRect(cssWidth: number, cssHeight: number): PlotRect {
+    return { x: 0, y: 0, width: cssWidth, height: cssHeight };
+}
+
+/** Right edge of the plot area, in canvas coordinates. */
+export function plotRight(viewport: ChartViewport): number {
+    return viewport.plot.x + viewport.plot.width;
+}
+
+/** Horizontal centre of the plot area, the anchor for zoom and data reloads. */
+export function plotCentreX(viewport: ChartViewport): number {
+    return viewport.plot.x + viewport.plot.width / 2;
+}
+
 /** Spherical transform of the plot area, all values in CSS pixels. */
 export interface ChartViewport {
     /** Screen x of logical index 0. */
@@ -21,6 +55,8 @@ export interface ChartViewport {
     cssWidth: number;
     /** Container height in CSS pixels. */
     cssHeight: number;
+    /** Region series occupy, inside the container. */
+    plot: PlotRect;
 }
 
 /**
@@ -88,8 +124,11 @@ export function nearestCandleIndex(
 export function visibleLogicalRange(viewport: ChartViewport, candleCount: number): LogicalRange {
     if (candleCount <= 0) return { from: 0, to: 0 };
 
-    const firstPartial: number = coordinateToIndex(viewport, 0);
-    const lastPartial: number = coordinateToIndex(viewport, viewport.cssWidth);
+    const firstPartial: number = coordinateToIndex(viewport, viewport.plot.x);
+    const lastPartial: number = coordinateToIndex(
+        viewport,
+        viewport.plot.x + viewport.plot.width,
+    );
     const from: number = Math.max(0, Math.min(candleCount, Math.floor(firstPartial)));
     const to: number = Math.max(from, Math.min(candleCount, Math.ceil(lastPartial)));
     return { from, to };
@@ -97,8 +136,11 @@ export function visibleLogicalRange(viewport: ChartViewport, candleCount: number
 
 /** Inclusive price bounds of the plot area, low first. */
 export function visiblePriceRange(viewport: ChartViewport): [number, number] {
-    const priceAtTop: number = coordinateToPrice(viewport, 0);
-    const priceAtBottom: number = coordinateToPrice(viewport, viewport.cssHeight);
+    const priceAtTop: number = coordinateToPrice(viewport, viewport.plot.y);
+    const priceAtBottom: number = coordinateToPrice(
+        viewport,
+        viewport.plot.y + viewport.plot.height,
+    );
     return [Math.min(priceAtTop, priceAtBottom), Math.max(priceAtTop, priceAtBottom)];
 }
 
@@ -128,9 +170,14 @@ export function isSameVisibleRange(
     return Math.abs(previous.barSpacing - barSpacing) < BAR_SPACING_EPSILON;
 }
 
-/** Screen x that parks the newest candle at the live edge. */
-export function liveEdgeOffsetX(cssWidth: number, candleCount: number, scaleX: number): number {
-    return cssWidth - (candleCount - LIVE_EDGE_INSET) * scaleX;
+/**
+ * Screen x that parks the newest candle at the live edge. The edge is the right
+ * side of the plot rect, not of the canvas, and it is an absolute coordinate
+ * rather than a width: a left gutter shifts the whole plot right, so passing a
+ * width here would park the newest bar that many pixels short of the edge.
+ */
+export function liveEdgeOffsetX(plotRightEdge: number, candleCount: number, scaleX: number): number {
+    return plotRightEdge - (candleCount - LIVE_EDGE_INSET) * scaleX;
 }
 
 /** Whether a viewport is close enough to the live edge to keep following it. */
@@ -138,12 +185,12 @@ export function isAtLiveEdgeOffset(
     offsetX: number,
     scaleX: number,
     candleCount: number,
-    cssWidth: number,
+    plotRightEdge: number,
 ): boolean {
     if (candleCount === 0) return true;
     const lastCandleX: number = offsetX + (candleCount - 1) * scaleX;
     const tolerance: number = Math.max(24, scaleX * 1.5);
-    return lastCandleX >= cssWidth - tolerance && lastCandleX <= cssWidth + tolerance;
+    return lastCandleX >= plotRightEdge - tolerance && lastCandleX <= plotRightEdge + tolerance;
 }
 
 /**

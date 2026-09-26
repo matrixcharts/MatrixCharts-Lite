@@ -172,6 +172,42 @@ test('numeric ranges are validated', () => {
     throws(() => resolveOptions({ priceFormat: { minMove: -1 } }), /minMove/);
 });
 
+test('axis gutter sizes are validated', () => {
+    // A negative gutter would invert the plot rect and flip the price axis; a
+    // non-finite one would collapse it. Both are rejected at the option boundary
+    // rather than reaching the geometry.
+    throws(() => resolveOptions({ layout: { priceAxisWidth: -1 } }), /priceAxisWidth/);
+    throws(() => resolveOptions({ layout: { priceAxisWidth: Number.NaN } }), /priceAxisWidth/);
+    throws(() => resolveOptions({ layout: { priceAxisWidth: Infinity } }), /priceAxisWidth/);
+    throws(() => resolveOptions({ layout: { priceAxisWidth: '80' } }), /priceAxisWidth/);
+    throws(() => resolveOptions({ layout: { timeAxisHeight: -1 } }), /timeAxisHeight/);
+    throws(() => resolveOptions({ layout: { timeAxisHeight: Number.NaN } }), /timeAxisHeight/);
+    // Zero is allowed: it means "reserve nothing", which is the old behaviour.
+    assert.equal(resolveOptions({ layout: { priceAxisWidth: 0 } }).layout.priceAxisWidth, 0);
+    assert.equal(resolveOptions({ layout: { timeAxisHeight: 0 } }).layout.timeAxisHeight, 0);
+});
+
+test('gutter sizes default per theme and are not reseeded by a theme change', () => {
+    // They are layout metrics, not colours: switching theme must not resize the
+    // plot out from under an integrator.
+    const dark = resolveOptions({ theme: 'dark' });
+    const paper = resolveOptions({ theme: 'paper' });
+    assert.equal(dark.layout.priceAxisWidth, paper.layout.priceAxisWidth);
+    assert.equal(dark.layout.timeAxisHeight, paper.layout.timeAxisHeight);
+    assert.ok(dark.layout.priceAxisWidth > 0);
+    assert.ok(dark.layout.timeAxisHeight > 0);
+
+    // An explicit width survives a later theme change, like every other override.
+    let explicit = mergeOptionPartials({}, { layout: { priceAxisWidth: 120 } });
+    assert.equal(resolveOptions(explicit).layout.priceAxisWidth, 120);
+    explicit = mergeOptionPartials(explicit, { theme: 'paper' });
+    const recoloured = resolveOptions(explicit);
+    assert.equal(recoloured.layout.priceAxisWidth, 120, 'explicit width survives the theme change');
+    assert.equal(recoloured.layout.background, themeDefaults('paper').layout.background);
+    // Only the one field was overridden; the sibling metric keeps its default.
+    assert.equal(recoloured.layout.timeAxisHeight, paper.layout.timeAxisHeight);
+});
+
 test('minMove finer than precision is rejected', () => {
     throws(
         () => resolveOptions({ priceFormat: { precision: 2, minMove: 0.0001 } }),

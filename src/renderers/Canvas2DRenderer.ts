@@ -9,6 +9,7 @@ import {
 } from '../core/options.js';
 import {
     type ChartViewport,
+    type PlotRect,
     clampCandleIndex,
     coordinateToIndex,
     coordinateToPrice,
@@ -16,6 +17,12 @@ import {
     priceToCoordinate,
     visiblePriceRange,
 } from '../core/coordinates.js';
+
+/**
+ * Vertical centre of a time-axis label, measured from the plot's bottom edge. The
+ * default time gutter is 22px, so 13px puts the text roughly centred in it.
+ */
+const TIME_LABEL_OFFSET_Y = 13;
 
 export class Canvas2DRenderer implements IRenderer {
     private canvas!: HTMLCanvasElement;
@@ -26,6 +33,8 @@ export class Canvas2DRenderer implements IRenderer {
     private offsetY: number = 0;
     private scaleX: number = 1;
     private scaleY: number = 1;
+    /** Region series occupy. Equals the canvas until the axes claim space. */
+    private plot: PlotRect = { x: 0, y: 0, width: 0, height: 0 };
     private devicePixelRatio: number = 1;
     private crosshairX: number | null = null;
     private crosshairY: number | null = null;
@@ -73,6 +82,7 @@ public init(canvas: HTMLCanvasElement, emitter: EventEmitter<ChartEvents>): void
         this.offsetY = payload.offsetY;
         this.scaleX = payload.scaleX;
         this.scaleY = payload.scaleY;
+        this.plot = payload.plot;
     };
 
     private handleOptionsEvent = (options: ResolvedChartOptions): void => {
@@ -116,13 +126,18 @@ public init(canvas: HTMLCanvasElement, emitter: EventEmitter<ChartEvents>): void
     };
 
     private get viewport(): ChartViewport {
+        const cssWidth: number = this.canvas.width / this.devicePixelRatio;
+        const cssHeight: number = this.canvas.height / this.devicePixelRatio;
         return {
             offsetX: this.offsetX,
             offsetY: this.offsetY,
             scaleX: this.scaleX,
             scaleY: this.scaleY,
-            cssWidth: this.canvas.width / this.devicePixelRatio,
-            cssHeight: this.canvas.height / this.devicePixelRatio,
+            cssWidth,
+            cssHeight,
+            plot: this.plot.width > 0 && this.plot.height > 0
+                ? this.plot
+                : { x: 0, y: 0, width: cssWidth, height: cssHeight },
         };
     }
 
@@ -149,8 +164,11 @@ public init(canvas: HTMLCanvasElement, emitter: EventEmitter<ChartEvents>): void
         }
 
         const viewport: ChartViewport = this.viewport;
-        const cssWidth: number = viewport.cssWidth;
-        const cssHeight: number = viewport.cssHeight;
+        // Grid lines are bounded by the plot rect, not the canvas, so reserving an
+        // axis gutter later cannot leave grid lines running under the labels.
+        const plot: PlotRect = viewport.plot;
+        const plotRight: number = plot.x + plot.width;
+        const plotBottom: number = plot.y + plot.height;
 
         this.ctx.save();
         this.ctx.strokeStyle = this.options.grid.color;
@@ -159,28 +177,30 @@ public init(canvas: HTMLCanvasElement, emitter: EventEmitter<ChartEvents>): void
 
         const priceTickStep: number = this.priceTickStep();
         const timeTickStep: number = this.niceStep(96 / this.scaleX);
-        const firstTimeTick: number = Math.ceil(coordinateToIndex(viewport, 0) / timeTickStep) * timeTickStep;
+        const firstTimeTick: number = Math.ceil(
+            coordinateToIndex(viewport, plot.x) / timeTickStep,
+        ) * timeTickStep;
 
         if (this.options.grid.horzLines) {
             const [minimumVisiblePrice, maximumVisiblePrice]: [number, number] = visiblePriceRange(viewport);
             const firstPriceTick: number = Math.ceil(minimumVisiblePrice / priceTickStep) * priceTickStep;
             for (let price: number = firstPriceTick; price <= maximumVisiblePrice + priceTickStep * 1e-9; price += priceTickStep) {
                 const y: number = priceToCoordinate(viewport, price);
-                if (y < 0 || y > cssHeight) continue;
+                if (y < plot.y || y > plotBottom) continue;
                 const crispY: number = Math.floor(y) + 0.5;
-                this.ctx.moveTo(0, crispY);
-                this.ctx.lineTo(cssWidth, crispY);
+                this.ctx.moveTo(plot.x, crispY);
+                this.ctx.lineTo(plotRight, crispY);
             }
         }
 
         if (this.options.grid.vertLines) {
             for (let time: number = firstTimeTick; ; time += timeTickStep) {
                 const x: number = indexToCoordinate(viewport, time);
-                if (x > cssWidth) break;
-                if (x < 0) continue;
+                if (x > plotRight) break;
+                if (x < plot.x) continue;
                 const crispX: number = Math.floor(x) + 0.5;
-                this.ctx.moveTo(crispX, 0);
-                this.ctx.lineTo(crispX, cssHeight);
+                this.ctx.moveTo(crispX, plot.y);
+                this.ctx.lineTo(crispX, plotBottom);
             }
         }
 
@@ -204,35 +224,41 @@ public init(canvas: HTMLCanvasElement, emitter: EventEmitter<ChartEvents>): void
         if (this.crosshairX === null || this.crosshairY === null) return;
 
         const viewport: ChartViewport = this.viewport;
-        const cssWidth: number = viewport.cssWidth;
-        const cssHeight: number = viewport.cssHeight;
+        // The rules span the plot; the tags annotating them are drawn into the
+        // gutters by renderCrosshairReadout.
+        const plot: PlotRect = viewport.plot;
 
         this.ctx.save();
         this.ctx.strokeStyle = this.options.crosshair.color;
         this.ctx.lineWidth = 1;
         this.ctx.setLineDash([4, 4]);
         this.ctx.beginPath();
-        this.ctx.moveTo(this.crosshairX + 0.5, 0);
-        this.ctx.lineTo(this.crosshairX + 0.5, cssHeight);
-        this.ctx.moveTo(0, this.crosshairY + 0.5);
-        this.ctx.lineTo(cssWidth, this.crosshairY + 0.5);
+        this.ctx.moveTo(this.crosshairX + 0.5, plot.y);
+        this.ctx.lineTo(this.crosshairX + 0.5, plot.y + plot.height);
+        this.ctx.moveTo(plot.x, this.crosshairY + 0.5);
+        this.ctx.lineTo(plot.x + plot.width, this.crosshairY + 0.5);
         this.ctx.stroke();
         this.ctx.restore();
-        this.renderCrosshairReadout(viewport, cssWidth, cssHeight);
+        this.renderCrosshairReadout(viewport);
     }
 
     /**
      * Draws the OHLC panel and the axis price/time tags for the crosshair. The
      * candle comes from Chart, so it is the exact bar the pointer resolved to
      * rather than an aggregate bucket from the visible pyramid slice.
+     *
+     * The panel sits just inside the plot's top-left corner so it never covers
+     * the price gutter, and both axis tags sit in the gutters beside the rule
+     * they annotate, matching where the static axis labels are drawn.
      */
-    private renderCrosshairReadout(viewport: ChartViewport, cssWidth: number, cssHeight: number): void {
+    private renderCrosshairReadout(viewport: ChartViewport): void {
         if (this.crosshairX === null || this.crosshairY === null) return;
 
+        const plot: PlotRect = viewport.plot;
         const candle: CandleData | null = this.crosshairCandle;
         if (candle) {
-            const panelX: number = 10;
-            const panelY: number = 10;
+            const panelX: number = plot.x + 10;
+            const panelY: number = plot.y + 10;
             const panelWidth: number = 158;
             const panelHeight: number = 58;
             const open: number = candle.open;
@@ -263,22 +289,43 @@ public init(canvas: HTMLCanvasElement, emitter: EventEmitter<ChartEvents>): void
             this.ctx.restore();
         }
 
+        // Both tags annotate a rule that is drawn across the plot, so they belong
+        // in the gutter beside that rule: the price tag in the price gutter, the
+        // time tag in the time gutter.
         const currentPrice: number = coordinateToPrice(viewport, this.crosshairY);
-        this.drawLabel(this.formatAxisValue(currentPrice), cssWidth - 6, this.crosshairY, 'right');
+        this.drawLabel(
+            this.formatAxisValue(currentPrice),
+            plot.x - 6,
+            this.crosshairY,
+            'right',
+        );
         const timeTag: string = this.crosshairTime === null
             ? this.formatAxisValue(this.crosshairX)
             : this.formatTimeAtTimestamp(this.crosshairTime);
-        this.drawLabel(timeTag, this.crosshairX + 6, cssHeight - 10, 'left');
+        this.drawLabel(
+            timeTag,
+            this.crosshairX,
+            plot.y + plot.height + TIME_LABEL_OFFSET_Y,
+            'center',
+        );
     }
 
+    /**
+     * Draws the plot frame and the axis labels. Labels live in the reserved
+     * gutters rather than over the data, so no price or time ever sits on top of
+     * a candle: prices are right-aligned against the plot's left edge inside the
+     * price gutter, times sit below the plot's bottom edge inside the time
+     * gutter.
+     */
     private renderAxes(
         viewport: ChartViewport,
         priceTickStep: number,
         timeTickStep: number,
         firstTimeTick: number,
     ): void {
-        const cssWidth: number = viewport.cssWidth;
-        const cssHeight: number = viewport.cssHeight;
+        const plot: PlotRect = viewport.plot;
+        const plotRight: number = plot.x + plot.width;
+        const plotBottom: number = plot.y + plot.height;
         this.ctx.save();
         this.ctx.font = '11px sans-serif';
         this.ctx.textBaseline = 'middle';
@@ -287,23 +334,25 @@ public init(canvas: HTMLCanvasElement, emitter: EventEmitter<ChartEvents>): void
         this.ctx.lineWidth = 1;
 
         this.ctx.beginPath();
-        this.ctx.moveTo(0.5, 0);
-        this.ctx.lineTo(0.5, cssHeight);
-        this.ctx.moveTo(0, cssHeight - 0.5);
-        this.ctx.lineTo(cssWidth, cssHeight - 0.5);
+        this.ctx.moveTo(plot.x + 0.5, plot.y);
+        this.ctx.lineTo(plot.x + 0.5, plotBottom);
+        this.ctx.moveTo(plot.x, plotBottom - 0.5);
+        this.ctx.lineTo(plotRight, plotBottom - 0.5);
         this.ctx.stroke();
 
         const [minimumVisiblePrice, maximumVisiblePrice]: [number, number] = visiblePriceRange(viewport);
         const firstPriceTick: number = Math.ceil(minimumVisiblePrice / priceTickStep) * priceTickStep;
         for (let price: number = firstPriceTick; price <= maximumVisiblePrice + priceTickStep * 1e-9; price += priceTickStep) {
             const y: number = priceToCoordinate(viewport, price);
-            if (y >= 0 && y <= cssHeight) this.drawLabel(this.formatAxisValue(price), 6, y, 'left');
+            if (y < plot.y || y > plotBottom) continue;
+            this.drawLabel(this.formatAxisValue(price), plot.x - 6, y, 'right');
         }
 
         for (let time: number = firstTimeTick; ; time += timeTickStep) {
             const x: number = indexToCoordinate(viewport, time);
-            if (x > cssWidth) break;
-            if (x >= 0) this.drawLabel(this.formatTimeAtIndex(time), x + 4, cssHeight - 10, 'left');
+            if (x > plotRight) break;
+            if (x < plot.x) continue;
+            this.drawLabel(this.formatTimeAtIndex(time), x, plotBottom + TIME_LABEL_OFFSET_Y, 'center');
         }
 
         this.ctx.restore();
@@ -357,8 +406,13 @@ public init(canvas: HTMLCanvasElement, emitter: EventEmitter<ChartEvents>): void
         const { locale, timeZone } = this.options;
         // Detail level depends on the visible span, so cache per span bucket.
         const viewport: ChartViewport = this.viewport;
-        const firstVisibleIndex: number = this.nearestCandleIndex(coordinateToIndex(viewport, 0));
-        const lastVisibleIndex: number = this.nearestCandleIndex(coordinateToIndex(viewport, viewport.cssWidth));
+        const plotRight: number = viewport.plot.x + viewport.plot.width;
+        const firstVisibleIndex: number = this.nearestCandleIndex(
+            coordinateToIndex(viewport, viewport.plot.x),
+        );
+        const lastVisibleIndex: number = this.nearestCandleIndex(
+            coordinateToIndex(viewport, plotRight),
+        );
         const visibleSpan: number = Math.abs(this.timeValues[lastVisibleIndex] - this.timeValues[firstVisibleIndex]);
         const detail: 'minute' | 'day' | 'month' = visibleSpan < 2 * 24 * 60 * 60 * 1000
             ? 'minute'

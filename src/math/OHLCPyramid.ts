@@ -1,4 +1,13 @@
 import { LTTBDownsampler } from './LTTBDownsampler.js';
+import {
+    CANDLE_CLOSE,
+    CANDLE_HIGH,
+    CANDLE_LOW,
+    CANDLE_OPEN,
+    CANDLE_STRIDE,
+    CANDLE_WIDTH,
+    CANDLE_X,
+} from './candleLayout.js';
 
 export class OHLCPyramid {
     private levels: Float32Array[] = [];
@@ -19,8 +28,8 @@ export class OHLCPyramid {
 
     public reset(candles: Float32Array): void {
         this.levels = LTTBDownsampler.buildOHLCPyramid(candles);
-        this.levelCounts = this.levels.map((level: Float32Array): number => level.length / 6);
-        this.sourceCandleCount = candles.length / 6;
+        this.levelCounts = this.levels.map((level: Float32Array): number => level.length / CANDLE_STRIDE);
+        this.sourceCandleCount = candles.length / CANDLE_STRIDE;
     }
 
     public getLevelCount(levelIndex: number): number {
@@ -30,7 +39,7 @@ export class OHLCPyramid {
     public getLevelData(levelIndex: number): Float32Array {
         const level: Float32Array | undefined = this.levels[levelIndex];
         if (!level) return new Float32Array(0);
-        return level.subarray(0, this.levelCounts[levelIndex] * 6);
+        return level.subarray(0, this.levelCounts[levelIndex] * CANDLE_STRIDE);
     }
 
     public append(
@@ -45,7 +54,7 @@ export class OHLCPyramid {
 
         const newIndex: number = this.sourceCandleCount;
         this.ensureCapacity(0, newIndex + 1);
-        this.writeCandle(this.levels[0], newIndex * 6, x, open, high, low, close, width);
+        this.writeCandle(this.levels[0], newIndex * CANDLE_STRIDE, x, open, high, low, close, width);
         this.sourceCandleCount++;
         this.levelCounts[0] = this.sourceCandleCount;
         this.recomputeAncestors(newIndex);
@@ -65,7 +74,7 @@ export class OHLCPyramid {
         this.validateValues(x, open, high, low, close, width);
 
         const lastIndex: number = this.sourceCandleCount - 1;
-        this.writeCandle(this.levels[0], lastIndex * 6, x, open, high, low, close, width);
+        this.writeCandle(this.levels[0], lastIndex * CANDLE_STRIDE, x, open, high, low, close, width);
         this.recomputeAncestors(lastIndex);
     }
 
@@ -76,11 +85,13 @@ export class OHLCPyramid {
         if (candleCount === 0) return;
 
         const retainedCount: number = this.sourceCandleCount - candleCount;
-        const retained: Float32Array = new Float32Array(retainedCount * 6);
+        const retained: Float32Array = new Float32Array(retainedCount * CANDLE_STRIDE);
         if (retainedCount > 0) {
-            retained.set(this.levels[0].subarray(candleCount * 6, this.sourceCandleCount * 6));
+            retained.set(
+                this.levels[0].subarray(candleCount * CANDLE_STRIDE, this.sourceCandleCount * CANDLE_STRIDE),
+            );
             for (let index: number = 0; index < retainedCount; index++) {
-                retained[index * 6] -= candleCount;
+                retained[index * CANDLE_STRIDE + CANDLE_X] -= candleCount;
             }
         }
         this.reset(retained);
@@ -111,9 +122,9 @@ export class OHLCPyramid {
         const childCount: number = this.levelCounts[levelIndex - 1];
         const firstChildIndex: number = bucketIndex * 2;
         const secondChildIndex: number = Math.min(firstChildIndex + 1, childCount - 1);
-        const firstOffset: number = firstChildIndex * 6;
-        const secondOffset: number = secondChildIndex * 6;
-        const outputOffset: number = bucketIndex * 6;
+        const firstOffset: number = firstChildIndex * CANDLE_STRIDE;
+        const secondOffset: number = secondChildIndex * CANDLE_STRIDE;
+        const outputOffset: number = bucketIndex * CANDLE_STRIDE;
         const groupSize: number = Math.pow(2, levelIndex);
         const firstSourceIndex: number = bucketIndex * groupSize;
         const lastSourceIndex: number = Math.min(
@@ -121,15 +132,20 @@ export class OHLCPyramid {
             this.sourceCandleCount,
         ) - 1;
 
+        // A bucket fuses two children: the group's open and close come from the
+        // outer edges, high and low are the extremes, and width accumulates. An
+        // odd tail can pair a candle with itself, which the width sum must not
+        // double-count.
         this.writeCandle(
             this.levels[levelIndex],
             outputOffset,
             (firstSourceIndex + lastSourceIndex) / 2,
-            children[firstOffset + 1],
-            Math.max(children[firstOffset + 2], children[secondOffset + 2]),
-            Math.min(children[firstOffset + 3], children[secondOffset + 3]),
-            children[secondOffset + 4],
-            children[firstOffset + 5] + (secondChildIndex === firstChildIndex ? 0 : children[secondOffset + 5]),
+            children[firstOffset + CANDLE_OPEN],
+            Math.max(children[firstOffset + CANDLE_HIGH], children[secondOffset + CANDLE_HIGH]),
+            Math.min(children[firstOffset + CANDLE_LOW], children[secondOffset + CANDLE_LOW]),
+            children[secondOffset + CANDLE_CLOSE],
+            children[firstOffset + CANDLE_WIDTH]
+                + (secondChildIndex === firstChildIndex ? 0 : children[secondOffset + CANDLE_WIDTH]),
         );
     }
 
@@ -140,11 +156,11 @@ export class OHLCPyramid {
         }
 
         const current: Float32Array = this.levels[levelIndex];
-        const currentCapacity: number = current.length / 6;
+        const currentCapacity: number = current.length / CANDLE_STRIDE;
         if (currentCapacity >= requiredCount) return;
 
         const nextCapacity: number = Math.max(requiredCount, Math.max(16, currentCapacity * 2));
-        const expanded: Float32Array = new Float32Array(nextCapacity * 6);
+        const expanded: Float32Array = new Float32Array(nextCapacity * CANDLE_STRIDE);
         expanded.set(current);
         this.levels[levelIndex] = expanded;
     }
@@ -159,12 +175,12 @@ export class OHLCPyramid {
         close: number,
         width: number,
     ): void {
-        target[offset] = x;
-        target[offset + 1] = open;
-        target[offset + 2] = high;
-        target[offset + 3] = low;
-        target[offset + 4] = close;
-        target[offset + 5] = width;
+        target[offset + CANDLE_X] = x;
+        target[offset + CANDLE_OPEN] = open;
+        target[offset + CANDLE_HIGH] = high;
+        target[offset + CANDLE_LOW] = low;
+        target[offset + CANDLE_CLOSE] = close;
+        target[offset + CANDLE_WIDTH] = width;
     }
 
     private validateValues(

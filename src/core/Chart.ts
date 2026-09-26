@@ -4,6 +4,15 @@ import { WebGL2Renderer } from '../renderers/WebGL2Renderer.js';
 import { Canvas2DRenderer } from '../renderers/Canvas2DRenderer.js';
 import { OHLCPyramid } from '../math/OHLCPyramid.js';
 import { DEFAULT_CANDLE_SPACING_PX } from '../math/candlestickBodyWidth.js';
+import {
+    CANDLE_CLOSE,
+    CANDLE_HIGH,
+    CANDLE_LOW,
+    CANDLE_OPEN,
+    CANDLE_STRIDE,
+    CANDLE_WIDTH,
+    CANDLE_X,
+} from '../math/candleLayout.js';
 import { EventEmitter, ChartEvents } from './EventEmitter.js';
 import type { CandleData } from './CandleData.js';
 import type { ChartOptions, ChartTheme, ResolvedCandleColors, ResolvedChartOptions } from './options.js';
@@ -18,6 +27,7 @@ import type {
 import {
     type ChartViewport,
     type LogicalRange,
+    type PlotRect,
     type TimeRange,
     type VisibleRangeSnapshot,
     coordinateToIndex,
@@ -28,6 +38,8 @@ import {
     liveEdgeOffsetX,
     nearestCandleIndex,
     nearestCandleIndexByTime,
+    plotCentreX,
+    plotRight,
     priceToCoordinate,
     visibleLogicalRange,
 } from './coordinates.js';
@@ -38,6 +50,13 @@ const FALLBACK_CSS_HEIGHT = 500;
 
 /** Pointer travel, in CSS pixels, that turns a press into a pan rather than a click. */
 const CLICK_SLOP_PX = 4;
+
+/**
+ * Relative body width written into every source candle. The renderer treats it as
+ * a weight that aggregation sums, never as pixels; actual body width comes from
+ * `candlestickBodyWidthDevicePixels`, which reads the bar spacing instead.
+ */
+const DEFAULT_BODY_WIDTH_WEIGHT = 0.7;
 
 export class Chart {
     private container: HTMLElement;
@@ -468,13 +487,16 @@ export class Chart {
 
         if (this.followsLiveEdge) {
             this.scaleX = clamped;
-            this.offsetX = liveEdgeOffsetX(this.viewport.cssWidth, this.candlePyramid.candleCount, clamped);
+            this.offsetX = liveEdgeOffsetX(plotRight(this.viewport), this.candlePyramid.candleCount, clamped);
             return;
         }
 
-        const centreIndex: number = coordinateToIndex(this.viewport, this.viewport.cssWidth / 2);
+        // Zoom about the middle of the plot, not of the canvas, so the bar under
+        // the pointer stays put once the axes claim space at the edges.
+        const centreX: number = plotCentreX(this.viewport);
+        const centreIndex: number = coordinateToIndex(this.viewport, centreX);
         this.scaleX = clamped;
-        this.offsetX = this.viewport.cssWidth / 2 - centreIndex * clamped;
+        this.offsetX = centreX - centreIndex * clamped;
         this.followsLiveEdge = this.isAtLiveEdge();
     }
 
@@ -611,14 +633,35 @@ export class Chart {
 
     /** Current plot geometry. Internal; exposed for the renderer and tests. */
     private get viewport(): ChartViewport {
+        const cssWidth: number = this.canvasWrapper.clientWidth || FALLBACK_CSS_WIDTH;
+        const cssHeight: number = this.canvasWrapper.clientHeight || FALLBACK_CSS_HEIGHT;
         return {
             offsetX: this.offsetX,
             offsetY: this.offsetY,
             scaleX: this.scaleX,
             scaleY: this.scaleY,
-            cssWidth: this.canvasWrapper.clientWidth || FALLBACK_CSS_WIDTH,
-            cssHeight: this.canvasWrapper.clientHeight || FALLBACK_CSS_HEIGHT,
+            cssWidth,
+            cssHeight,
+            plot: this.plotRect(cssWidth, cssHeight),
         };
+    }
+
+    /**
+     * The region series are drawn into: the canvas less the gutters reserved for
+     * the price axis on the left and the time axis along the bottom. Every
+     * consumer derives from this, so the transform, the live edge, the visible
+     * range, and the vertical fit cannot each invent their own idea of where the
+     * plot ends.
+     *
+     * A gutter larger than the canvas collapses the plot to nothing rather than
+     * inverting it, because an inverted rect would flip the price axis and make
+     * every reported range meaningless.
+     */
+    private plotRect(cssWidth: number, cssHeight: number): PlotRect {
+        const { priceAxisWidth, timeAxisHeight } = this.resolvedOptions.layout;
+        const width: number = Math.max(0, cssWidth - priceAxisWidth);
+        const height: number = Math.max(0, cssHeight - timeAxisHeight);
+        return { x: priceAxisWidth, y: 0, width, height };
     }
 
     /** CSS pixels per candle index. */
@@ -671,13 +714,13 @@ export class Chart {
         if (time === undefined) return null;
 
         const level: Float32Array = this.candlePyramid.getLevelData(0);
-        const offset: number = index * 6;
+        const offset: number = index * CANDLE_STRIDE;
         return {
             time,
-            open: level[offset + 1],
-            high: level[offset + 2],
-            low: level[offset + 3],
-            close: level[offset + 4],
+            open: level[offset + CANDLE_OPEN],
+            high: level[offset + CANDLE_HIGH],
+            low: level[offset + CANDLE_LOW],
+            close: level[offset + CANDLE_CLOSE],
         };
     }
 
@@ -751,7 +794,7 @@ export class Chart {
         const previousCount: number = this.candlePyramid.candleCount;
         const previousFollowing: boolean = this.followsLiveEdge;
         const previousScale: number = this.scaleX;
-        const anchorScreenX: number = this.viewport.cssWidth / 2;
+        const anchorScreenX: number = plotCentreX(this.viewport);
         const previousAnchorIndex: number = previousCount > 0
             ? Math.max(0, Math.min(previousCount - 1, Math.round((anchorScreenX - this.offsetX) / this.scaleX)))
             : 0;
@@ -765,7 +808,7 @@ export class Chart {
         this.pendingReplace = false;
         const retainedStart: number = Math.max(0, candles.length - this.maxRetainedCandles);
         const retainedLength: number = candles.length - retainedStart;
-        const rawCandles: Float32Array = new Float32Array(retainedLength * 6);
+        const rawCandles: Float32Array = new Float32Array(retainedLength * CANDLE_STRIDE);
         const times: number[] = new Array<number>(retainedLength);
         let previousTime: number = Number.NEGATIVE_INFINITY;
 
@@ -776,14 +819,9 @@ export class Chart {
 
             if (candleIndex < retainedStart) continue;
 
-            const outputIndex: number = (candleIndex - retainedStart) * 6;
-            rawCandles[outputIndex] = candleIndex - retainedStart;
-            rawCandles[outputIndex + 1] = candle.open;
-            rawCandles[outputIndex + 2] = candle.high;
-            rawCandles[outputIndex + 3] = candle.low;
-            rawCandles[outputIndex + 4] = candle.close;
-            rawCandles[outputIndex + 5] = 0.7;
-            times[candleIndex - retainedStart] = candle.time;
+            const retainedIndex: number = candleIndex - retainedStart;
+            this.writeCandleRecord(rawCandles, retainedIndex, retainedIndex, candle);
+            times[retainedIndex] = candle.time;
         }
 
         this.candlePyramid.reset(rawCandles);
@@ -793,7 +831,7 @@ export class Chart {
         if (preserveViewport && retainedLength > 0 && previousCount > 0) {
             this.scaleX = previousScale;
             if (previousFollowing) {
-                this.offsetX = liveEdgeOffsetX(this.viewport.cssWidth, retainedLength, this.scaleX);
+                this.offsetX = liveEdgeOffsetX(plotRight(this.viewport), retainedLength, this.scaleX);
                 this.followsLiveEdge = true;
             } else if (anchorTime !== null) {
                 const retainedIndex: number = this.findNearestDataIndex(candles, retainedStart, anchorTime);
@@ -805,7 +843,7 @@ export class Chart {
             this.scaleX = 1;
         } else {
             this.scaleX = DEFAULT_CANDLE_SPACING_PX;
-            this.offsetX = liveEdgeOffsetX(this.viewport.cssWidth, retainedLength, this.scaleX);
+            this.offsetX = liveEdgeOffsetX(plotRight(this.viewport), retainedLength, this.scaleX);
         }
         this.updateViewport();
     }
@@ -908,7 +946,7 @@ export class Chart {
             this.offsetX,
             this.scaleX,
             this.candlePyramid.candleCount,
-            this.viewport.cssWidth,
+            plotRight(this.viewport),
         );
     }
 
@@ -939,6 +977,27 @@ export class Chart {
         this.scheduledViewportFrame = null;
     }
 
+    /**
+     * Writes one interleaved candle record into a source buffer. Every ingest
+     * path funnels through here so the record layout is defined in exactly one
+     * place; a channel added to `CandleData` is appended here once rather than at
+     * each of the call sites.
+     */
+    private writeCandleRecord(
+        target: Float32Array,
+        recordIndex: number,
+        ordinalIndex: number,
+        candle: CandleData,
+    ): void {
+        const offset: number = recordIndex * CANDLE_STRIDE;
+        target[offset + CANDLE_X] = ordinalIndex;
+        target[offset + CANDLE_OPEN] = candle.open;
+        target[offset + CANDLE_HIGH] = candle.high;
+        target[offset + CANDLE_LOW] = candle.low;
+        target[offset + CANDLE_CLOSE] = candle.close;
+        target[offset + CANDLE_WIDTH] = DEFAULT_BODY_WIDTH_WEIGHT;
+    }
+
     private flushPendingData(): void {
         if (this.pendingReplace) {
             const replacement: CandleData[] = this.pendingAppends;
@@ -946,24 +1005,18 @@ export class Chart {
             this.pendingLastUpdate = null;
             this.pendingReplace = false;
 
-            const rawCandles: Float32Array = new Float32Array(replacement.length * 6);
+            const rawCandles: Float32Array = new Float32Array(replacement.length * CANDLE_STRIDE);
             const times: number[] = new Array<number>(replacement.length);
             for (let index: number = 0; index < replacement.length; index++) {
                 const candle: CandleData = replacement[index];
-                const outputIndex: number = index * 6;
-                rawCandles[outputIndex] = index;
-                rawCandles[outputIndex + 1] = candle.open;
-                rawCandles[outputIndex + 2] = candle.high;
-                rawCandles[outputIndex + 3] = candle.low;
-                rawCandles[outputIndex + 4] = candle.close;
-                rawCandles[outputIndex + 5] = 0.7;
+                this.writeCandleRecord(rawCandles, index, index, candle);
                 times[index] = candle.time;
             }
             this.candlePyramid.reset(rawCandles);
             this.candleTimes = times;
             if (this.followsLiveEdge) {
                 this.offsetX = liveEdgeOffsetX(
-                    this.viewport.cssWidth,
+                    plotRight(this.viewport),
                     replacement.length,
                     this.scaleX,
                 );
@@ -989,7 +1042,7 @@ export class Chart {
                 lastUpdate.high,
                 lastUpdate.low,
                 lastUpdate.close,
-                0.7,
+                DEFAULT_BODY_WIDTH_WEIGHT,
             );
         }
 
@@ -1002,7 +1055,7 @@ export class Chart {
                 candle.high,
                 candle.low,
                 candle.close,
-                0.7,
+                DEFAULT_BODY_WIDTH_WEIGHT,
             );
             this.candleTimes.push(candle.time);
         }
@@ -1018,7 +1071,7 @@ export class Chart {
         if (shouldFollow && appends.length > 0) {
             if (overflow > 0) {
                 this.offsetX = liveEdgeOffsetX(
-                    this.viewport.cssWidth,
+                    plotRight(this.viewport),
                     this.candlePyramid.candleCount,
                     this.scaleX,
                 );
@@ -1058,17 +1111,25 @@ export class Chart {
         this.lastPinchCenterX = centerX;
     }
 
+    /**
+     * Fits the vertical scale to the visible candles. The fit uses the highs and
+     * lows of the pyramid level actually being drawn, so it matches what is on
+     * screen, and it fills the whole plot height; there is no plot rect yet, so
+     * "plot" is currently the entire canvas.
+     */
     private autoScaleY(): void {
         if (this.displayedCandles.length === 0) return;
 
-        const cssHeight: number = this.viewport.cssHeight;
+        const plot: PlotRect = this.viewport.plot;
+        const plotBottom: number = plot.y + plot.height;
 
         let maxHigh = Number.NEGATIVE_INFINITY;
         let minLow = Number.POSITIVE_INFINITY;
-        const count: number = this.displayedCandles.length / 6;
+        const count: number = this.displayedCandles.length / CANDLE_STRIDE;
         for (let i: number = 0; i < count; i++) {
-            maxHigh = Math.max(maxHigh, this.displayedCandles[i * 6 + 2]);
-            minLow = Math.min(minLow, this.displayedCandles[i * 6 + 3]);
+            const offset: number = i * CANDLE_STRIDE;
+            maxHigh = Math.max(maxHigh, this.displayedCandles[offset + CANDLE_HIGH]);
+            minLow = Math.min(minLow, this.displayedCandles[offset + CANDLE_LOW]);
         }
 
         // Add 10% padding to top and bottom
@@ -1076,12 +1137,14 @@ export class Chart {
         const padding = priceRange === 0
             ? Math.max(Math.abs(maxHigh) * 0.1, 1)
             : priceRange * 0.1;
-        
+
         const paddedMin = minLow - padding;
         const paddedMax = maxHigh + padding;
 
-        this.scaleY = -cssHeight / (paddedMax - paddedMin);
-        this.offsetY = cssHeight - paddedMin * this.scaleY;
+        // Fitted to the plot rect, so the highest and lowest visible candle land
+        // inside the plot rather than inside the canvas.
+        this.scaleY = -plot.height / (paddedMax - paddedMin);
+        this.offsetY = plotBottom - paddedMin * this.scaleY;
     }
 
     private updateViewport(): void {
@@ -1097,7 +1160,8 @@ export class Chart {
             offsetX: this.offsetX,
             offsetY: this.offsetY,
             scaleX: this.scaleX,
-            scaleY: this.scaleY
+            scaleY: this.scaleY,
+            plot: this.viewport.plot,
         });
         this.uploadVisibleCandles();
         // A pan, zoom, or feed append moves the bars under a stationary pointer,
@@ -1173,15 +1237,18 @@ export class Chart {
             const aggregationFactor: number = Math.pow(2, levelIndex);
             const level: Float32Array = this.candlePyramid.getLevelData(levelIndex);
             const levelCount: number = this.candlePyramid.getLevelCount(levelIndex);
-            const visibleMinX: number = coordinateToIndex(viewport, 0);
-            const visibleMaxX: number = coordinateToIndex(viewport, viewport.cssWidth);
+            const visibleMinX: number = coordinateToIndex(viewport, viewport.plot.x);
+            const visibleMaxX: number = coordinateToIndex(
+                viewport,
+                viewport.plot.x + viewport.plot.width,
+            );
             const startBucket: number = Math.max(0, Math.floor(visibleMinX / aggregationFactor) - 1);
             const endBucket: number = Math.min(
                 levelCount,
                 Math.ceil(visibleMaxX / aggregationFactor) + 2,
             );
             this.displayedCandles = endBucket > startBucket
-                ? level.slice(startBucket * 6, endBucket * 6)
+                ? level.slice(startBucket * CANDLE_STRIDE, endBucket * CANDLE_STRIDE)
                 : new Float32Array(0);
         }
 

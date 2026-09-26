@@ -22,6 +22,19 @@ export interface LayoutOptions {
     background?: string;
     /** Axis labels, crosshair readout, and any other text. */
     textColor?: string;
+    /**
+     * Width reserved for the price axis, in CSS pixels. Price labels are drawn in
+     * this gutter, right-aligned against the plot, so no longer overlap a candle.
+     *
+     * Additive in 1.x. Sized in CSS pixels rather than measured from the label
+     * text, because the widest label depends on the visible price range, which
+     * depends on the plot height, which depends on this width. The default fits a
+     * separated price of up to six digits with two decimals; widen it for
+     * instruments quoted with more digits or a longer grouping.
+     */
+    priceAxisWidth?: number;
+    /** Height reserved for the time axis, in CSS pixels. Additive in 1.x. */
+    timeAxisHeight?: number;
 }
 
 export interface GridOptions {
@@ -74,7 +87,12 @@ export interface ChartOptions {
 }
 
 export interface ResolvedPriceFormat { precision: number; minMove: number }
-export interface ResolvedLayout { background: string; textColor: string }
+export interface ResolvedLayout {
+    background: string;
+    textColor: string;
+    priceAxisWidth: number;
+    timeAxisHeight: number;
+}
 export interface ResolvedGrid { vertLines: boolean; horzLines: boolean; color: string }
 export interface ResolvedCrosshair { visible: boolean; color: string }
 export interface ResolvedTimeScale { barSpacing: number; minBarSpacing: number; maxBarSpacing: number }
@@ -122,7 +140,7 @@ const BASE_DEFAULTS: Omit<ResolvedChartOptions, 'theme' | 'locale' | 'candlestic
 
 /** Colors and chrome seeded per theme. Explicit overrides are re-applied on top. */
 const THEME_PRESETS: Record<ChartTheme, {
-    layout: ResolvedLayout;
+    layout: Omit<ResolvedLayout, 'priceAxisWidth' | 'timeAxisHeight'>;
     grid: ResolvedGrid;
     crosshair: ResolvedCrosshair;
     candlestick: ResolvedCandlestick;
@@ -286,6 +304,18 @@ function requireLocale(value: unknown): string {
     }
 }
 
+/**
+ * A CSS-pixel measurement for a reserved gutter. Must be a finite, non-negative
+ * number: a negative width would invert the plot rect, and `Infinity` or `NaN`
+ * would collapse it, both of which reach the geometry rather than failing here.
+ */
+function requireNonNegativeNumber(value: unknown, label: string): number {
+    if (typeof value !== 'number' || !Number.isFinite(value) || value < 0) {
+        fail(`${label} must be a finite, non-negative number of CSS pixels, received ${describe(value)}.`);
+    }
+    return value;
+}
+
 function requireTimeZone(value: unknown): string {
     if (typeof value !== 'string' || value.trim().length === 0) {
         fail(`timeZone must be a non-empty IANA zone name, received ${describe(value)}.`);
@@ -309,6 +339,15 @@ export function runtimeLocale(): string {
     return new Intl.NumberFormat().resolvedOptions().locale;
 }
 
+/**
+ * Default gutter sizes, in CSS pixels. Not theme-dependent: they are layout
+ * metrics rather than colours, so a theme change must not resize the plot.
+ */
+const DEFAULT_LAYOUT_METRICS = {
+    priceAxisWidth: 78,
+    timeAxisHeight: 22,
+} as const;
+
 /** Preset-only snapshot for a theme, with no caller overrides applied. */
 export function themeDefaults(theme: ChartTheme): ResolvedChartOptions {
     const preset = THEME_PRESETS[theme];
@@ -317,7 +356,7 @@ export function themeDefaults(theme: ChartTheme): ResolvedChartOptions {
         theme,
         locale: runtimeLocale(),
         priceFormat: { ...BASE_DEFAULTS.priceFormat },
-        layout: { ...preset.layout },
+        layout: { ...preset.layout, ...DEFAULT_LAYOUT_METRICS },
         grid: { ...preset.grid },
         crosshair: { ...preset.crosshair },
         timeScale: { ...BASE_DEFAULTS.timeScale },
@@ -365,6 +404,18 @@ export function resolveOptions(partial: ChartOptions, fallbackTheme: ChartTheme 
         const layout = requirePlainObject(partial.layout, 'layout');
         if (layout.background !== undefined) resolved.layout.background = requireColor(layout.background, 'layout.background');
         if (layout.textColor !== undefined) resolved.layout.textColor = requireColor(layout.textColor, 'layout.textColor');
+        if (layout.priceAxisWidth !== undefined) {
+            resolved.layout.priceAxisWidth = requireNonNegativeNumber(
+                layout.priceAxisWidth,
+                'layout.priceAxisWidth',
+            );
+        }
+        if (layout.timeAxisHeight !== undefined) {
+            resolved.layout.timeAxisHeight = requireNonNegativeNumber(
+                layout.timeAxisHeight,
+                'layout.timeAxisHeight',
+            );
+        }
     }
 
     if (partial.grid !== undefined) {

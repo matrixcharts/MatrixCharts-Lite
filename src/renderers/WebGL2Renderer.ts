@@ -2,7 +2,17 @@
 import type { ResolvedCandleColors } from '../core/options.js';
 import type { IRenderer } from '../core/IRenderer.js';
 import type { EventEmitter, ChartEvents } from '../core/EventEmitter.js';
+import type { PlotRect } from '../core/coordinates.js';
 import { candlestickBodyEdgesData } from '../math/candlestickBodyWidth.js';
+import {
+    CANDLE_CLOSE,
+    CANDLE_HIGH,
+    CANDLE_LOW,
+    CANDLE_OPEN,
+    CANDLE_STRIDE,
+    CANDLE_WIDTH,
+    CANDLE_X,
+} from '../math/candleLayout.js';
 
 export class WebGL2Renderer implements IRenderer {
     private gl: WebGL2RenderingContext | null = null;
@@ -37,6 +47,11 @@ export class WebGL2Renderer implements IRenderer {
 
     private currentOffset: [number, number] = [0, 0];
     private currentScale: [number, number] = [1, 1];
+    /**
+     * Region data is confined to, in CSS pixels. Starts degenerate so a draw
+     * before the first viewport event covers nothing rather than everything.
+     */
+    private currentPlot: PlotRect = { x: 0, y: 0, width: 0, height: 0 };
     private devicePixelRatio: number = 1;
     private lineVertexCount: number = 0;
     private candleWickVertexCount: number = 0;
@@ -184,6 +199,10 @@ export class WebGL2Renderer implements IRenderer {
 
     public clear(): void {
         const gl: WebGL2RenderingContext = this.requireContext();
+        // The scissor box is confined to the plot for drawing only. Clearing
+        // under it would leave the gutters holding whatever was last drawn there,
+        // so the whole backing store is cleared with clipping off.
+        gl.disable(gl.SCISSOR_TEST);
         gl.clearColor(0, 0, 0, 0);
         gl.clear(gl.COLOR_BUFFER_BIT);
     }
@@ -207,6 +226,7 @@ export class WebGL2Renderer implements IRenderer {
     private handleViewportEvent = (payload: ChartEvents['viewport']): void => {
         this.currentOffset = [payload.offsetX, payload.offsetY];
         this.currentScale = [payload.scaleX, payload.scaleY];
+        this.currentPlot = payload.plot;
     };
 
     public drawLine(points: Float32Array, color: [number, number, number, number]): void {
@@ -238,12 +258,15 @@ export class WebGL2Renderer implements IRenderer {
         borderVisible: boolean,
     ): void {
         const gl: WebGL2RenderingContext = this.requireContext();
-        if (candles.length % 6 !== 0) {
+        if (candles.length % CANDLE_STRIDE !== 0) {
             throw new Error('MatrixCharts: Candles must contain x/open/high/low/close/width values.');
         }
 
-        const candleCount: number = candles.length / 6;
-        const vertexStride: number = 6; // x, y, r, g, b, a
+        const candleCount: number = candles.length / CANDLE_STRIDE;
+        // The GPU vertex layout, [x, y, r, g, b, a]. This is also six floats, but
+        // it is a different six from CANDLE_STRIDE above; conflating the two puts
+        // every read and every index past the end of its buffer.
+        const vertexStride: number = 6;
         if (candleCount === 0) {
             // Nothing to draw. Skipping the upload avoids handing WebGL zero-length
             // buffers on the empty first frame, which buys nothing.
@@ -281,13 +304,13 @@ export class WebGL2Renderer implements IRenderer {
         let bodyIndexOffset: number = 0;
 
         for (let candleIndex: number = 0; candleIndex < candleCount; candleIndex++) {
-            const inputIndex: number = candleIndex * 6;
-            const x: number = candles[inputIndex];
-            const open: number = candles[inputIndex + 1];
-            const high: number = candles[inputIndex + 2];
-            const low: number = candles[inputIndex + 3];
-            const close: number = candles[inputIndex + 4];
-            const width: number = candles[inputIndex + 5];
+            const inputIndex: number = candleIndex * CANDLE_STRIDE;
+            const x: number = candles[inputIndex + CANDLE_X];
+            const open: number = candles[inputIndex + CANDLE_OPEN];
+            const high: number = candles[inputIndex + CANDLE_HIGH];
+            const low: number = candles[inputIndex + CANDLE_LOW];
+            const close: number = candles[inputIndex + CANDLE_CLOSE];
+            const width: number = candles[inputIndex + CANDLE_WIDTH];
 
             if (![x, open, high, low, close, width].every(Number.isFinite) || width <= 0) {
                 throw new Error('MatrixCharts: Candlestick values must be finite and width must be positive.');
@@ -368,17 +391,74 @@ export class WebGL2Renderer implements IRenderer {
             let fillBottom: number = bodyBottom;
 
             if (borderVisible) {
-                const horizontalInset: number = 1 / (scaleX * this.devicePixelRatio);
-                const verticalInset: number = 1 / Math.abs(scaleY * this.devicePixelRatio);
-                const hasRoom: boolean =
-                    Math.abs(bodyRight - bodyLeft) > horizontalInset * 3
-                    && Math.abs(bodyTop - bodyBottom) > verticalInset * 3;
+                // Every body edge is resolved to a whole device pixel and then
+                // emitted as the data value whose device position is exactly that
+                // pixel. The shader's snap is floor(device + 0.5), which is
+                // knife-edge whenever the device position lands near a .5 boundary:
+                // a body edge on a whole CSS pixel puts `position * pixelRatio` on
+                // a half-integer at every odd-tenth pixel ratio, and two edges that
+                // must be one pixel apart then round independently, giving a
+                // two-pixel or zero-pixel frame. Targeting the exact pixel keeps
+                // each edge half a pixel clear of the boundary, so the snap is
+                // stable at any pixel ratio. candlestickBodyEdgesData already
+                // resolves the horizontal edges this way; the vertical ones are
+                // recovered here.
+                //
+                // The snap is evaluated in float32 on purpose. The uniforms reach
+                // the GPU as float32, so a row computed in double precision can
+                // disagree with the row the shader picks whenever the edge is
+                // within float32 error of a boundary, and the frame would then hug
+                // a row the body was never drawn on. A pixel ratio such as 2.3 is
+                // not representable in float32, so this is not hypothetical.
+                const ratio: number = Math.fround(this.devicePixelRatio);
+                const snapScaleX: number = Math.fround(this.currentScale[0]);
+                const snapScaleY: number = Math.fround(this.currentScale[1]);
+                const snapOffsetX: number = Math.fround(this.currentOffset[0]);
+                const snapOffsetY: number = Math.fround(this.currentOffset[1]);
+                /** Device column of a data x, matching the shader's body snap. */
+                const columnOf = (dataX: number): number => Math.floor(
+                    Math.fround(
+                        Math.fround(Math.fround(dataX * snapScaleX) + snapOffsetX) * ratio,
+                    ) + 0.5,
+                );
+                /** Device row of a price, matching the shader's body snap. */
+                const rowOf = (price: number): number => Math.floor(
+                    Math.fround(
+                        Math.fround(Math.fround(price * snapScaleY) + snapOffsetY) * ratio,
+                    ) + 0.5,
+                );
+                /** Data x whose device column is exactly `column`. */
+                const dataForColumn = (column: number): number => (
+                    (column / ratio - snapOffsetX) / snapScaleX
+                );
+                /** Price whose device row is exactly `row`. */
+                const dataForRow = (row: number): number => (
+                    (row / ratio - snapOffsetY) / snapScaleY
+                );
+
+                const leftColumn: number = columnOf(bodyLeft);
+                const rightColumn: number = columnOf(bodyRight);
+                const topRow: number = rowOf(bodyTop);
+                const bottomRow: number = rowOf(bodyBottom);
+
+                // A one-pixel frame needs an interior left over, so a body thinner
+                // than three device pixels on either axis carries no frame at all.
+                const hasRoom: boolean = rightColumn - leftColumn > 3 && bottomRow - topRow > 3;
+
+                fillTop = dataForRow(topRow);
+                fillBottom = dataForRow(bottomRow);
 
                 if (hasRoom) {
-                    const innerLeft: number = bodyLeft + horizontalInset;
-                    const innerRight: number = bodyRight - horizontalInset;
-                    const innerTop: number = bodyTop - verticalInset;
-                    const innerBottom: number = bodyBottom + verticalInset;
+                    const innerLeftColumn: number = leftColumn + 1;
+                    const innerRightColumn: number = rightColumn - 1;
+                    const innerTopRow: number = topRow + 1;
+                    const innerBottomRow: number = bottomRow - 1;
+                    const innerLeft: number = dataForColumn(innerLeftColumn);
+                    const innerRight: number = dataForColumn(innerRightColumn);
+                    const innerTop: number = dataForRow(innerTopRow);
+                    const innerBottom: number = dataForRow(innerBottomRow);
+                    const frameLeft: number = dataForColumn(leftColumn);
+                    const frameRight: number = dataForColumn(rightColumn);
 
                     /** One axis-aligned quad: 4 vertices and 6 indices. */
                     const writeStrip = (
@@ -411,10 +491,10 @@ export class WebGL2Renderer implements IRenderer {
 
                     // Top and bottom run the full width; the sides fill the gap
                     // between them, so no pixel is ever covered twice.
-                    writeStrip(bodyLeft, bodyRight, innerTop, bodyTop);
-                    writeStrip(bodyLeft, bodyRight, bodyBottom, innerBottom);
-                    writeStrip(bodyLeft, innerLeft, innerBottom, innerTop);
-                    writeStrip(innerRight, bodyRight, innerBottom, innerTop);
+                    writeStrip(frameLeft, frameRight, innerTop, dataForRow(topRow));
+                    writeStrip(frameLeft, frameRight, dataForRow(bottomRow), innerBottom);
+                    writeStrip(frameLeft, innerLeft, innerBottom, innerTop);
+                    writeStrip(innerRight, frameRight, innerBottom, innerTop);
 
                     fillLeft = innerLeft;
                     fillRight = innerRight;
@@ -457,6 +537,28 @@ export class WebGL2Renderer implements IRenderer {
         if ((this.lineVertexCount === 0 && this.candleBodyVertexCount === 0) || !this.canvas) return;
 
         gl.viewport(0, 0, this.canvas.width, this.canvas.height);
+
+        // Confine data to the plot rect. Without this a bar scrolled part-way past
+        // an edge keeps painting over the axis gutter it is supposed to be clipped
+        // by. GL's origin is bottom-left, so the box is mirrored in y, and the
+        // extents are rounded so a fractional ratio cannot leave a seam.
+        const plot: PlotRect = this.currentPlot;
+        const clipLeft: number = Math.round(plot.x * this.devicePixelRatio);
+        const clipBottom: number = Math.round(
+            (this.canvas.height - (plot.y + plot.height) * this.devicePixelRatio),
+        );
+        const clipWidth: number = Math.round(plot.width * this.devicePixelRatio);
+        const clipHeight: number = Math.round(plot.height * this.devicePixelRatio);
+        if (clipWidth > 0 && clipHeight > 0) {
+            gl.enable(gl.SCISSOR_TEST);
+            gl.scissor(clipLeft, clipBottom, clipWidth, clipHeight);
+        } else {
+            // A collapsed plot has no area to confine to; draw nothing rather than
+            // letting data cover the whole canvas.
+            gl.disable(gl.SCISSOR_TEST);
+            return;
+        }
+
         gl.useProgram(this.program);
 
         const cssWidth = this.canvas.width / this.devicePixelRatio;
@@ -497,6 +599,9 @@ export class WebGL2Renderer implements IRenderer {
             );
         }
         gl.bindVertexArray(null);
+        // Clipping is a per-draw decision, not a mode the renderer leaves on, so
+        // the next clear starts from an unconfined buffer.
+        gl.disable(gl.SCISSOR_TEST);
     }
 
     public destroy(): void {
