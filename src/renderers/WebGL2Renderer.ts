@@ -48,7 +48,9 @@ export class WebGL2Renderer implements IRenderer {
         this.emitter.on('viewport', this.handleViewportEvent);
         const gl: WebGL2RenderingContext | null = canvas.getContext('webgl2');
         if (!gl) {
-            throw new Error('MatrixCharts: WebGL2 is not supported by this browser.');
+            // Stable, documented, and safe to string-match. v1 has no Canvas2D
+            // fallback, so there is nothing to degrade to.
+            throw new Error('MatrixCharts: WebGL2 is required.');
         }
 
         // FIX: Add u_offset entirely to prevent the GLSL compiler from optimizing it out
@@ -259,14 +261,13 @@ export class WebGL2Renderer implements IRenderer {
         // then body fills. Each block starts at a fixed offset so the three can
         // never overlap, whatever the flags say.
         const wickVerticesPerCandle: number = wickVisible ? 4 : 0;
-        const borderVerticesPerCandle: number = borderVisible ? 4 : 0;
+        // A border is a frame of four quads, so 16 vertices and 24 indices.
+        const borderVerticesPerCandle: number = borderVisible ? 16 : 0;
         const bodyVertexStart: number = candleCount * (wickVerticesPerCandle + borderVerticesPerCandle);
         const verticesPerCandle: number = wickVerticesPerCandle + borderVerticesPerCandle + 4;
         const totalVertices: number = candleCount * verticesPerCandle;
         const vertices: Float32Array = new Float32Array(totalVertices * vertexStride);
-        // Border quads are indexed ahead of the fills, so the frame is laid down
-        // first and the fill covers its interior in the same pass.
-        const indicesPerCandle: number = borderVisible ? 12 : 6;
+        const indicesPerCandle: number = (borderVisible ? 24 : 0) + 6;
         const bodyIndices: Uint32Array = new Uint32Array(candleCount * indicesPerCandle);
 
         // Two cursors per block, and they count different things: a float offset
@@ -356,9 +357,11 @@ export class WebGL2Renderer implements IRenderer {
                 vertices[wickFloat++] = color[0]; vertices[wickFloat++] = color[1]; vertices[wickFloat++] = color[2]; vertices[wickFloat++] = color[3];
             }
 
-            // The border is the full body outline in the border colour; the fill is
-            // then drawn inset by one device pixel on each side, so the frame stays
-            // visible without the body growing and the bar gutter changing.
+            // The border is a one-device-pixel frame on the body outline, and the
+            // fill is drawn inset to match. The frame is four strips rather than one
+            // quad under the fill, because a translucent fill would otherwise
+            // composite onto the border colour instead of the background and the
+            // whole body would take on the border's hue.
             let fillLeft: number = bodyLeft;
             let fillRight: number = bodyRight;
             let fillTop: number = bodyTop;
@@ -371,31 +374,52 @@ export class WebGL2Renderer implements IRenderer {
                     Math.abs(bodyRight - bodyLeft) > horizontalInset * 3
                     && Math.abs(bodyTop - bodyBottom) > verticalInset * 3;
 
-                vertices[borderFloat++] = bodyLeft; vertices[borderFloat++] = bodyBottom;
-                vertices[borderFloat++] = borderColor[0]; vertices[borderFloat++] = borderColor[1]; vertices[borderFloat++] = borderColor[2]; vertices[borderFloat++] = borderColor[3];
-
-                vertices[borderFloat++] = bodyRight; vertices[borderFloat++] = bodyBottom;
-                vertices[borderFloat++] = borderColor[0]; vertices[borderFloat++] = borderColor[1]; vertices[borderFloat++] = borderColor[2]; vertices[borderFloat++] = borderColor[3];
-
-                vertices[borderFloat++] = bodyLeft; vertices[borderFloat++] = bodyTop;
-                vertices[borderFloat++] = borderColor[0]; vertices[borderFloat++] = borderColor[1]; vertices[borderFloat++] = borderColor[2]; vertices[borderFloat++] = borderColor[3];
-
-                vertices[borderFloat++] = bodyRight; vertices[borderFloat++] = bodyTop;
-                vertices[borderFloat++] = borderColor[0]; vertices[borderFloat++] = borderColor[1]; vertices[borderFloat++] = borderColor[2]; vertices[borderFloat++] = borderColor[3];
-
-                bodyIndices[bodyIndexOffset++] = borderVertexId;
-                bodyIndices[bodyIndexOffset++] = borderVertexId + 1;
-                bodyIndices[bodyIndexOffset++] = borderVertexId + 2;
-                bodyIndices[bodyIndexOffset++] = borderVertexId + 2;
-                bodyIndices[bodyIndexOffset++] = borderVertexId + 1;
-                bodyIndices[bodyIndexOffset++] = borderVertexId + 3;
-                borderVertexId += 4;
-
                 if (hasRoom) {
-                    fillLeft = bodyLeft + horizontalInset;
-                    fillRight = bodyRight - horizontalInset;
-                    fillTop = bodyTop - verticalInset;
-                    fillBottom = bodyBottom + verticalInset;
+                    const innerLeft: number = bodyLeft + horizontalInset;
+                    const innerRight: number = bodyRight - horizontalInset;
+                    const innerTop: number = bodyTop - verticalInset;
+                    const innerBottom: number = bodyBottom + verticalInset;
+
+                    /** One axis-aligned quad: 4 vertices and 6 indices. */
+                    const writeStrip = (
+                        left: number, right: number, bottom: number, top: number,
+                    ): void => {
+                        vertices[borderFloat++] = left; vertices[borderFloat++] = bottom;
+                        vertices[borderFloat++] = borderColor[0]; vertices[borderFloat++] = borderColor[1];
+                        vertices[borderFloat++] = borderColor[2]; vertices[borderFloat++] = borderColor[3];
+
+                        vertices[borderFloat++] = right; vertices[borderFloat++] = bottom;
+                        vertices[borderFloat++] = borderColor[0]; vertices[borderFloat++] = borderColor[1];
+                        vertices[borderFloat++] = borderColor[2]; vertices[borderFloat++] = borderColor[3];
+
+                        vertices[borderFloat++] = left; vertices[borderFloat++] = top;
+                        vertices[borderFloat++] = borderColor[0]; vertices[borderFloat++] = borderColor[1];
+                        vertices[borderFloat++] = borderColor[2]; vertices[borderFloat++] = borderColor[3];
+
+                        vertices[borderFloat++] = right; vertices[borderFloat++] = top;
+                        vertices[borderFloat++] = borderColor[0]; vertices[borderFloat++] = borderColor[1];
+                        vertices[borderFloat++] = borderColor[2]; vertices[borderFloat++] = borderColor[3];
+
+                        bodyIndices[bodyIndexOffset++] = borderVertexId;
+                        bodyIndices[bodyIndexOffset++] = borderVertexId + 1;
+                        bodyIndices[bodyIndexOffset++] = borderVertexId + 2;
+                        bodyIndices[bodyIndexOffset++] = borderVertexId + 2;
+                        bodyIndices[bodyIndexOffset++] = borderVertexId + 1;
+                        bodyIndices[bodyIndexOffset++] = borderVertexId + 3;
+                        borderVertexId += 4;
+                    };
+
+                    // Top and bottom run the full width; the sides fill the gap
+                    // between them, so no pixel is ever covered twice.
+                    writeStrip(bodyLeft, bodyRight, innerTop, bodyTop);
+                    writeStrip(bodyLeft, bodyRight, bodyBottom, innerBottom);
+                    writeStrip(bodyLeft, innerLeft, innerBottom, innerTop);
+                    writeStrip(innerRight, bodyRight, innerBottom, innerTop);
+
+                    fillLeft = innerLeft;
+                    fillRight = innerRight;
+                    fillTop = innerTop;
+                    fillBottom = innerBottom;
                 }
             }
 

@@ -107,6 +107,18 @@
             close,
         });
         const waitFrame = () => new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+        const eventCandlesForTeardown = (base) => Array.from({ length: 5 }, (_, index) => ({
+            time: base + index * 60_000, open: 100, high: 101, low: 99, close: 100.5,
+        }));
+        /**
+         * Finds a renderer by its layer's z-index rather than its position in the
+         * renderers array, which is an implementation detail and is not paint order.
+         */
+        const layerRenderer = (chart, zIndex) => {
+            const renderer = chart.renderers.find((candidate) => candidate.canvas.style.zIndex === String(zIndex));
+            if (!renderer) throw new Error(`No renderer for layer z-index ${zIndex}.`);
+            return renderer;
+        };
 
         try {
             socket.open();
@@ -188,7 +200,7 @@
                 sessionCandle(monday, 101),
                 sessionCandle(tuesday, 102),
             ]);
-            const timeRenderer = gapChart.renderers[2];
+            const timeRenderer = layerRenderer(gapChart, 0);
             const fridayLabel = timeRenderer.formatTimeAtIndex(0.4);
             const mondayLabel = timeRenderer.formatTimeAtIndex(0.6);
             // timeZone defaults to UTC so labels do not depend on the viewer's zone.
@@ -340,6 +352,223 @@
             }
             detachedHost.remove();
 
+            // Sizing must not depend solely on ResizeObserver. A container that
+            // gains or changes its size while the chart is not rendering has to
+            // correct itself the next time the chart renders, even in an
+            // environment where observer notifications never arrive. A hover
+            // deliberately does not count: it repaints only the UI layer, so it
+            // must not resize canvases it is not about to redraw. A zoom is a
+            // real render, so that is the trigger used here.
+            const lateHost = document.createElement('div');
+            lateHost.style.cssText = 'width:320px;height:200px';
+            const lateChart = new Chart(lateHost);
+            lateChart.setData([sessionCandle(friday, 100), sessionCandle(monday, 101)]);
+            document.body.appendChild(lateHost);
+            const lateSurface = lateHost.firstElementChild;
+            const lateCanvas = lateHost.querySelectorAll('canvas')[1];
+            if (lateCanvas.width > 300) {
+                throw new Error('The chart should not have been sized while its container was detached.');
+            }
+            const zoom = () => {
+                const rect = lateHost.getBoundingClientRect();
+                lateSurface.dispatchEvent(new WheelEvent('wheel', {
+                    deltaY: -100, clientX: rect.left + 160, clientY: rect.top + 100,
+                    bubbles: true, cancelable: true,
+                }));
+            };
+            zoom();
+            await waitFrame();
+            if (lateCanvas.width !== Math.round(lateCanvas.clientWidth * window.devicePixelRatio)) {
+                throw new Error(
+                    `The chart did not correct its canvas size on render: `
+                    + `backing ${lateCanvas.width} for css ${lateCanvas.clientWidth}.`,
+                );
+            }
+            if (lateCanvas.width <= 300) {
+                throw new Error('The chart canvas is still at its unsized default.');
+            }
+            // A real container resize is picked up the same way.
+            lateHost.style.width = '500px';
+            zoom();
+            await waitFrame();
+            if (lateCanvas.width !== Math.round(lateCanvas.clientWidth * window.devicePixelRatio)) {
+                throw new Error(
+                    `The chart did not pick up a container resize: `
+                    + `backing ${lateCanvas.width} for css ${lateCanvas.clientWidth}.`,
+                );
+            }
+            if (lateCanvas.width <= Math.round(320 * window.devicePixelRatio)) {
+                throw new Error('The canvas did not grow with its container.');
+            }
+            lateChart.destroy();
+            lateHost.remove();
+
+            // A handler that calls back into the chart must not be able to drive
+            // an unbounded event loop.
+            const reentryHost = document.createElement('div');
+            reentryHost.style.cssText = 'width:400px;height:220px';
+            document.body.appendChild(reentryHost);
+            const reentryChart = new Chart(reentryHost);
+            reentryChart.setData(Array.from({ length: 30 }, (_, index) => sessionCandle(baseTime + index * 60_000, 100 + index)));
+            await waitFrame();
+            const reentrySurface = reentryHost.firstElementChild;
+
+            let rangeEvents = 0;
+            reentryChart.subscribeVisibleRangeChange(() => {
+                rangeEvents++;
+                if (rangeEvents < 500) {
+                    // Restyling from inside the handler is the pathological case.
+                    reentryChart.applyOptions({ timeScale: { barSpacing: 8 + (rangeEvents % 5) } });
+                }
+            });
+            let crosshairEvents = 0;
+            reentryChart.subscribeCrosshairMove(() => {
+                crosshairEvents++;
+                if (crosshairEvents < 500) {
+                    reentryChart.applyOptions({ crosshair: { visible: true } });
+                }
+            });
+
+            const reentryRect = reentryHost.getBoundingClientRect();
+            reentrySurface.dispatchEvent(new PointerEvent('pointermove', {
+                clientX: reentryRect.left + 200, clientY: reentryRect.top + 110,
+                bubbles: true, pointerId: 41, pointerType: 'mouse',
+            }));
+            for (let frame = 0; frame < 12; frame++) await waitFrame();
+            if (rangeEvents > 20) {
+                throw new Error(`A re-entrant range handler produced ${rangeEvents} events; the loop is not bounded.`);
+            }
+            if (crosshairEvents > 20) {
+                throw new Error(`A re-entrant crosshair handler produced ${crosshairEvents} events; the loop is not bounded.`);
+            }
+            // The chart must still work normally afterwards.
+            assertEqual(reentryChart.getCandleCount(), 30, 'the chart survived the re-entrant handlers');
+            reentryChart.destroy();
+            reentryHost.remove();
+
+            // --- WebGL2 requirement --------------------------------------------
+            // v1 has no Canvas2D fallback. An unsupported engine must fail fast with
+            // a stable message and leave the caller's container untouched, rather
+            // than a half-mounted shell of empty canvases.
+            const requiredHost = document.createElement('div');
+            requiredHost.id = 'webgl2-requirement-host';
+            requiredHost.style.cssText = 'width:320px;height:200px';
+            const callerMarkup = document.createElement('span');
+            callerMarkup.id = 'caller-markup';
+            callerMarkup.textContent = 'integrator markup';
+            requiredHost.appendChild(callerMarkup);
+            document.body.appendChild(requiredHost);
+
+            const realGetContext = HTMLCanvasElement.prototype.getContext;
+            HTMLCanvasElement.prototype.getContext = function patchedGetContext(type, ...rest) {
+                if (type === 'webgl2') return null;
+                return realGetContext.call(this, type, ...rest);
+            };
+            let requiredMessage = null;
+            let requiredThrew = false;
+            try {
+                // eslint-disable-next-line no-new
+                new Chart(requiredHost);
+            } catch (error) {
+                requiredThrew = true;
+                requiredMessage = error instanceof Error ? error.message : String(error);
+            } finally {
+                HTMLCanvasElement.prototype.getContext = realGetContext;
+            }
+
+            if (!requiredThrew) throw new Error('A chart constructed without WebGL2 instead of throwing.');
+            assertEqual(requiredMessage, 'MatrixCharts: WebGL2 is required.', 'stable WebGL2 error message');
+            if (requiredHost.querySelectorAll('canvas').length !== 0) {
+                throw new Error('A failed construction left canvases in the caller container.');
+            }
+            if (requiredHost.querySelectorAll('div').length !== 0) {
+                throw new Error('A failed construction left a wrapper element in the caller container.');
+            }
+            if (!document.getElementById('caller-markup')) {
+                throw new Error('A failed construction removed the caller own markup.');
+            }
+
+            // The failure must not poison anything: restoring WebGL2 has to work.
+            const recoveredChart = new Chart(requiredHost);
+            assertEqual(recoveredChart.getCandleCount(), 0, 'recovered chart mounted');
+            if (requiredHost.querySelectorAll('canvas').length !== 3) {
+                throw new Error('The recovered chart did not mount its three layers.');
+            }
+            assertEqual(document.getElementById('caller-markup') !== null, true, 'caller markup survived recovery');
+            recoveredChart.destroy();
+            if (requiredHost.querySelectorAll('canvas').length !== 0) {
+                throw new Error('destroy() left layers behind after recovery.');
+            }
+            requiredHost.remove();
+
+            // --- Teardown contract -----------------------------------------------
+            // destroy() removes only what the chart created, and leaves the object
+            // uniformly unusable rather than half-working.
+            const teardownHost = document.createElement('div');
+            teardownHost.style.cssText = 'width:320px;height:200px';
+            const teardownSibling = document.createElement('span');
+            teardownSibling.id = 'teardown-sibling';
+            teardownSibling.textContent = 'caller markup';
+            teardownHost.appendChild(teardownSibling);
+            document.body.appendChild(teardownHost);
+
+            const teardownChart = new Chart(teardownHost);
+            teardownChart.setData(eventCandlesForTeardown(baseTime));
+            await waitFrame();
+            if (teardownHost.querySelectorAll('canvas').length !== 3) {
+                throw new Error('Teardown chart did not mount its layers.');
+            }
+            teardownChart.destroy();
+            if (teardownHost.querySelectorAll('canvas').length !== 0) {
+                throw new Error('destroy() left the chart layers in the container.');
+            }
+            if (!document.getElementById('teardown-sibling')) {
+                throw new Error('destroy() removed markup the caller put in the container.');
+            }
+            assertEqual(teardownHost.children.length, 1, 'only the caller markup remains after destroy');
+
+            // Every public entry point must report the same single error.
+            const destroyedCalls = [
+                ['setData', () => teardownChart.setData([])],
+                ['replaceData', () => teardownChart.replaceData([])],
+                ['appendData', () => teardownChart.appendData({ time: baseTime, open: 1, high: 1, low: 1, close: 1 })],
+                ['appendBatch', () => teardownChart.appendBatch([])],
+                ['updateLast', () => teardownChart.updateLast({ time: baseTime, open: 1, high: 1, low: 1, close: 1 })],
+                ['setTheme', () => teardownChart.setTheme('paper')],
+                ['applyOptions', () => teardownChart.applyOptions({ theme: 'paper' })],
+                ['options', () => teardownChart.options()],
+                ['getBarSpacing', () => teardownChart.getBarSpacing()],
+                ['getVisibleLogicalRange', () => teardownChart.getVisibleLogicalRange()],
+                ['getVisibleTimeRange', () => teardownChart.getVisibleTimeRange()],
+                ['getCandleCount', () => teardownChart.getCandleCount()],
+                ['getCandleAt', () => teardownChart.getCandleAt(0)],
+                ['getLastCandle', () => teardownChart.getLastCandle()],
+                ['indexToCoordinate', () => teardownChart.indexToCoordinate(0)],
+                ['coordinateToIndex', () => teardownChart.coordinateToIndex(0)],
+                ['coordinateToNearestIndex', () => teardownChart.coordinateToNearestIndex(0)],
+                ['coordinateToTime', () => teardownChart.coordinateToTime(0)],
+                ['timeToCoordinate', () => teardownChart.timeToCoordinate(baseTime)],
+                ['priceToCoordinate', () => teardownChart.priceToCoordinate(1)],
+                ['coordinateToPrice', () => teardownChart.coordinateToPrice(1)],
+                ['subscribeCrosshairMove', () => teardownChart.subscribeCrosshairMove(() => {})],
+                ['subscribeClick', () => teardownChart.subscribeClick(() => {})],
+                ['subscribeVisibleRangeChange', () => teardownChart.subscribeVisibleRangeChange(() => {})],
+            ];
+            for (const [label, call] of destroyedCalls) {
+                let message = null;
+                try {
+                    call();
+                } catch (error) {
+                    message = error instanceof Error ? error.message : String(error);
+                }
+                if (message !== 'MatrixCharts: This chart has been destroyed.') {
+                    throw new Error(`${label}() after destroy reported ${JSON.stringify(message)}.`);
+                }
+            }
+            // destroy() stays idempotent.
+            teardownChart.destroy();
+            teardownHost.remove();
+
             // --- applyOptions ---------------------------------------------------
             // Recolouring must reach the GPU without a setData, which is the
             // point of runtime options.
@@ -474,7 +703,7 @@
             const labelFor = (precision) => {
                 const minMove = Math.pow(10, -precision);
                 optionsChart.applyOptions({ priceFormat: { precision, minMove } });
-                return optionsChart.renderers[0].formatAxisValue(1234.5678);
+                return layerRenderer(optionsChart, 0).formatAxisValue(1234.5678);
             };
             assertEqual(labelFor(0), new Intl.NumberFormat(undefined, { maximumFractionDigits: 0 }).format(1234.5678), 'precision 0');
             assertEqual(labelFor(2), new Intl.NumberFormat(undefined, { maximumFractionDigits: 2 }).format(1234.5678), 'precision 2');
@@ -493,7 +722,7 @@
             // The locale changes label formatting.
             const localeLabel = (locale) => {
                 optionsChart.applyOptions({ locale });
-                return optionsChart.renderers[0].formatAxisValue(1234.5);
+                return layerRenderer(optionsChart, 0).formatAxisValue(1234.5);
             };
             assertEqual(localeLabel('en-US'), '1,234.5', 'en-US label');
             assertEqual(localeLabel('de-DE'), new Intl.NumberFormat('de-DE', { maximumFractionDigits: 2 }).format(1234.5), 'de-DE label');
@@ -538,6 +767,112 @@
             const plainAgain = await recoloured();
             if (plainAgain.magenta !== 0) throw new Error('Border pixels survived borderVisible=false.');
             if (plainAgain.green === 0) throw new Error('Repainting after the border toggle lost the up colour.');
+
+            // --- Border geometry and translucency -----------------------------
+            // A border is a frame, never a fill under the body: a translucent fill
+            // must keep compositing against the background, not the border colour.
+            // Measured on one large opaque-bodied candle so the numbers are exact.
+            const frameHost = document.createElement('div');
+            frameHost.style.cssText = 'width:200px;height:160px';
+            document.body.appendChild(frameHost);
+            const frameChart = new Chart(frameHost, {
+                theme: 'paper',
+                candlestick: { upColor: '#00ff00', borderUpColor: '#ff0000', wickVisible: false, borderVisible: true },
+            });
+            const frameCandle = [{ time: baseTime, open: 100, high: 102, low: 98, close: 101 }];
+            frameChart.setData(frameCandle);
+            const frameCanvas = frameHost.querySelectorAll('canvas')[1];
+            const frameGl = frameCanvas.getContext('webgl2');
+            let frame = null;
+            const frameDraw = frameGl.drawElements.bind(frameGl);
+            frameGl.drawElements = (...args) => {
+                const result = frameDraw(...args);
+                const W = frameGl.drawingBufferWidth;
+                const H = frameGl.drawingBufferHeight;
+                const px = new Uint8Array(W * H * 4);
+                frameGl.readPixels(0, 0, W, H, frameGl.RGBA, frameGl.UNSIGNED_BYTE, px);
+                const at = (x, y) => {
+                    const i = (y * W + x) * 4;
+                    return { r: px[i], g: px[i + 1], b: px[i + 2], a: px[i + 3] };
+                };
+                const isRed = (c) => c.r > 200 && c.g < 60 && c.b < 60;
+                const isGreen = (c) => c.g > 200 && c.r < 60 && c.b < 60;
+                const isAlphaGreen = (c) => c.a > 16 && c.a < 200 && c.g > 90 && c.g < 190 && c.r < 60 && c.b < 60;
+                let minX = Infinity, maxX = -1, minY = Infinity, maxY = -1;
+                for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
+                    if (at(x, y).a < 16) continue;
+                    if (x < minX) minX = x; if (x > maxX) maxX = x;
+                    if (y < minY) minY = y; if (y > maxY) maxY = y;
+                }
+                if (maxX >= 0) {
+                    let red = 0, green = 0, alphaGreen = 0;
+                    for (let y = minY; y <= maxY; y++) for (let x = minX; x <= maxX; x++) {
+                        const c = at(x, y);
+                        if (c.a < 16) continue;
+                        if (isRed(c)) red++;
+                        else if (isGreen(c)) green++;
+                        else if (isAlphaGreen(c)) alphaGreen++;
+                    }
+                    const cx = Math.floor((minX + maxX) / 2);
+                    const cy = Math.floor((minY + maxY) / 2);
+                    frame = {
+                        w: maxX - minX + 1,
+                        h: maxY - minY + 1,
+                        red, green, alphaGreen,
+                        centre: at(cx, cy),
+                        topRowAllRed: (() => {
+                            for (let x = minX; x <= maxX; x++) if (!isRed(at(x, minY))) return false;
+                            return true;
+                        })(),
+                    };
+                }
+                return result;
+            };
+            const sampleFrame = async (apply) => {
+                frame = null;
+                apply();
+                await waitFrame();
+                return frame;
+            };
+
+            const opaqueFrame = await sampleFrame(() => frameChart.applyOptions({ crosshair: { visible: true } }));
+            if (!opaqueFrame) throw new Error('The bordered candle produced no pixels to measure.');
+            if (opaqueFrame.red === 0) throw new Error('The border frame drew no pixels.');
+            if (!opaqueFrame.topRowAllRed) throw new Error('The border frame is not continuous along the top edge.');
+            if (opaqueFrame.green === 0) throw new Error('The bordered body drew no fill.');
+            // A 1px frame on a w x h rect covers exactly its perimeter, so the
+            // border must be a small fraction of the body rather than covering it.
+            const perimeter = 2 * (opaqueFrame.w + opaqueFrame.h) - 4;
+            if (opaqueFrame.red !== perimeter) {
+                throw new Error(`Border covers ${opaqueFrame.red}px, expected the ${perimeter}px perimeter of a ${opaqueFrame.w}x${opaqueFrame.h} frame.`);
+            }
+
+            // The regression: with a translucent fill the interior must stay
+            // translucent and must not pick up the border colour.
+            const alphaFrame = await sampleFrame(() => frameChart.applyOptions({
+                candlestick: { upColor: 'rgba(0,255,0,0.5)' },
+            }));
+            if (!alphaFrame) throw new Error('The translucent bordered candle produced no pixels.');
+            if (alphaFrame.red !== perimeter) {
+                throw new Error(`Translucent border perimeter changed: ${alphaFrame.red}px vs ${perimeter}px.`);
+            }
+            if (alphaFrame.alphaGreen === 0) {
+                throw new Error('The translucent fill did not composite against the background.');
+            }
+            if (isBorderTint(alphaFrame.centre)) {
+                throw new Error(
+                    `The border bled through the translucent fill: centre is `
+                    + `rgb(${alphaFrame.centre.r},${alphaFrame.centre.g},${alphaFrame.centre.b}).`,
+                );
+            }
+
+            function isBorderTint(c) {
+                // Red showing through green at partial alpha lands in this range.
+                return c.r > 90 && c.r < 190 && c.g > 90 && c.g < 190 && c.b < 90;
+            }
+
+            frameChart.destroy();
+            frameHost.remove();
 
             // Grid toggles.
             optionsChart.applyOptions({ grid: { vertLines: false, horzLines: false } });

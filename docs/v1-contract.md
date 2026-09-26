@@ -55,9 +55,26 @@ Each condition carries its own `.d.ts` so a CommonJS consumer's `require('matrix
 
 ## Runtime requirements
 
-`Chart` requires a browser document and **WebGL2**. `canvas.getContext('webgl2')` must succeed. There is no Canvas2D candlestick fallback in v1. Unsupported engines throw `MatrixCharts: WebGL2 is not supported by this browser.`
+`Chart` requires a browser document and **WebGL2**. `canvas.getContext('webgl2')` must succeed. There is no Canvas2D candlestick fallback in v1, no software WebGL polyfill, and no reduced-fidelity mode.
 
-Supported intent: current Chromium, Firefox, and Safari with WebGL2. Not IE, not Safari without WebGL2.
+When the context cannot be acquired, `new Chart(...)` throws exactly:
+
+```
+MatrixCharts: WebGL2 is required.
+```
+
+That string is stable and safe to match on. The failure is fail-fast and clean: the three layers are built and initialised while detached and are only attached to the caller's container once every renderer is live, so a rejected construction leaves the container byte-for-byte as it was, including any markup the caller put there. There is no window in which a caller can observe a half-mounted chart or a set of empty canvases. A failed construction also poisons nothing: constructing again after the capability returns works normally.
+
+Supported engines, and the versions that first shipped WebGL2:
+
+| Browser | Minimum |
+|---|---|
+| Chrome, Edge, Opera | 56 / 79 / 43 |
+| Firefox | 51 |
+| Safari (macOS, iOS) | 15 |
+| Internet Explorer | not supported, at any version |
+
+Safari 14 and earlier are out, including iOS 14. A Canvas2D renderer is a separate post-v1 milestone with a documented cap on visible candles; it is deliberately absent from v1 rather than half-present.
 
 ## `CandleData`
 
@@ -92,10 +109,17 @@ new Chart(container: HTMLElement | string, options?: ChartOptions)
 | `replaceData(candles)` | preserved | Authoritative snapshot. Keep zoom; rematerialize the time anchor when that timestamp still exists. |
 | `appendData(candle)` / `appendBatch(candles)` | follow if at live edge | Each candle `time` must be strictly after the current last. |
 | `updateLast(candle)` | unchanged | `candle.time` must equal the current last timestamp. |
-| `setTheme(theme)` | redraw | `'dark'` or `'paper'`. |
-| `destroy()` | — | Detach listeners, drop GPU resources, empty the container. |
+| `setTheme(theme)` | redraw | `'dark'` or `'paper'`. Equivalent to `applyOptions({ theme })`. |
+| `destroy()` | — | Detach listeners, drop GPU resources, remove the chart's own wrapper. |
 
 Historical corrections that are not the current last candle require `replaceData` (or a feed snapshot). The chart never invents missing bars.
+
+### Teardown
+
+`destroy()` removes only the wrapper the chart created. Any other markup the caller placed in the same container, such as a legend or a toolbar, is left untouched.
+
+After `destroy()` the chart is unusable: every public method, including the read API and the subscriptions, throws exactly `MatrixCharts: This chart has been destroyed.` No method quietly serves stale state. `destroy()` is idempotent, so it is safe to call from more than one teardown path.
+
 
 The horizontal coordinate is the candle **ordinal index**, not wall-clock time. Closed sessions (nights, weekends, holidays) are compressed. Axis and crosshair labels snap to real candle timestamps.
 
@@ -125,6 +149,14 @@ The index range is half-open because it names a set of bars. The time range is i
 
 Time conversions snap to a real candle timestamp and never interpolate across a gap, so `coordinateToTime` at the midpoint of a weekend returns the Friday or Monday candle, never a Saturday.
 
+### Handler re-entrancy
+
+A handler may call back into the chart. Doing so cannot start an event loop: while `crosshairMove` or `visibleRangeChange` handlers are running, further crosshair emissions and further range notifications are suppressed. A change a handler causes for itself is therefore not re-notified, but the next change from outside still fires. This makes a handler that restyles the chart on every notification safe rather than a runaway `requestAnimationFrame` chain.
+
+### Sizing
+
+Canvas backing stores are sized from the container on the `ResizeObserver` notification, and re-checked at the top of every render. The re-check is what makes the chart correct in environments where the observer is late, throttled, or unavailable, such as a background tab or an embedded webview: the next time the chart renders, it renders at the right resolution, and a container that changed size while the chart was idle is picked up then. The guarantee is scoped to rendering, so a pointer hover, which repaints only the crosshair layer, deliberately does not resize canvases it is not about to redraw.
+
 `getVisibleTimeRange()` is `null` and `getVisibleLogicalRange()` is `{ from: 0, to: 0 }` when the chart is empty or scrolled entirely off the series.
 
 ## User events
@@ -138,6 +170,8 @@ Subscribe to the chart; do not attach listeners to the canvases. The chart wrapp
 | `subscribeVisibleRangeChange(handler)` | When the visible bars or bar spacing change, at most once per animation frame. |
 
 Each returns an `Unsubscribe` (`() => void`). Calling it more than once is harmless. `destroy()` drops every handler, so a destroyed chart never calls back into application code.
+
+`crosshair.visible: false` suppresses the drawn crosshair only. `crosshairMove` still fires, because the payload describes the pointer position over the data and is useful for a tooltip that should keep working with the crosshair hidden. A subscriber that wants neither should ignore the events.
 
 `CrosshairMoveEvent` and `ChartClickEvent` are discriminated unions on `candle`:
 
@@ -217,6 +251,8 @@ chart.applyOptions({ priceFormat: { precision: 0, minMove: 1 } });
 
 **`candlestick.wickVisible: false`** skips generating and drawing the wick segments. **`borderVisible: true`** draws a 1 device-pixel frame inside the body outline and insets the fill to match, in the same indexed pass with no extra shader or draw call. The body is never grown, so the gutter between bars is unchanged, and the frame is skipped on bodies too small to hold it.
 
+The border is a frame of four strips, never a quad underneath the body. That matters for translucent fills: the fill always composites against the plot background, never against the border colour, so `borderVisible` cannot tint the interior of a candle. Verified by construction, since a body covered by the border quad would blend to the border's hue wherever the fill has alpha.
+
 Recolouring reaches the GPU without touching the data: `applyOptions` repaints from the existing vertex buffers, and `getCandleCount()` is unchanged.
 
 
@@ -225,12 +261,14 @@ Recolouring reaches the GPU without touching the data: `applyOptions` repaints f
 
 Use `WebSocketCandleSource` + `ChartFeedController` against a `CandleTarget` (`Chart` implements this). Do not open sockets inside renderers.
 
-Message types: `snapshot`, `append`, `update`, `heartbeat`. Sequences are non-negative safe integers and increase once per message. Snapshot is authoritative. Gaps pause deltas and emit `{"type":"resync","afterSequence":n,"reason":"..."}`. Heartbeats must arrive more often than the client timeout. Reconnect backoff is capped; v1 retries indefinitely.
+Message types: `snapshot`, `update`, `append`, `heartbeat`. Sequences are non-negative safe integers and increase once per message. Snapshot is authoritative. Gaps pause deltas and emit `{"type":"resync","afterSequence":n,"reason":"..."}`. Heartbeats must arrive more often than the client timeout. Reconnect backoff is capped; v1 retries indefinitely.
+
+A candle field that is not a finite number is rejected at the transport boundary and requests a snapshot. `JSON.parse` turns an out-of-range literal such as `1e999` into `Infinity`, which is a `number` but not a usable price or timestamp, so it is rejected like any other malformed field rather than passed downstream for a consumer to catch. A malformed frame requests a resync once; further bad frames do not re-send it while one is already pending.
 
 `MockCandleSource` is a development source, not a production protocol.
 
 ## Breaking vs additive
 
-**Breaking:** changing `CandleData` field units; adding required fields; new required feed message types for a working live chart; removing any export in the table above; changing the package entry or its `exports` conditions; changing mutation ordering rules; changing the half-open index range or inclusive time range conventions; making a conversion depend on `devicePixelRatio`; changing when an event fires or what a `null` field means; making `maxRetainedCandles` settable at runtime; changing a resolved default or a validation rule; requiring wall-clock X; dropping the WebGL2 requirement without a replacement renderer.
+**Breaking:** changing `CandleData` field units; adding required fields; new required feed message types for a working live chart; removing any export in the table above; changing the package entry or its `exports` conditions; changing mutation ordering rules; changing the half-open index range or inclusive time range conventions; making a conversion depend on `devicePixelRatio`; changing when an event fires or what a `null` field means; making `maxRetainedCandles` settable at runtime; changing a resolved default or a validation rule; changing the WebGL2 or post-destroy error strings, or what `destroy()` removes; requiring wall-clock X; dropping the WebGL2 requirement without a replacement renderer.
 
 **Additive (allowed in 1.x):** extra optional `ChartOptions`; new `Chart` methods; optional feed fields the v1 client ignores; extra exports.

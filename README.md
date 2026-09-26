@@ -17,14 +17,39 @@ chart.setData([
 ]);
 ```
 
+`new Chart(container, options)` takes an `HTMLElement` or an element id.
+
 Ships ESM and CommonJS with separate declarations for each, so both work in Vite/Next and in `require()`-based Node tests. No runtime dependencies.
 
 ## Requirements
 
-- Browser DOM
-- **WebGL2** (no Canvas2D candlestick fallback in v1)
+- A browser DOM.
+- **WebGL2 is required.** There is no Canvas2D fallback in v1.
 
-`new Chart(container, options)` takes an `HTMLElement` or an element id.
+If `canvas.getContext('webgl2')` fails, `new Chart(...)` throws `MatrixCharts: WebGL2 is required.` and leaves your container exactly as it was — no empty canvases, no half-mounted chart. Detection is therefore a `try`/`catch` around the constructor:
+
+```ts
+try {
+    chart = new Chart(host);
+} catch (error) {
+    if (error instanceof Error && error.message === 'MatrixCharts: WebGL2 is required.') {
+        showUnsupportedBrowserNotice();
+    } else {
+        throw error;
+    }
+}
+```
+
+Supported engines, and the versions that first shipped WebGL2:
+
+| Browser | Minimum |
+|---|---|
+| Chrome, Edge, Opera | 56 / 79 / 43 |
+| Firefox | 51 |
+| Safari (macOS, iOS) | 15 |
+| Internet Explorer | not supported, at any version |
+
+Safari 14 and earlier are out, including iOS 14. There is no software WebGL polyfill and no reduced-fidelity mode; on an unsupported engine the chart refuses to mount rather than drawing something misleading. A Canvas2D renderer is planned as a separate milestone with a documented cap on visible candles, not as part of v1.
 
 ## Reading the viewport
 

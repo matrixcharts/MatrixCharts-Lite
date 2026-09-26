@@ -43,3 +43,16 @@ test('no public export is reachable only through a deep path', () => {
     assert.equal(publicApi.Chart.prototype.constructor, publicApi.Chart);
 });
 
+test('the WebGL2 requirement ships as one stable, documented error string', async () => {
+    // Integrators match on this text, and the contract freezes it, so a change
+    // here has to be a deliberate breaking change rather than a reword.
+    const { WebGL2Renderer } = require('../.test-build/renderers/WebGL2Renderer.js');
+    const noContextCanvas = { getContext: () => null };
+    const emitter = { on() {}, off() {} };
+    assert.throws(
+        () => new WebGL2Renderer().init(noContextCanvas, emitter),
+        (error) => error.message === 'MatrixCharts: WebGL2 is required.',
+        'unsupported context must throw the exact documented message',
+    );
+});
+

@@ -305,21 +305,25 @@ export class WebSocketCandleSource implements CandleSource {
     private parseCandle(value: unknown): CandleData {
         if (typeof value !== 'object' || value === null) throw new Error('Candle must be an object.');
         const candle: { time?: unknown; open?: unknown; high?: unknown; low?: unknown; close?: unknown } = value;
+        // `Number.isFinite`, not `typeof`: JSON.parse turns an out-of-range literal
+        // such as 1e999 into Infinity, which is a number but not a usable price or
+        // timestamp. Rejecting it here keeps the parser's contract honest instead of
+        // relying on every downstream consumer to re-check.
         if (
-            typeof candle.time !== 'number' ||
-            typeof candle.open !== 'number' ||
-            typeof candle.high !== 'number' ||
-            typeof candle.low !== 'number' ||
-            typeof candle.close !== 'number'
+            !Number.isFinite(candle.time) ||
+            !Number.isFinite(candle.open) ||
+            !Number.isFinite(candle.high) ||
+            !Number.isFinite(candle.low) ||
+            !Number.isFinite(candle.close)
         ) {
-            throw new Error('Candle fields time/open/high/low/close must be numbers.');
+            throw new Error('Candle fields time/open/high/low/close must be finite numbers.');
         }
         return {
-            time: candle.time,
-            open: candle.open,
-            high: candle.high,
-            low: candle.low,
-            close: candle.close,
+            time: candle.time as number,
+            open: candle.open as number,
+            high: candle.high as number,
+            low: candle.low as number,
+            close: candle.close as number,
         };
     }
 }

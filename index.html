@@ -234,7 +234,7 @@
         theme.addEventListener('change', () => {
             // Phase 4: the theme toggle is just an applyOptions call. Colours the
             // user set explicitly below survive the preset switch.
-            chart.applyOptions({ theme: theme.value });
+            restyle({ theme: theme.value }, `theme ${theme.value}`);
             document.body.dataset.theme = theme.value;
             syncSwatchesToOptions();
         });
@@ -247,32 +247,49 @@
         const gridInput = document.querySelector('#grid-mode');
         const precisionInput = document.querySelector('#price-precision');
 
+        /**
+         * Wraps applyOptions so a rejected value surfaces in the status line
+         * instead of an uncaught exception. `priceFormat.precision` and
+         * `minMove` must agree, so they are always sent as a pair.
+         */
+        const restyle = (partial, label) => {
+            try {
+                chart.applyOptions(partial);
+                status.textContent = label;
+            } catch (error) {
+                status.textContent = error instanceof Error ? error.message : 'invalid option';
+                syncSwatchesToOptions();
+            }
+        };
+
         upInput.addEventListener('input', () => {
-            chart.applyOptions({ candlestick: { upColor: upInput.value } });
+            restyle({ candlestick: { upColor: upInput.value } }, `up ${upInput.value}`);
         });
         downInput.addEventListener('input', () => {
-            chart.applyOptions({ candlestick: { downColor: downInput.value } });
+            restyle({ candlestick: { downColor: downInput.value } }, `down ${downInput.value}`);
         });
         wicksInput.addEventListener('change', () => {
-            chart.applyOptions({ candlestick: { wickVisible: wicksInput.value === 'true' } });
+            restyle({ candlestick: { wickVisible: wicksInput.value === 'true' } }, `wicks ${wicksInput.value}`);
         });
         bordersInput.addEventListener('change', () => {
-            chart.applyOptions({ candlestick: { borderVisible: bordersInput.value === 'true' } });
+            restyle({ candlestick: { borderVisible: bordersInput.value === 'true' } }, `borders ${bordersInput.value}`);
         });
         crosshairInput.addEventListener('change', () => {
-            chart.applyOptions({ crosshair: { visible: crosshairInput.value === 'true' } });
+            restyle({ crosshair: { visible: crosshairInput.value === 'true' } }, `crosshair ${crosshairInput.value}`);
         });
         gridInput.addEventListener('change', () => {
-            chart.applyOptions({
+            restyle({
                 grid: {
                     vertLines: gridInput.value === 'both' || gridInput.value === 'vert',
                     horzLines: gridInput.value === 'both' || gridInput.value === 'horz',
                 },
-            });
+            }, `grid ${gridInput.value}`);
         });
         precisionInput.addEventListener('change', () => {
             const precision = Number(precisionInput.value);
-            chart.applyOptions({ priceFormat: { precision } });
+            // A precision that cannot show the tick size is rejected, so widen
+            // minMove together with it.
+            restyle({ priceFormat: { precision, minMove: Math.pow(10, -precision) } }, `precision ${precision}`);
         });
 
         /** Reflects the resolved snapshot back into the controls after a theme change. */

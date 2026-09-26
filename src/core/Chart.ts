@@ -47,6 +47,8 @@ export class Chart {
     
     // Store your active renderers
     private renderers: IRenderer[] = [];
+    /** Held directly rather than by position, since init order is not paint order. */
+    private dataRenderer!: WebGL2Renderer;
     private isDragging: boolean = false;
     private lastPointerX: number = 0;
     private activePointers: Map<number, { x: number; y: number }> = new Map();
@@ -97,6 +99,16 @@ export class Chart {
 
     private lastReportedRange: VisibleRangeSnapshot | null = null;
     private scheduledRangeFrame: number | null = null;
+    /**
+     * A destroyed chart is unusable. Every public method throws a single stable
+     * error rather than some throwing internal messages and others quietly
+     * serving stale state, which is far harder to diagnose at an integration
+     * boundary.
+     */
+    private destroyed: boolean = false;
+    /** Guards against a handler re-entering its own event and looping forever. */
+    private emittingCrosshair: boolean = false;
+    private emittingVisibleRange: boolean = false;
 
     /**
      * Mounts a chart into an existing element, or into `document.getElementById(container)`.
@@ -116,45 +128,62 @@ export class Chart {
 
         this.container = resolveChartContainer(container);
 
+        // Layers are built and initialised while still detached from the document,
+        // and the wrapper is only attached once every renderer is live. A browser
+        // without WebGL2 therefore fails fast and leaves the caller's container
+        // exactly as it was, instead of a half-mounted shell of empty canvases.
         this.canvasWrapper = document.createElement('div');
         this.canvasWrapper.style.position = 'relative';
         this.canvasWrapper.style.width = '100%';
         this.canvasWrapper.style.height = '100%';
         this.canvasWrapper.style.touchAction = 'none';
         this.canvasWrapper.style.backgroundColor = initial.layout.background;
-        this.container.appendChild(this.canvasWrapper);
 
         // Initialize layers
         const gridCanvas = this.createLayer(0);
         const dataCanvas = this.createLayer(1);
         const uiCanvas = this.createLayer(2);
 
-        // Layer 0: Background Grid
-        const gridRenderer = new Canvas2DRenderer(true);
-        gridRenderer.init(gridCanvas, this.emitter);
-        this.renderers.push(gridRenderer);
+        try {
+            // Layer 1: GPU Data. Initialised first because WebGL2 is the hard
+            // requirement, so the unsupported case costs one context attempt and
+            // no Canvas2D work. Paint order still comes from the z-index.
+            const dataRenderer = new WebGL2Renderer();
+            dataRenderer.init(dataCanvas, this.emitter);
+            this.dataRenderer = dataRenderer;
+            this.renderers.push(dataRenderer);
 
-        // Layer 1: GPU Data
-        const dataRenderer = new WebGL2Renderer();
-        dataRenderer.init(dataCanvas, this.emitter);
-        this.renderers.push(dataRenderer);
+            // Layer 0: Background Grid
+            const gridRenderer = new Canvas2DRenderer(true);
+            gridRenderer.init(gridCanvas, this.emitter);
+            this.renderers.push(gridRenderer);
 
-        // Layer 2: UI Overlay
-        const uiRenderer = new Canvas2DRenderer(false);
-        uiRenderer.init(uiCanvas, this.emitter);
-        this.renderers.push(uiRenderer);
+            // Layer 2: UI Overlay
+            const uiRenderer = new Canvas2DRenderer(false);
+            uiRenderer.init(uiCanvas, this.emitter);
+            this.renderers.push(uiRenderer);
+        } catch (error) {
+            // Release whatever did come up before rethrowing. The wrapper was never
+            // attached, so there is nothing in the caller's DOM to clean up.
+            for (const renderer of this.renderers) {
+                renderer.destroy();
+            }
+            this.renderers.length = 0;
+            throw error;
+        }
+
+        this.container.appendChild(this.canvasWrapper);
         this.emitter.emit('options', initial);
 
         // Bind the resize observer to the wrapper
-        this.resizeObserver = new ResizeObserver((entries) => {
-            for (const entry of entries) {
-                const { width, height } = entry.contentRect;
-                this.handleResize(width, height);
-            }
+        this.resizeObserver = new ResizeObserver(() => {
+            // The wrapper's own client size is the single source of truth, so the
+            // entry payload is deliberately not used here.
+            this.handleResize();
         });
-        
+
         this.resizeObserver.observe(this.canvasWrapper);
-        this.handleResize(this.canvasWrapper.clientWidth, this.canvasWrapper.clientHeight);
+        this.handleResize();
         this.bindEvents();
         document.addEventListener('visibilitychange', this.handleVisibilityChange);
     }
@@ -174,18 +203,44 @@ export class Chart {
         return canvas;
     }
 
-    private handleResize(width: number, height: number): void {
-        if (width === 0 || height === 0) return;
-        
-        const dpr = window.devicePixelRatio || 1;
-        
-        // Broadcast the resize and new DPR to all rendering engines
-        for (const renderer of this.renderers) {
-            renderer.resize(width, height, dpr);
-        }
-        
+    private handleResize(): void {
+        this.syncRendererSize();
         this.cancelScheduledViewportUpdate();
         this.updateViewport();
+    }
+
+    private lastSizedWidth: number = 0;
+    private lastSizedHeight: number = 0;
+    private lastSizedRatio: number = 0;
+
+    /**
+     * Sizes the renderer canvases to the wrapper when that has changed.
+     *
+     * This runs at the top of every viewport update as well as from the
+     * ResizeObserver, so the backing store self-corrects on the next time the
+     * chart renders even where ResizeObserver is late, throttled, or entirely
+     * unavailable, such as a background tab or an embedded webview. The observer
+     * stays the fast path; this is the safety net. Costs two number comparisons
+     * per render.
+     */
+    private syncRendererSize(): void {
+        const width: number = this.canvasWrapper.clientWidth;
+        const height: number = this.canvasWrapper.clientHeight;
+        if (width === 0 || height === 0) return;
+        const ratio: number = window.devicePixelRatio || 1;
+        if (
+            width === this.lastSizedWidth &&
+            height === this.lastSizedHeight &&
+            ratio === this.lastSizedRatio
+        ) {
+            return;
+        }
+        this.lastSizedWidth = width;
+        this.lastSizedHeight = height;
+        this.lastSizedRatio = ratio;
+        for (const renderer of this.renderers) {
+            renderer.resize(width, height, ratio);
+        }
     }
 
     private redraw(): void {
@@ -334,10 +389,12 @@ export class Chart {
     }
 
     public setData(candles: readonly CandleData[]): void {
+        this.assertAlive();
         this.loadData(candles, false);
     }
 
     public setTheme(theme: ChartTheme): void {
+        this.assertAlive();
         this.applyOptions({ theme });
     }
 
@@ -354,6 +411,7 @@ export class Chart {
      * under a live viewport.
      */
     public applyOptions(partial: ChartOptions): void {
+        this.assertAlive();
         if (partial === null || typeof partial !== 'object' || Array.isArray(partial)) {
             throw new Error(`MatrixCharts: applyOptions expects an options object, received ${String(partial)}.`);
         }
@@ -387,6 +445,7 @@ export class Chart {
 
     /** Fully resolved options. The returned object is a fresh, immutable snapshot. */
     public options(): Readonly<ResolvedChartOptions> {
+        this.assertAlive();
         return this.resolvedOptions;
     }
 
@@ -419,18 +478,29 @@ export class Chart {
         this.followsLiveEdge = this.isAtLiveEdge();
     }
 
+    // --- Public API ------------------------------------------------------------
+
+    /** Throws if `destroy()` has run. Called by every public entry point. */
+    private assertAlive(): void {
+        if (this.destroyed) {
+            throw new Error('MatrixCharts: This chart has been destroyed.');
+        }
+    }
+
     // --- User events ------------------------------------------------------------
     // Handlers are held in Sets and iterated over a copy, so subscribing or
     // unsubscribing from inside a handler is safe and cannot skip a listener.
 
     /** Fires as the pointer moves over the chart, and once when it leaves. */
     public subscribeCrosshairMove(handler: (event: CrosshairMoveEvent) => void): Unsubscribe {
+        this.assertAlive();
         this.crosshairHandlers.add(handler);
         return () => { this.crosshairHandlers.delete(handler); };
     }
 
     /** Fires on a press and release that did not turn into a pan or pinch. */
     public subscribeClick(handler: (event: ChartClickEvent) => void): Unsubscribe {
+        this.assertAlive();
         this.clickHandlers.add(handler);
         return () => { this.clickHandlers.delete(handler); };
     }
@@ -440,11 +510,24 @@ export class Chart {
      * per animation frame. A drag that stays inside one bar's width is silent.
      */
     public subscribeVisibleRangeChange(handler: (event: VisibleRangeEvent) => void): Unsubscribe {
+        this.assertAlive();
         this.visibleRangeHandlers.add(handler);
         return () => { this.visibleRangeHandlers.delete(handler); };
     }
 
     private emitCrosshair(): void {
+        // Re-entrancy guard: a handler that calls back into the chart (applyOptions,
+        // setData) must not be able to drive an unbounded emission loop.
+        if (this.emittingCrosshair) return;
+        this.emittingCrosshair = true;
+        try {
+            this.dispatchCrosshair();
+        } finally {
+            this.emittingCrosshair = false;
+        }
+    }
+
+    private dispatchCrosshair(): void {
         const payload: ChartEvents['crosshair'] = {
             x: this.crosshairX,
             y: this.crosshairY,
@@ -540,6 +623,7 @@ export class Chart {
 
     /** CSS pixels per candle index. */
     public getBarSpacing(): number {
+        this.assertAlive();
         return this.scaleX;
     }
 
@@ -549,6 +633,7 @@ export class Chart {
      * series is empty or fully scrolled out of view.
      */
     public getVisibleLogicalRange(): LogicalRange {
+        this.assertAlive();
         return visibleLogicalRange(this.viewport, this.candlePyramid.candleCount);
     }
 
@@ -558,6 +643,7 @@ export class Chart {
      * so the span can be wider than the elapsed visible time.
      */
     public getVisibleTimeRange(): TimeRange | null {
+        this.assertAlive();
         const { from, to } = this.getVisibleLogicalRange();
         if (to <= from) return null;
         const first: CandleData | null = this.getCandleAt(from);
@@ -568,6 +654,7 @@ export class Chart {
 
     /** Number of candles retained in chart memory. */
     public getCandleCount(): number {
+        this.assertAlive();
         return this.candlePyramid.candleCount;
     }
 
@@ -577,6 +664,7 @@ export class Chart {
      * renderer draws, so they may differ from the doubles that were passed in.
      */
     public getCandleAt(index: number): CandleData | null {
+        this.assertAlive();
         const candleCount: number = this.candlePyramid.candleCount;
         if (!Number.isInteger(index) || index < 0 || index >= candleCount) return null;
         const time: number | undefined = this.candleTimes[index];
@@ -595,21 +683,25 @@ export class Chart {
 
     /** Newest retained candle, or `null` when the chart has no data. */
     public getLastCandle(): CandleData | null {
+        this.assertAlive();
         return this.getCandleAt(this.candlePyramid.candleCount - 1);
     }
 
     /** Screen x of a candle index. */
     public indexToCoordinate(index: number): number {
+        this.assertAlive();
         return indexToCoordinate(this.viewport, index);
     }
 
     /** Fractional candle index at a screen x. Not clamped to the series. */
     public coordinateToIndex(coordinateX: number): number {
+        this.assertAlive();
         return coordinateToIndex(this.viewport, coordinateX);
     }
 
     /** Index of the candle nearest a screen x, or -1 when the chart has no data. */
     public coordinateToNearestIndex(coordinateX: number): number {
+        this.assertAlive();
         return nearestCandleIndex(this.viewport, coordinateX, this.candlePyramid.candleCount);
     }
 
@@ -618,6 +710,7 @@ export class Chart {
      * data. Snaps to a real candle time and never interpolates through a gap.
      */
     public coordinateToTime(coordinateX: number): number | null {
+        this.assertAlive();
         const index: number = this.coordinateToNearestIndex(coordinateX);
         return index < 0 ? null : this.getCandleAt(index)?.time ?? null;
     }
@@ -627,6 +720,7 @@ export class Chart {
      * the chart has no data. Inverse of `coordinateToTime` up to snapping.
      */
     public timeToCoordinate(time: number): number | null {
+        this.assertAlive();
         const index: number = nearestCandleIndexByTime(
             this.candleTimes.length,
             time,
@@ -637,16 +731,19 @@ export class Chart {
 
     /** Screen y of a price. */
     public priceToCoordinate(price: number): number {
+        this.assertAlive();
         return priceToCoordinate(this.viewport, price);
     }
 
     /** Price at a screen y, using the current auto-fitted vertical scale. */
     public coordinateToPrice(coordinateY: number): number {
+        this.assertAlive();
         return coordinateToPrice(this.viewport, coordinateY);
     }
 
     /** Replaces authoritative feed history while retaining the current time anchor when available. */
     public replaceData(candles: readonly CandleData[]): void {
+        this.assertAlive();
         this.loadData(candles, true);
     }
 
@@ -723,11 +820,13 @@ export class Chart {
     }
 
     public appendData(candle: CandleData): void {
+        this.assertAlive();
         this.appendBatch([candle]);
     }
 
     /** Appends a chronological batch after validating every candle before mutation. */
     public appendBatch(candles: readonly CandleData[]): void {
+        this.assertAlive();
         if (candles.length === 0) return;
 
         const currentCount: number = this.candlePyramid.candleCount;
@@ -760,6 +859,7 @@ export class Chart {
 
     /** Replaces the current last candle; its timestamp must match exactly. */
     public updateLast(candle: CandleData): void {
+        this.assertAlive();
         const currentCount: number = this.candlePyramid.candleCount;
         const pendingCount: number = this.pendingAppends.length;
         if (currentCount === 0 && pendingCount === 0) {
@@ -986,6 +1086,9 @@ export class Chart {
 
     private updateViewport(): void {
         this.cancelScheduledViewportUpdate();
+        // Self-heal the backing store before anything reads it, so a container
+        // that resized without notifying us still renders at the right size.
+        this.syncRendererSize();
         this.flushPendingData();
         this.updateVisibleCandles();
         this.autoScaleY();
@@ -1018,6 +1121,10 @@ export class Chart {
     private scheduleVisibleRangeChange(): void {
         if (this.visibleRangeHandlers.size === 0) return;
         if (this.scheduledRangeFrame !== null) return;
+        // A range change caused from inside a range handler is not re-notified.
+        // Without this, a handler that restyles the chart on every notification
+        // would schedule a fresh frame forever.
+        if (this.emittingVisibleRange) return;
         this.scheduledRangeFrame = requestAnimationFrame(() => {
             this.scheduledRangeFrame = null;
             this.emitVisibleRangeChange();
@@ -1032,6 +1139,7 @@ export class Chart {
 
     private emitVisibleRangeChange(): void {
         if (this.visibleRangeHandlers.size === 0) return;
+        if (this.emittingVisibleRange) return;
         const logical: LogicalRange = this.getVisibleLogicalRange();
         const barSpacing: number = this.scaleX;
         if (isSameVisibleRange(this.lastReportedRange, logical, barSpacing)) return;
@@ -1041,7 +1149,12 @@ export class Chart {
             time: this.getVisibleTimeRange(),
             barSpacing,
         };
-        for (const handler of Array.from(this.visibleRangeHandlers)) handler(event);
+        this.emittingVisibleRange = true;
+        try {
+            for (const handler of Array.from(this.visibleRangeHandlers)) handler(event);
+        } finally {
+            this.emittingVisibleRange = false;
+        }
     }
 
     private updateVisibleCandles(): void {
@@ -1075,10 +1188,9 @@ export class Chart {
     }
 
     private uploadVisibleCandles(): void {
-        const dataRenderer: WebGL2Renderer = this.renderers[1] as WebGL2Renderer;
         // Colours were parsed to vec4 when the options were applied, so this
         // per-frame path only copies four precomputed channels.
-        dataRenderer.drawCandlesticks(
+        this.dataRenderer.drawCandlesticks(
             this.displayedCandles,
             this.candleColors,
             this.resolvedOptions.candlestick.wickVisible,
@@ -1088,6 +1200,8 @@ export class Chart {
     }
 
     public destroy(): void {
+        // Idempotent: teardown code often runs from more than one place.
+        if (this.destroyed) return;
         this.cancelScheduledViewportUpdate();
         this.cancelScheduledVisibleRangeChange();
         document.removeEventListener('visibilitychange', this.handleVisibilityChange);
@@ -1104,10 +1218,16 @@ export class Chart {
         this.clickHandlers.clear();
         this.visibleRangeHandlers.clear();
         this.lastReportedRange = null;
+        this.emittingCrosshair = false;
+        this.emittingVisibleRange = false;
         this.resizeObserver.disconnect();
         for (const renderer of this.renderers) {
             renderer.destroy();
         }
-        this.container.innerHTML = ''; // Clean up DOM
+        this.renderers.length = 0;
+        this.destroyed = true;
+        // Remove only the wrapper this chart created. Wiping the container would
+        // take any legend, toolbar, or other markup the caller put there with it.
+        this.canvasWrapper.remove();
     }
 }
