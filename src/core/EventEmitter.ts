@@ -2,6 +2,7 @@
 import type { CandleData } from './CandleData.js';
 import type { PlotRect } from './coordinates.js';
 import type { ResolvedChartOptions } from './options.js';
+import type { PaneLayout } from './panes.js';
 
 export interface ChartEvents {
     'viewport': {
@@ -11,6 +12,15 @@ export interface ChartEvents {
         scaleY: number;
         /** Region series occupy, in CSS pixels relative to the canvas. */
         plot: PlotRect;
+        /**
+         * Pane rects and vertical transforms for this frame, in CSS pixels and
+         * index-aligned. `transforms[0]` is the price scale, so it agrees with
+         * `offsetY`/`scaleY` above.
+         *
+         * Internal, not a public event: it exists so the two renderers can clip
+         * and label per pane without either owning the layout.
+         */
+        panes?: PaneLayout;
     };
     /**
      * Retained candle timestamps, used by the axis renderer to label ticks. The

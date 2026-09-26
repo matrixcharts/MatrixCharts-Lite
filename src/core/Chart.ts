@@ -22,10 +22,20 @@ import type {
     ChartTheme,
     ResolvedCandleColors,
     ResolvedChartOptions,
+    ResolvedPanes,
     Rgba,
 } from './options.js';
 import { mergeOptionPartials, parseCssColor, resolveCandleColors, resolveOptions } from './options.js';
 import { resolveChartContainer } from './resolveChartContainer.js';
+import {
+    fitPaneTransform,
+    paneRects,
+    paneValueAt,
+    visibleOverlayRange,
+    PRICE_PANE,
+} from './panes.js';
+import type { PaneLayout } from './panes.js';
+import type { VerticalTransform } from '../renderers/WebGLSeries.js';
 import {
     bucketOverlay,
     resolveOverlays,
@@ -105,6 +115,18 @@ export class Chart {
     private displayedCandles: Float32Array = new Float32Array(0);
     private candleTimes: number[] = [];
     private overlays: ResolvedOverlay[] = [];
+    /**
+     * The specs as last supplied, kept so a change to the pane count can
+     * re-validate them. Resolved overlays alone are not enough for that, because
+     * a pane index has already been resolved away by then.
+     */
+    private overlaySpecs: readonly OverlaySpec[] = [];
+    /**
+     * Pane rects and vertical transforms for the current frame, in CSS pixels.
+     * Recomputed with the viewport, because both depend on it.
+     */
+    private paneLayout: PaneLayout = { rects: [], transforms: [], empty: [] };
+    private paneRects: PlotRect[] = [];
     private followsLiveEdge: boolean = true;
     private scheduledViewportFrame: number | null = null;
     private readonly maxRetainedCandles: number;
@@ -466,9 +488,17 @@ export class Chart {
 
         const previous: ResolvedChartOptions = this.resolvedOptions;
         const previousSpacing: number = this.scaleX;
+        // A pane count change can invalidate an overlay's pane index, so the set is
+        // re-validated against the new count before the options are adopted. Throwing
+        // here leaves both the options and the overlays exactly as they were.
+        const nextOverlays: ResolvedOverlay[] | null =
+            nextResolved.panes.weights.length === previous.panes.weights.length
+                ? null
+                : this.resolveOverlaySpecs(nextResolved, this.overlaySpecs);
         this.explicitOptions = nextExplicit;
         this.resolvedOptions = nextResolved;
         this.candleColors = nextColors;
+        if (nextOverlays !== null) this.overlays = nextOverlays;
 
         this.canvasWrapper.style.backgroundColor = nextResolved.layout.background;
 
@@ -771,25 +801,73 @@ export class Chart {
         this.assertAlive();
         // Resolved before any mutation, so a rejected overlay leaves the chart as
         // it was rather than half-applied.
-        this.overlays = resolveOverlays(
-            overlays,
+        const resolved: ResolvedOverlay[] = this.resolveOverlaySpecs(this.resolvedOptions, overlays);
+        this.overlaySpecs = [...overlays];
+        this.overlays = resolved;
+        this.updateViewport();
+    }
+
+    /**
+     * Validates and aligns overlay specs against the current options.
+     *
+     * Kept separate from `setOverlays` because the pane count can change under an
+     * overlay: shrinking `panes.weights` can leave a supplied overlay naming a
+     * pane that no longer exists, and that has to be caught rather than drawn on
+     * whichever pane now occupies that index.
+     */
+    private resolveOverlaySpecs(
+        options: ResolvedChartOptions,
+        specs: readonly OverlaySpec[],
+    ): ResolvedOverlay[] {
+        return resolveOverlays(
+            specs,
             this.candleTimes,
             (spec: OverlaySpec): Rgba => (
                 spec.color === undefined
-                    ? this.resolvedOptions.candlestick.lineColor
+                    ? options.candlestick.lineColor
                     : parseCssColor(spec.color, `overlay ${spec.id}.color`)
             ),
             (spec: OverlaySpec, cssColor: string): Rgba => (
                 parseCssColor(cssColor, `overlay ${spec.id} point color`)
             ),
+            options.panes.weights.length,
         );
-        this.updateViewport();
     }
 
     /** The overlay ids currently supplied, in the order they were given. */
     public getOverlayIds(): string[] {
         this.assertAlive();
         return this.overlays.map((overlay: ResolvedOverlay): string => overlay.id);
+    }
+
+    /**
+     * How many panes the chart has. Always at least 1, the price pane, and equal
+     * to the length of `panes.weights`.
+     */
+    public getPaneCount(): number {
+        this.assertAlive();
+        return this.resolvedOptions.panes.weights.length;
+    }
+
+    /**
+     * The value range currently shown in a pane, low first, or `null` for a pane
+     * that does not exist or has nothing on screen to scale to.
+     *
+     * Pane 0 reports the price range. Any other pane reports the range of the
+     * values drawn in it, which is the range its axis is labelled from, so a
+     * caller labelling its own pane is reading the same numbers the chart is
+     * drawing rather than recomputing them.
+     */
+    public getPaneValueRange(pane: number): [number, number] | null {
+        this.assertAlive();
+        const index: number = Math.trunc(pane);
+        if (index < 0 || index >= this.paneLayout.rects.length) return null;
+        if (this.paneLayout.rects[index].height <= 0) return null;
+        const transform: VerticalTransform = this.paneLayout.transforms[index];
+        const rect: PlotRect = this.paneLayout.rects[index];
+        const top: number = paneValueAt(transform, rect.y);
+        const bottom: number = paneValueAt(transform, rect.y + rect.height);
+        return [Math.min(top, bottom), Math.max(top, bottom)];
     }
 
     /**
@@ -1215,8 +1293,10 @@ export class Chart {
     private autoScaleY(): void {
         if (this.displayedCandles.length === 0) return;
 
-        const plot: PlotRect = this.viewport.plot;
-        const plotBottom: number = plot.y + plot.height;
+        // Fitted to the price pane rather than the whole plot, so a pane below it
+        // does not squash the candles. With one pane the two are the same rect and
+        // this is the behaviour that shipped before panes existed.
+        const pricePane: PlotRect = this.pricePaneRect();
 
         let maxHigh = Number.NEGATIVE_INFINITY;
         let minLow = Number.POSITIVE_INFINITY;
@@ -1236,10 +1316,76 @@ export class Chart {
         const paddedMin = minLow - padding;
         const paddedMax = maxHigh + padding;
 
-        // Fitted to the plot rect, so the highest and lowest visible candle land
-        // inside the plot rather than inside the canvas.
-        this.scaleY = -plot.height / (paddedMax - paddedMin);
-        this.offsetY = plotBottom - paddedMin * this.scaleY;
+        // Fitted to the price pane, so the highest and lowest visible candle land
+        // inside the pane rather than inside the canvas.
+        this.scaleY = -pricePane.height / (paddedMax - paddedMin);
+        this.offsetY = pricePane.y + pricePane.height - paddedMin * this.scaleY;
+    }
+
+    /** The price pane's rect: pane 0 of the current layout, or the whole plot. */
+    private pricePaneRect(): PlotRect {
+        const rects: PlotRect[] = this.paneRects;
+        return rects.length > 0 ? rects[PRICE_PANE] : this.viewport.plot;
+    }
+
+    /**
+     * The layout for the current frame: one rect per declared pane, and a
+     * vertical transform for each.
+     *
+     * Pane 0 keeps the viewport's price scale so the price axis, the candles, and
+     * every price-derived coordinate are untouched. Every other pane is fitted to
+     * the values actually on screen in it, which is what stops an RSI drawn
+     * against the price range from being a flat line along one price level.
+     */
+    private computePaneLayout(): PaneLayout {
+        const options: ResolvedPanes = this.resolvedOptions.panes;
+        const rects: PlotRect[] = paneRects(
+            this.viewport.plot,
+            options.weights,
+            options.separatorHeight,
+        );
+        const transforms: VerticalTransform[] = [];
+        const empty: boolean[] = [];
+
+        const logical: LogicalRange = this.displayedLogicalRange();
+        for (let index = 0; index < rects.length; index++) {
+            if (index === PRICE_PANE) {
+                // The price scale lives on the viewport, which the read API and the
+                // crosshair already use; the panes table only has to agree with it.
+                transforms.push({ scaleY: this.scaleY, offsetY: this.offsetY });
+                empty.push(false);
+                continue;
+            }
+            let minimum: number = Number.POSITIVE_INFINITY;
+            let maximum: number = Number.NEGATIVE_INFINITY;
+            for (const overlay of this.overlays) {
+                if (!overlay.visible || overlay.pane !== index) continue;
+                const range: [number, number] | null = visibleOverlayRange(
+                    overlay.values,
+                    overlay.firstIndex,
+                    overlay.lastIndex,
+                    logical.from,
+                    logical.to,
+                );
+                if (range === null) continue;
+                minimum = Math.min(minimum, range[0]);
+                maximum = Math.max(maximum, range[1]);
+            }
+            const hasValues: boolean = minimum <= maximum;
+            transforms.push(fitPaneTransform(rects[index], minimum, maximum));
+            empty.push(!hasValues);
+        }
+
+        return { rects, transforms, empty };
+    }
+
+    /**
+     * The visible candle range as a half-open interval, computed from the same
+     * transform the candles are drawn with. Reading it off the displayed slice
+     * would work at full resolution and be wrong at every aggregated level.
+     */
+    private displayedLogicalRange(): LogicalRange {
+        return visibleLogicalRange(this.viewport, this.candlePyramid.candleCount);
     }
 
     private updateViewport(): void {
@@ -1250,6 +1396,12 @@ export class Chart {
         this.flushPendingData();
         this.updateVisibleCandles();
         this.autoScaleY();
+        this.paneRects = paneRects(
+            this.viewport.plot,
+            this.resolvedOptions.panes.weights,
+            this.resolvedOptions.panes.separatorHeight,
+        );
+        this.paneLayout = this.computePaneLayout();
         // Broadcast the spatial update to all subscribed renderers without coupling
         this.emitter.emit('viewport', {
             offsetX: this.offsetX,
@@ -1257,6 +1409,7 @@ export class Chart {
             scaleX: this.scaleX,
             scaleY: this.scaleY,
             plot: this.viewport.plot,
+            panes: this.paneLayout,
         });
         this.uploadVisibleCandles();
         // A pan, zoom, or feed append moves the bars under a stationary pointer,
@@ -1408,13 +1561,16 @@ export class Chart {
                 overlay.lastIndex,
                 overlay.pointColors,
             );
-            // Shares the price scale, so an overlay is read against the same axis.
+            // A pane below the price one has its own scale, so an overlay there is
+            // read against its own axis rather than the price axis. Pane 0 passes
+            // null and shares the price transform with the candles.
             this.dataRenderer.drawOverlay(
                 overlay.id,
                 bucketed.points,
                 bucketed.stride,
                 overlay.color,
-                null,
+                overlay.pane === PRICE_PANE ? null : this.paneLayout.transforms[overlay.pane],
+                overlay.pane,
             );
         }
         this.dataRenderer.retainOverlays(active);

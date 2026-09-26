@@ -89,6 +89,8 @@ export class WebGL2Renderer implements IRenderer {
      * before the first viewport event covers nothing rather than everything.
      */
     private currentPlot: PlotRect = { x: 0, y: 0, width: 0, height: 0 };
+    /** Pane rects in CSS pixels, index-aligned with the series' pane indices. */
+    private currentPanes: PlotRect[] = [];
     private devicePixelRatio: number = 1;
 
     public init(canvas: HTMLCanvasElement, emitter: EventEmitter<ChartEvents>): void {
@@ -226,6 +228,8 @@ export class WebGL2Renderer implements IRenderer {
         this.currentOffset = [payload.offsetX, payload.offsetY];
         this.currentScale = [payload.scaleX, payload.scaleY];
         this.currentPlot = payload.plot;
+        // An absent table means no panes, and every series then clips to the plot.
+        this.currentPanes = payload.panes?.rects ?? [];
     };
 
     /**
@@ -284,6 +288,7 @@ export class WebGL2Renderer implements IRenderer {
         stride: 2 | 6,
         color: Rgba,
         vertical: VerticalTransform | null,
+        pane: number = 0,
     ): void {
         const gl: WebGL2RenderingContext = this.requireContext();
         let series: WebGLSeries | undefined = this.overlaySeries.get(id);
@@ -297,6 +302,10 @@ export class WebGL2Renderer implements IRenderer {
             this.series.splice(this.series.length - 1, 0, series);
         }
         series.setVerticalTransform(vertical);
+        // Recorded rather than passed per draw: clipping is a property of where
+        // the series lives, and a series that drew outside its own pane would paint
+        // over the pane above it.
+        series.pane = pane;
 
         const pointCount = Math.floor(points.length / stride);
         if (pointCount < 2) {
@@ -988,6 +997,18 @@ export class WebGL2Renderer implements IRenderer {
 
         gl.viewport(0, 0, this.canvas.width, this.canvas.height);
 
+        const uniforms: SeriesUniforms = {
+            // Device pixels throughout: the shader multiplies by the pixel ratio,
+            // so the resolution it divides by has to be the backing store's.
+            resolutionX: this.canvas.width,
+            resolutionY: this.canvas.height,
+            offsetX: this.currentOffset[0],
+            offsetY: this.currentOffset[1],
+            scaleX: this.currentScale[0],
+            scaleY: this.currentScale[1],
+            pixelRatio: this.devicePixelRatio,
+        };
+
         // Confine data to the plot rect. Without this a bar scrolled part-way past
         // an edge keeps painting over the axis gutter it is supposed to be clipped
         // by. GL's origin is bottom-left, so the box is mirrored in y, and the
@@ -1002,25 +1023,22 @@ export class WebGL2Renderer implements IRenderer {
             return;
         }
         gl.enable(gl.SCISSOR_TEST);
-        gl.scissor(
-            Math.round(plot.x * this.devicePixelRatio),
-            Math.round(this.canvas.height - (plot.y + plot.height) * this.devicePixelRatio),
-            clipWidth,
-            clipHeight,
-        );
-
-        const uniforms: SeriesUniforms = {
-            // Device pixels throughout: the shader multiplies by the pixel ratio,
-            // so the resolution it divides by has to be the backing store's.
-            resolutionX: this.canvas.width,
-            resolutionY: this.canvas.height,
-            offsetX: this.currentOffset[0],
-            offsetY: this.currentOffset[1],
-            scaleX: this.currentScale[0],
-            scaleY: this.currentScale[1],
-            pixelRatio: this.devicePixelRatio,
+        const applyScissor = (rect: PlotRect): void => {
+            gl.scissor(
+                Math.round(rect.x * this.devicePixelRatio),
+                Math.round(this.canvas!.height - (rect.y + rect.height) * this.devicePixelRatio),
+                Math.round(rect.width * this.devicePixelRatio),
+                Math.round(rect.height * this.devicePixelRatio),
+            );
         };
+        applyScissor(plot);
+
         for (const entry of this.series) {
+            // A series in a pane is clipped to that pane rather than to the whole
+            // plot. The price pane uses the plot rect, which is the same box in the
+            // single-pane case, so this only changes anything once panes exist.
+            const paneRect: PlotRect | undefined = this.currentPanes[entry.pane];
+            if (entry.pane !== 0 && paneRect !== undefined) applyScissor(paneRect);
             entry.draw(
                 uniforms,
                 this.resolutionLocation!,
@@ -1029,6 +1047,7 @@ export class WebGL2Renderer implements IRenderer {
                 this.pixelRatioLocation!,
                 this.snapOffsetLocation!,
             );
+            if (entry.pane !== 0 && paneRect !== undefined) applyScissor(plot);
         }
 
         gl.bindVertexArray(null);

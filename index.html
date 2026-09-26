@@ -143,6 +143,13 @@
                 <option value="true">on</option>
             </select>
         </label>
+        <label class="swatch">Panes
+            <select id="pane-weights" aria-label="Pane layout">
+                <option value="1">1 pane</option>
+                <option value="3,1">price + RSI</option>
+                <option value="3,1,1">price + RSI + MACD</option>
+            </select>
+        </label>
         <label class="swatch">Overlay
             <select id="overlay-style" aria-label="Overlay series">
                 <option value="off">off</option>
@@ -150,6 +157,8 @@
                 <option value="bands">Bollinger</option>
                 <option value="stops">Supertrend</option>
                 <option value="mixed">per-point colour</option>
+                <option value="rsi">RSI in its own pane</option>
+                <option value="rsi-macd">RSI + MACD panes</option>
             </select>
         </label>
         <label class="swatch">Cross
@@ -404,15 +413,58 @@
             }
             return out;
         };
+        // Wilder's RSI, the shape an indicator library hands back. Bounded 0..100
+        // and nothing like a price, which is exactly why it needs its own pane.
+        const rsiValues = (closes, period) => {
+            if (closes.length <= period) return [];
+            const out = [];
+            let gain = 0, loss = 0;
+            for (let i = 1; i <= period; i++) {
+                const change = closes[i] - closes[i - 1];
+                if (change >= 0) gain += change; else loss -= change;
+            }
+            gain /= period; loss /= period;
+            out.push(100 - 100 / (1 + (loss === 0 ? Infinity : gain / loss)));
+            for (let i = period + 1; i < closes.length; i++) {
+                const change = closes[i] - closes[i - 1];
+                gain = (gain * (period - 1) + Math.max(change, 0)) / period;
+                loss = (loss * (period - 1) + Math.max(-change, 0)) / period;
+                out.push(100 - 100 / (1 + (loss === 0 ? Infinity : gain / loss)));
+            }
+            return out;
+        };
+        const emaValues = (values, period) => {
+            const out = [];
+            const k = 2 / (period + 1);
+            let seed = 0;
+            for (let i = 0; i < period; i++) seed += values[i];
+            let previous = seed / period;
+            out.push(previous);
+            for (let i = period; i < values.length; i++) {
+                previous = values[i] * k + previous * (1 - k);
+                out.push(previous);
+            }
+            return out;
+        };
 
         const overlayInput = document.querySelector('#overlay-style');
         const setOverlays = (kind) => {
-            const count = chart.getCandleCount();
-            if (count === 0 || kind === 'off') {
+            if (chart.getCandleCount() === 0 || kind === 'off') {
                 chart.setOverlays([]);
                 return;
             }
+            try {
+                setOverlaysInner(kind);
+            } catch (error) {
+                // A refused overlay is a normal outcome here, not a crash: the pane
+                // layout and the indicator have to agree, and the demo shows which
+                // one is wrong rather than leaving an unhandled rejection.
+                status.textContent = error instanceof Error ? error.message : 'overlay error';
+            }
+        };
+        const setOverlaysInner = (kind) => {
             // The chart's own candles are the source, read through public API.
+            const count = chart.getCandleCount();
             const closes = [];
             const times = [];
             for (let i = 0; i < count; i++) {
@@ -454,6 +506,52 @@
                 chart.setOverlays([{ id: 'stops', points }]);
                 return;
             }
+            if (kind === 'rsi' || kind === 'rsi-macd') {
+                // An indicator that does not measure price, in a pane of its own.
+                // The layout is declared before the overlay names a pane in it;
+                // naming a pane that was never declared is refused by the chart.
+                const weights = kind === 'rsi' ? [3, 1] : [3, 1, 1];
+                chart.applyOptions({ panes: { weights } });
+                // Keep the layout control showing what the chart is actually doing,
+                // rather than leaving it claiming a pane count that was replaced.
+                const paneSelect = document.querySelector('#pane-weights');
+                const shown = paneSelect.querySelector(`option[value="${weights.join(',')}"]`);
+                if (shown) paneSelect.value = shown.value;
+                const rsiPeriod = 14;
+                const rsi = rsiValues(closes, rsiPeriod);
+                const rsiStart = closes.length - rsi.length;
+                const overlays = [{
+                    id: 'rsi',
+                    pane: 1,
+                    color: '#bf5af2',
+                    points: rsi.map((value, i) => ({ time: times[rsiStart + i], value })),
+                }];
+                if (kind === 'rsi-macd') {
+                    // Each average is shorter than the candle series by its own
+                    // warm-up, so they are aligned by their own offsets rather than
+                    // indexed as though they started at the same bar. Indexing the
+                    // fast average at the slow one's offset runs off its end and
+                    // produces NaN, which the chart then refuses.
+                    const fast = emaValues(closes, 12);
+                    const slow = emaValues(closes, 26);
+                    const fastStart = closes.length - fast.length;
+                    const macdStart = closes.length - slow.length;
+                    const macd = slow.map((value, i) => ({
+                        time: times[macdStart + i],
+                        value: fast[fastStart + i] - value,
+                    }));
+                    const signal = emaValues(macd.map((point) => point.value), 9);
+                    const signalStart = macdStart + (macd.length - signal.length);
+                    overlays.push({
+                        id: 'macd',
+                        pane: 2,
+                        color: '#5ac8fa',
+                        points: signal.map((value, i) => ({ time: times[signalStart + i], value })),
+                    });
+                }
+                chart.setOverlays(overlays);
+                return;
+            }
             // 'mixed': two overlays at once, one flat and one per-point.
             chart.setOverlays([
                 { id: 'basis', points: means.map((_, i) => at(i)), color: '#ff9f0a' },
@@ -468,6 +566,22 @@
             ]);
         };
         overlayInput.addEventListener('change', () => setOverlays(overlayInput.value));
+
+        // Pane layout is its own control, so the panes can be emptied or resized
+        // without changing which indicator is selected.
+        const paneInput = document.querySelector('#pane-weights');
+        paneInput.addEventListener('change', () => {
+            const weights = paneInput.value.split(',').map(Number);
+            try {
+                chart.applyOptions({ panes: { weights } });
+                // Growing the layout is fine; shrinking it under an indicator that
+                // needs the pane is refused, and the chart says so.
+                if (overlayInput.value !== 'off') setOverlays(overlayInput.value);
+                status.textContent = 'connected';
+            } catch (error) {
+                status.textContent = error instanceof Error ? error.message : 'pane error';
+            }
+        });
 
         window.addEventListener('beforeunload', () => {
             if (feedController) feedController.dispose();

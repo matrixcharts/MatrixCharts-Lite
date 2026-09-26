@@ -347,6 +347,32 @@ chart.setOverlays(Object.entries(output.plots).map(([id, points]) => ({
 
 A point may carry its own `color`, which overrides the overlay's colour for that point and lets one overlay change colour along its length — a MACD histogram signed by side, a stop level that flips between bullish and bearish. This is honoured rather than declared-and-ignored, and it costs nothing for the common case: an overlay whose points are all one colour carries no per-point colour array at all, and the renderer expands the single colour itself.
 
+## Panes
+
+A pane is a horizontal band of the plot area with **its own vertical scale**. Pane 0 is the price pane and always exists. Every pane shares the *horizontal* transform, because every series is indexed on the same time axis; only the vertical one differs, which is why a series can be moved to a pane without anything about its data changing.
+
+Panes are what let an indicator that does not measure price — an RSI, a MACD histogram — be drawn readably instead of being squashed into the price range.
+
+`panes.weights` is one relative height per pane and is what **creates** them; a single pane filling the plot is the default, and is the behaviour without this feature. `panes.separatorHeight` (default 1 CSS pixel) is reserved between panes, and a single pane has nothing to separate from so it is never subtracted. `panes.separatorColor` defaults to the grid colour, so a division reads as part of the grid rather than as new chrome. A weight must be greater than zero, and a bad one is rejected rather than repaired.
+
+`overlay.pane` selects the pane, defaulting to 0. **The pane must exist**: an overlay naming an index that was never declared is rejected, because silently drawing it on whichever pane now occupies that index would put an RSI on the price scale — the exact failure panes exist to prevent. A pane index is checked before any data work, so a typo is reported as a typo.
+
+The same rule applies to `applyOptions`. Shrinking `panes.weights` under a supplied overlay is refused, and because the overlay specs are re-validated before the new options are adopted, **both** the options and the overlays are left exactly as they were.
+
+Pane 0 keeps the viewport's price scale, so the price axis, the candles, and every price-derived coordinate are unchanged. Every other pane is fitted to the values actually on screen in it, read at full resolution rather than from the reduced buckets, so a pane's scale cannot clip a peak that is genuinely visible. A series in a pane is clipped to that pane rather than to the whole plot.
+
+`getPaneCount()` reports the pane count. `getPaneValueRange(index)` reports what a pane is currently showing, low first, or `null` for an index that does not exist or for a pane with nothing on screen — so a caller labelling its own pane reads the same numbers the chart is drawing rather than recomputing them.
+
+Two behaviours worth stating, because both are the alternative to something worse:
+
+**A non-price pane is guaranteed several axis labels.** Sizing a tick step from a fixed pixel separation suits a tall pane and starves a short one: an RSI pane a quarter as tall as the price pane still spans its whole range in far fewer pixels, so a step chosen for 56px of separation rounds up past the pane's own range and leaves a single label on the axis — an RSI you cannot read a level off. The step is therefore walked *down* a 1/2/5 ladder until the pane carries at least four labels, because snapping *up* to that ladder is what defeats a minimum count.
+
+**An empty pane is left unlabelled.** A pane with nothing on screen to scale to has a placeholder transform spanning 0 to 1, and labelling that would put a real-looking axis beside an empty chart. It is drawn, and it is not labelled.
+
+`priceFormat.minMove` applies to the price pane only. It is the instrument's tradable increment, a property of prices; rounding an RSI pane's ticks to multiples of it would leave a pane spanning 0 to 100 labelled every hundredth.
+
+Pane separators are not draggable in this release. Heights are an option, not an interaction.
+
 ## Feed v1
 
 Use `WebSocketCandleSource` + `ChartFeedController` against a `CandleTarget` (`Chart` implements this). Do not open sockets inside renderers.

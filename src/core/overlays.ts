@@ -10,6 +10,7 @@
 // drift apart as the chart zooms.
 
 import type { Rgba } from './options.js';
+import { PRICE_PANE } from './panes.js';
 
 /** One value at one candle timestamp. */
 export interface OverlayPoint {
@@ -33,6 +34,16 @@ export interface OverlaySpec {
     color?: string;
     /** Whether to draw it. An overlay kept for later is cheaper than re-supplying it. */
     visible?: boolean;
+    /**
+     * Which pane to draw on. 0, the price pane, is the default and always exists.
+     *
+     * A higher index is for values that do not measure price — an RSI, a MACD
+     * histogram — which would otherwise be squashed into the price range. The pane
+     * must exist: it is created by declaring `panes.weights`, so naming an index
+     * that was never declared is rejected rather than quietly drawn on the wrong
+     * one.
+     */
+    pane?: number;
 }
 
 /** An overlay after validation: colour resolved, values aligned to candle ordinals. */
@@ -40,6 +51,8 @@ export interface ResolvedOverlay {
     id: string;
     visible: boolean;
     color: Rgba;
+    /** Pane this overlay is drawn on, already checked against the pane count. */
+    pane: number;
     /**
      * One value per retained candle, indexed by candle ordinal. A timestamp that
      * matched no candle is rejected rather than skipped, so this array is always
@@ -88,6 +101,7 @@ export function resolveOverlays(
     resolvePointColor: (spec: OverlaySpec, cssColor: string) => Rgba = (spec): Rgba => (
         resolveColor(spec)
     ),
+    paneCount: number = 1,
 ): ResolvedOverlay[] {
     if (specs.length === 0) return [];
 
@@ -106,6 +120,19 @@ export function resolveOverlays(
         if (!Array.isArray(spec.points)) {
             fail(`Overlay ${JSON.stringify(spec.id)} must supply a points array.`);
         }
+        // Checked before any data work, so a typo in a pane index is reported as
+        // the typo it is rather than as a downstream complaint about geometry.
+        const pane: number = spec.pane ?? PRICE_PANE;
+        if (!Number.isInteger(pane) || pane < 0) {
+            fail(`Overlay ${JSON.stringify(spec.id)} has pane ${pane}; a pane index must be a non-negative integer.`);
+        }
+        if (pane >= paneCount) {
+            fail(
+                `Overlay ${JSON.stringify(spec.id)} is on pane ${pane}, but the chart has `
+                + `${paneCount} pane${paneCount === 1 ? '' : 's'}. Panes are created by `
+                + 'declaring panes.weights, one entry per pane.',
+            );
+        }
         const values = new Float32Array(candleTimes.length);
         if (spec.points.length === 0) {
             // Kept, but with nothing to draw. Not an error: an indicator that has
@@ -114,6 +141,7 @@ export function resolveOverlays(
                 id: spec.id,
                 visible: spec.visible !== false && spec.points.length > 0,
                 color: resolveColor(spec),
+                pane,
                 values,
                 firstIndex: -1,
                 lastIndex: -1,
@@ -169,6 +197,7 @@ export function resolveOverlays(
             id: spec.id,
             visible: spec.visible !== false,
             color: resolveColor(spec),
+            pane,
             values,
             firstIndex,
             lastIndex,

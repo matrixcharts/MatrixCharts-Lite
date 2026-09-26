@@ -1427,6 +1427,229 @@
                 host.remove();
             }
 
+            // --- Panes with independent scales -----------------------------
+            // A pane is a band of the plot with its own vertical scale. The claim
+            // worth testing is that the second pane is scaled in its own units and
+            // that its series stay inside it, which is what an RSI drawn against
+            // the price range would otherwise be.
+            let paneReport = null;
+            {
+                const t0 = Date.UTC(2025, 7, 1);
+                const count = 200;
+                const series = Array.from({ length: count }, (_, i) => {
+                    const open = 4000 + Math.sin(i / 11) * 40;
+                    const close = open + ((i % 7) - 3) * 1.2;
+                    return {
+                        time: t0 + i * 60_000, open, close,
+                        high: Math.max(open, close) + 2, low: Math.min(open, close) - 2,
+                        volume: 1000 + (i % 11) * 90,
+                    };
+                });
+                // A plausible RSI: bounded 0..100, nowhere near a price of 4000.
+                const rsi = series.map((bar, i) => ({
+                    time: bar.time,
+                    value: 50 + Math.sin(i / 5) * 28 + ((i % 13) - 6) * 0.9,
+                }));
+
+                const host = document.createElement('div');
+                host.style.cssText = 'position:absolute;left:-9999px;width:760px;height:420px';
+                document.body.appendChild(host);
+                const chart = new Chart(host, { theme: 'dark' });
+                chart.setData(series);
+
+                if (chart.getPaneCount() !== 1) {
+                    throw new Error(`A new chart has ${chart.getPaneCount()} panes, expected 1.`);
+                }
+                chart.applyOptions({ panes: { weights: [3, 1] } });
+                if (chart.getPaneCount() !== 2) {
+                    throw new Error(`Declaring weights gave ${chart.getPaneCount()} panes, expected 2.`);
+                }
+                chart.setOverlays([{ id: 'rsi', points: rsi, pane: 1, color: '#bf5af2' }]);
+
+                // The price pane reports prices; the RSI pane reports its own units.
+                const priceRange = chart.getPaneValueRange(0);
+                const rsiRange = chart.getPaneValueRange(1);
+                if (priceRange === null || rsiRange === null) {
+                    throw new Error('A pane reported no value range.');
+                }
+                // The price pane must still be reporting prices, in the thousands.
+                if (priceRange[0] < 3000 || priceRange[1] > 5000) {
+                    throw new Error(`The price pane reports ${JSON.stringify(priceRange)}, which is not a price range.`);
+                }
+                // The RSI pane must be reporting its own units. A price scale would
+                // put it near 4000, and a squashed one would put it in a sliver.
+                if (rsiRange[0] < 0 || rsiRange[1] > 120) {
+                    throw new Error(`The RSI pane reports ${JSON.stringify(rsiRange)}, which is not an RSI range.`);
+                }
+                if (chart.getPaneValueRange(2) !== null || chart.getPaneValueRange(-1) !== null) {
+                    throw new Error('A pane index that does not exist reported a range.');
+                }
+
+                // Shrinking the weights under a supplied overlay must be refused, and
+                // must leave both the options and the overlay as they were.
+                let shrinkError = '';
+                try {
+                    chart.applyOptions({ panes: { weights: [1] } });
+                } catch (error) {
+                    shrinkError = error instanceof Error ? error.message : String(error);
+                }
+                if (!shrinkError.includes('the chart has 1 pane')) {
+                    throw new Error(`Shrinking panes under an overlay was not refused: ${shrinkError || 'no error'}`);
+                }
+                if (chart.getPaneCount() !== 2 || chart.getOverlayIds().join(',') !== 'rsi') {
+                    throw new Error('A refused pane change mutated the chart anyway.');
+                }
+
+                // Now measure: the RSI must draw inside its own pane and nowhere
+                // above it, and the price axis must label both panes.
+                const gl = host.querySelectorAll('canvas')[1].getContext('webgl2');
+                const axis = host.querySelectorAll('canvas')[0].getContext('2d');
+                const W = gl.drawingBufferWidth, H = gl.drawingBufferHeight;
+                const dpr = W / host.querySelectorAll('canvas')[1].clientWidth;
+                const gutter = Math.round(78 * dpr);
+                const plotRight = W;
+
+                // Pane 0 is three quarters of the plot, the separator one pixel, and
+                // pane 1 the rest. Derived from the same layout rule the chart uses,
+                // with the gutter sizes read from the public options rather than
+                // from a private accessor. These are CSS bounds, measured downward
+                // from the top of the canvas, because that is the coordinate system
+                // pane rects are expressed in.
+                const layout = chart.options().layout;
+                const plotTop = 0;
+                const plotBottom = host.clientHeight - layout.timeAxisHeight;
+                const plotWidth = host.clientWidth - layout.priceAxisWidth;
+                const separator = 1;
+                const pane0Bottom = plotTop + Math.round((plotBottom - plotTop - separator) * 0.75);
+                const pane1Top = pane0Bottom + separator;
+                // readPixels returns rows bottom-up, so a GL row is a CSS row
+                // mirrored about the buffer's height. Comparing a GL row against a
+                // CSS bound without this is the same units error as comparing CSS
+                // pixels against device pixels.
+                const cssYOf = (glRow) => (H - glRow) / dpr;
+
+                // Union across every pass in the frame. A read taken after only the
+                // first draw sees a partial image — the candle bodies have not been
+                // drawn yet — which makes a "nothing drew here" assertion pass for
+                // the wrong reason. Accumulating the union is what makes the
+                // negative half of this check mean anything.
+                const buf = new Uint8Array(W * H * 4);
+                const oa = gl.drawArrays.bind(gl);
+                const oe = gl.drawElements.bind(gl);
+                const grab = () => {
+                    const px = new Uint8Array(W * H * 4);
+                    gl.readPixels(0, 0, W, H, gl.RGBA, gl.UNSIGNED_BYTE, px);
+                    for (let p = 0; p < W * H; p++) {
+                        const i = p * 4;
+                        if (px[i + 3] > buf[i + 3]) {
+                            buf[i] = px[i]; buf[i + 1] = px[i + 1];
+                            buf[i + 2] = px[i + 2]; buf[i + 3] = px[i + 3];
+                        }
+                    }
+                };
+                gl.drawArrays = (...a) => { const o = oa(...a); grab(); return o; };
+                gl.drawElements = (...a) => { const o = oe(...a); grab(); return o; };
+                chart.applyOptions({ crosshair: { visible: true } });
+                await waitFrame();
+                gl.drawArrays = oa; gl.drawElements = oe;
+
+                // readPixels is bottom-up, so a y is measured from the bottom.
+                let inPane1 = 0;
+                let inPane0 = 0;
+                for (let y = 0; y < H; y++) {
+                    const cssY = cssYOf(y);
+                    for (let x = gutter; x < plotRight; x++) {
+                        const i = (y * W + x) * 4;
+                        if (buf[i + 3] < 128) continue;
+                        const r = buf[i], g = buf[i + 1], b = buf[i + 2];
+                        // #bf5af2, the RSI's own colour, which no theme or candle uses.
+                        const isRsi = r > 140 && g < 130 && b > 150;
+                        if (!isRsi) continue;
+                        if (cssY >= pane1Top && cssY <= plotBottom) inPane1++;
+                        if (cssY >= plotTop && cssY < pane0Bottom) inPane0++;
+                    }
+                }
+                if (inPane1 === 0) {
+                    throw new Error('The RSI drew no pixels inside its own pane.');
+                }
+                if (inPane0 > 0) {
+                    throw new Error(`The RSI drew ${inPane0} pixels inside the price pane, above its own.`);
+                }
+
+                // The axis layer must label both panes: ink in the price gutter at a
+                // y inside pane 1 as well as inside pane 0, which is what proves the
+                // second pane got its own scale rather than the price one. The 2D
+                // layer is not flipped, so its rows are already top-down.
+                const axisBuf = axis.getImageData(0, 0, axis.canvas.width, axis.canvas.height);
+                let pane0Labels = 0, pane1Labels = 0;
+                for (let y = 0; y < H; y++) {
+                    const cssY = y / dpr;
+                    for (let x = 0; x < gutter; x++) {
+                        const i = (y * axis.canvas.width + x) * 4;
+                        if (axisBuf.data[i + 3] < 128) continue;
+                        if (cssY >= plotTop && cssY < pane0Bottom) pane0Labels++;
+                        if (cssY >= pane1Top && cssY <= plotBottom) pane1Labels++;
+                    }
+                }
+                if (pane0Labels === 0) throw new Error('The price pane has no axis labels.');
+                if (pane1Labels === 0) {
+                    throw new Error('The second pane has no axis labels of its own.');
+                }
+
+                // And the second pane must be *readable*: several labels, not one.
+                // A single label is what a tick step sized for a full-height pane
+                // produces on a quarter-height one, and it is the only symptom —
+                // the pane still draws, still has the right scale, and is still
+                // correctly clipped.
+                // And the second pane must be *readable*: several labels, not one.
+                // A single label is what a tick step sized for a full-height pane
+                // produces on a quarter-height one, and it is the only symptom — the
+                // pane still draws, still has the right scale, and is still
+                // correctly clipped.
+                //
+                // Counted as well-separated ink rows rather than by grouping
+                // contiguous ones: two rows more than a label height apart cannot be
+                // part of the same label, so this cannot merge or split wrongly. The
+                // grouping approach reported 112 labels for a pane that holds four,
+                // because the ink inside a glyph is not contiguous.
+                const axisWidth = axis.canvas.width;
+                const LABEL_HEIGHT = 16;
+                const litRows = [];
+                for (let y = 0; y < H; y++) {
+                    let lit = 0;
+                    for (let x = 0; x < gutter; x++) {
+                        const i = (y * axisWidth + x) * 4;
+                        if (axisBuf.data[i] > 90 && axisBuf.data[i + 1] > 90 && axisBuf.data[i + 2] > 90) lit++;
+                    }
+                    if (lit > 2) litRows.push(y / dpr);
+                }
+                const separated = [];
+                for (const y of litRows) {
+                    if (y < pane1Top || y > plotBottom) continue;
+                    if (separated.length === 0 || y - separated[separated.length - 1] > LABEL_HEIGHT) {
+                        separated.push(y);
+                    }
+                }
+                const pane1Labels2 = separated.length;
+                if (pane1Labels2 < 3) {
+                    throw new Error(`The second pane has ${pane1Labels2} separated axis label(s); `
+                        + 'an RSI pane with one label on it cannot be read.');
+                }
+
+                chart.setOverlays([]);
+                paneReport = {
+                    priceRange,
+                    rsiRange,
+                    pane0Labels,
+                    pane1Labels,
+                    pane1LabelCount: pane1Labels2,
+                    rsiPixelsInOwnPane: inPane1,
+                    rsiPixelsAboveItsPane: inPane0,
+                };
+                chart.destroy();
+                host.remove();
+            }
+
             // --- Axis gutters ---------------------------------------------
             // Series are confined to the plot rect, and the axis labels live in
             // the gutters outside it. A bar scrolled part-way past an edge must
@@ -1909,6 +2132,7 @@
                 volumeHistogram: volumeReport,
                 candleStyles: styleReport,
                 overlays: overlayReport,
+                panes: paneReport,
                 barSpacing: chart.getBarSpacing(),
                 visibleLogicalRange: feedRange,
                 visibleTimeRange: {

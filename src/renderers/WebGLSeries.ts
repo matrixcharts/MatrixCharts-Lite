@@ -86,6 +86,22 @@ export class WebGLSeries {
     private indexBuffer: WebGLBuffer;
     private passes: SeriesPass[] = [];
     private vertical: VerticalTransform | null = null;
+    private currentPane: number = 0;
+
+    /**
+     * Which pane this series is drawn in, and therefore which rect clips it.
+     *
+     * A series in a pane below the price one has to be confined to that pane: its
+     * values run on a different vertical scale, so unclipped geometry would
+     * overshoot the pane and paint over the one above it.
+     */
+    public get pane(): number {
+        return this.currentPane;
+    }
+
+    public set pane(index: number) {
+        this.currentPane = index;
+    }
 
     /**
      * `program` is shared by every series: they differ in how their vertices are

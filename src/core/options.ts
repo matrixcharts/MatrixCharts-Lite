@@ -7,6 +7,7 @@
 // preset and then re-apply the caller's overrides.
 
 import { DEFAULT_CANDLE_SPACING_PX } from '../math/candlestickBodyWidth.js';
+import { resolvePaneOptions } from './panes.js';
 
 export type ChartTheme = 'dark' | 'paper';
 
@@ -54,10 +55,42 @@ export interface VolumeOptions {
      * Additive in 1.x. Must be greater than 0 and at most 1.
      *
      * The histogram is scaled to its own range rather than the price range, so it
-     * never distorts the price axis. It shares the plot for now; a later release
-     * gives it its own pane, and the fraction is what becomes that pane's height.
+     * never distorts the price axis. It shares the price pane; a separate pane for
+     * it is expressed with `panes.weights` and its own `pane` index.
      */
     heightRatio?: number;
+}
+
+/**
+ * Panes: horizontal bands of the plot area, each with its own vertical scale.
+ * Additive in 1.x.
+ *
+ * Pane 0 is the price pane and always exists. A pane is what lets an indicator
+ * that does not measure price — an RSI, a MACD histogram — be drawn readably
+ * instead of being squashed into the price range. Every pane shares the
+ * horizontal transform, because every series is indexed on the same time axis;
+ * only the vertical one differs.
+ */
+export interface PanesOptions {
+    /**
+     * Relative heights, one per pane, index 0 being the price pane. Absent means
+     * a single pane filling the plot, which is the behaviour without this feature.
+     *
+     * Declaring the weights is what *creates* the panes, so a series naming a
+     * higher index without them is rejected rather than silently dropped into a
+     * pane that does not exist. A weight must be greater than zero.
+     */
+    weights?: number[];
+    /**
+     * Space reserved between panes, CSS pixels. Defaults to 1. A single pane has
+     * nothing to separate from, so it is never subtracted.
+     */
+    separatorHeight?: number;
+    /**
+     * Colour of the line between panes. Defaults to the grid colour, so a pane
+     * division reads as part of the grid rather than as a new piece of chrome.
+     */
+    separatorColor?: string;
 }
 
 export interface GridOptions {
@@ -140,6 +173,7 @@ export interface ChartOptions {
     priceFormat?: PriceFormatOptions;
     layout?: LayoutOptions;
     volume?: VolumeOptions;
+    panes?: PanesOptions;
     grid?: GridOptions;
     crosshair?: CrosshairOptions;
     timeScale?: TimeScaleOptions;
@@ -165,6 +199,11 @@ export interface ResolvedVolume {
     visible: boolean;
     colors: ResolvedVolumeColors;
     heightRatio: number;
+}
+export interface ResolvedPanes {
+    weights: number[];
+    separatorHeight: number;
+    separatorColor: string;
 }
 export interface ResolvedCrosshair { visible: boolean; color: string }
 export interface ResolvedTimeScale { barSpacing: number; minBarSpacing: number; maxBarSpacing: number }
@@ -192,6 +231,7 @@ export interface ResolvedChartOptions {
     priceFormat: ResolvedPriceFormat;
     layout: ResolvedLayout;
     volume: ResolvedVolume;
+    panes: ResolvedPanes;
     grid: ResolvedGrid;
     crosshair: ResolvedCrosshair;
     timeScale: ResolvedTimeScale;
@@ -210,6 +250,9 @@ const BASE_DEFAULTS: Omit<ResolvedChartOptions, 'theme' | 'locale' | 'candlestic
     maxRetainedCandles: DEFAULT_MAX_RETAINED_CANDLES,
     timeZone: 'UTC',
     priceFormat: { precision: 2, minMove: 0.01 },
+    // One pane filling the plot, and a hairline between panes. The separator
+    // colour is resolved after the grid colour, which it defaults to.
+    panes: { weights: [1], separatorHeight: 1, separatorColor: '' },
     timeScale: {
         barSpacing: DEFAULT_CANDLE_SPACING_PX,
         minBarSpacing: DEFAULT_MIN_BAR_SPACING,
@@ -496,6 +539,9 @@ export function themeDefaults(theme: ChartTheme): ResolvedChartOptions {
             },
         },
         grid: { ...preset.grid },
+        // A pane division reads as part of the grid, so it defaults to the grid
+        // colour rather than inventing a colour of its own.
+        panes: { ...BASE_DEFAULTS.panes, separatorColor: preset.grid.color },
         crosshair: { ...preset.crosshair },
         timeScale: { ...BASE_DEFAULTS.timeScale },
         candlestick: {
@@ -530,6 +576,32 @@ export function resolveOptions(partial: ChartOptions, fallbackTheme: ChartTheme 
     }
     if (partial.locale !== undefined) resolved.locale = requireLocale(partial.locale);
     if (partial.timeZone !== undefined) resolved.timeZone = requireTimeZone(partial.timeZone);
+
+    if (partial.panes !== undefined) {
+        const panes = requirePlainObject(partial.panes, 'panes');
+        if (panes.weights !== undefined) {
+            if (!Array.isArray(panes.weights)) {
+                fail('panes.weights must be an array of one positive weight per pane.');
+            }
+            // Validated by the pane module, which owns the layout rule and its
+            // error strings, rather than restated here.
+            resolved.panes.weights = [...resolvePaneOptions({
+                weights: panes.weights,
+                separatorHeight: resolved.panes.separatorHeight,
+            }).weights];
+        }
+        if (panes.separatorHeight !== undefined) {
+            // requirePlainObject widens its fields, so the value is handed to the
+            // pane resolver as a number and validated there rather than cast.
+            resolved.panes.separatorHeight = resolvePaneOptions({
+                weights: resolved.panes.weights,
+                separatorHeight: panes.separatorHeight as number,
+            }).separatorHeight;
+        }
+        if (panes.separatorColor !== undefined) {
+            resolved.panes.separatorColor = requireColor(panes.separatorColor, 'panes.separatorColor');
+        }
+    }
 
     if (partial.volume !== undefined) {
         const volume = requirePlainObject(partial.volume, 'volume');
@@ -694,7 +766,7 @@ export function mergeOptionPartials(
     }
 
     const merged: ChartOptions = { ...base };
-    const nestedKeys = ['priceFormat', 'layout', 'volume', 'grid', 'crosshair', 'timeScale', 'candlestick'] as const;
+    const nestedKeys = ['priceFormat', 'layout', 'volume', 'panes', 'grid', 'crosshair', 'timeScale', 'candlestick'] as const;
     for (const key of nestedKeys) {
         const patchValue = patch[key];
         if (patchValue === undefined) continue;
