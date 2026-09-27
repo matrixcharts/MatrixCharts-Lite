@@ -2689,6 +2689,7 @@ export class Chart {
             logical,
             time: this.getVisibleTimeRange(),
             barSpacing,
+            atRealtime: this.followsLiveEdge,
         };
         this.emittingVisibleRange = true;
         try {

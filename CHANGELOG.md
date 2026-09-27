@@ -6,6 +6,26 @@ records what moved and why, per release.
 
 ## Unreleased
 
+### Added
+
+**`VisibleRangeEvent.atRealtime`**, and `isAtRealtime()` / `scrollToRealtime()` documented
+and pinned as public. A chart that has been panned takes its view over while the feed keeps
+appending into it, and from outside the chart that is indistinguishable from a feed that has
+stopped — a chart twenty-six bars behind reads as frozen. The event now says which state it
+is in, so a `LIVE` badge, a jump-to-latest button and a dimmed newest-price tag are all
+consequences a caller can derive.
+
+The chart draws nothing about it. No badge, no banner, no element of its own and no text it
+chose: a charting library that renders its own chrome is one every application has to fight,
+so the library reports a boolean and the caller's UI decides what that looks like.
+
+The field rides on the events that were already firing rather than adding any, so *when* the
+event fires is unchanged. The `followsLiveEdge` latch moves in exactly three places — a pan
+away from the edge, `fitContent()` and `scrollToRealtime()` — and each of those changes which
+bars are on screen, which was already a reason to notify. So there is no transition the field
+can report that the existing firing rule does not cover, and no way for it to go stale
+between events. A chart with no data reports `true`: there is no state to be behind.
+
 ### Fixed
 
 **Switching back to a candle style no longer leaves the previous style on the GPU.** The

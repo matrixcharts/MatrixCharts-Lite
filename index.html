@@ -100,6 +100,35 @@
             font: 13px ui-monospace, SFMono-Regular, Menlo, monospace;
             color: #8b949e;
         }
+        /* Harness-only, for the live-edge row. Styled from the same variables as the
+           feed controls so it reads as part of this page and not as library output. */
+        #live-row {
+            width: min(800px, 100%);
+            margin-bottom: 12px;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+        #live-row button {
+            min-height: 28px;
+            padding: 0 10px;
+            border: 1px solid var(--control-border);
+            border-radius: 4px;
+            background: var(--control-bg);
+            color: inherit;
+            font: 12px sans-serif;
+            cursor: pointer;
+        }
+        #live-row button:disabled {
+            opacity: 0.45;
+            cursor: default;
+        }
+        #live-row button:not(:disabled):hover {
+            border-color: var(--accent);
+        }
+        #live-state {
+            font: 13px ui-monospace, SFMono-Regular, Menlo, monospace;
+        }
         /* This is the target container we pass to the library */
         #chart-container {
             width: 800px;
@@ -225,6 +254,14 @@
         <span id="feed-status" role="status">disconnected</span>
     </div>
     <div id="readout">move the pointer over the chart</div>
+<!-- Dev-harness UI only. The library reports `atRealtime` and nothing else: no badge,
+     no overlay, no element of its own. This button and the readout tint below are what
+     an application would build on top, and they live here precisely because they are not
+     the library's business. -->
+<div id="live-row">
+    <button id="live-jump" type="button" disabled>Jump to live</button>
+    <span id="live-state" role="status" aria-live="polite">—</span>
+</div>
 <!-- Driven only by subscribePaneRangeChange. Kept separate from the readout above
      because that one is overwritten wholesale by the crosshair handler, and a
      vertical-bounds readout that vanished every time the pointer moved would
@@ -276,6 +313,23 @@
                 : 'off screen';
             readout.textContent = `barSpacing ${spacing}px   visible ${visible}   time ${window_}`;
         };
+
+        // The live-edge affordance, built the way an application would build it: read a
+        // boolean off the event that already fires, and offer the method that puts the
+        // view back. The chart itself draws nothing and says nothing.
+        const liveJump = document.querySelector('#live-jump');
+        const liveState = document.querySelector('#live-state');
+        const paintLive = (atRealtime) => {
+            liveState.textContent = atRealtime ? 'following the feed' : 'off the live edge — panned back';
+            liveState.classList.toggle('muted', atRealtime);
+            liveJump.disabled = atRealtime;
+        };
+        liveJump.addEventListener('click', () => {
+            chart.scrollToRealtime();
+            paintReadout();
+        });
+        chart.subscribeVisibleRangeChange((event) => paintLive(event.atRealtime));
+        paintLive(chart.isAtRealtime());
 
         chart.subscribeCrosshairMove((event) => {
             if (!event.candle) {

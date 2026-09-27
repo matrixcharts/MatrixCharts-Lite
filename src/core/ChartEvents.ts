@@ -61,6 +61,24 @@ export interface VisibleRangeEvent {
     time: TimeRange | null;
     /** CSS pixels per candle index. */
     barSpacing: number;
+    /**
+     * Whether the chart is following the newest candle, i.e. `chart.isAtRealtime()`.
+     *
+     * A live chart is right-anchored and scrolls leftward as bars arrive. Panning away
+     * takes the view over: the feed keeps appending into a window the caller has claimed,
+     * and from outside the chart that is indistinguishable from a feed that has stopped.
+     * This is the field that tells the two apart, and it is the one a UI most needs — a
+     * "LIVE" badge, a jump-to-latest button, a dimmed newest-price tag. Deriving it from
+     * `logical` against `getCandleCount()` is a subtraction every caller has to remember
+     * to do, and a caller that forgets sees a frozen chart and files a bug.
+     *
+     * It rides on the events that were already firing rather than adding any. The latch
+     * only moves in `scrollToRealtime`, `fitContent` and a pan away from the edge, and
+     * every one of those changes which bars are on screen, so there is no transition this
+     * field can make that the event's own firing rule does not already cover. A chart with
+     * no data reports `true`: there is no state to be behind.
+     */
+    atRealtime: boolean;
 }
 
 /**

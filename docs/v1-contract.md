@@ -178,6 +178,8 @@ Every method below is synchronous, works in CSS pixels relative to the container
 | `priceToCoordinate(price)` | Screen y of a price. |
 | `coordinateToPrice(y)` | Price at a screen y, on the current auto-fitted vertical scale. |
 | `getPaneAtCoordinate(x, y)` | Index of the pane at a point, or `null` on a pane divider or outside the chart. |
+| `isAtRealtime()` | Whether the chart is following the newest candle. |
+| `scrollToRealtime()` | Re-arms that following. No-op on a chart with no data. |
 
 The index range is half-open because it names a set of bars. The time range is inclusive on both ends because it names two real candles, and a closed session has no end instant to report. The two are related by `getVisibleTimeRange().from === getCandleAt(range.from).time` and `.to === getCandleAt(range.to - 1).time`.
 
@@ -234,7 +236,11 @@ Each returns an `Unsubscribe` (`() => void`). Calling it more than once is harml
 
 `event.price` remains the **price pane's** price at `y`, whatever pane the pointer is over. That is a frozen field and it means what it says; a component displaying an oscillator's reading should use `getPaneValueRange(pane)` with the pane from `getPaneAtCoordinate`, not `event.price`.
 
-`VisibleRangeEvent` carries `logical`, `time`, and `barSpacing` from the read API above. It is silent when the visible bars and bar spacing are unchanged, so a drag that stays between bar boundaries produces no events and float drift from wheel or pinch arithmetic does not re-notify.
+`VisibleRangeEvent` carries `logical`, `time`, `barSpacing` and `atRealtime` from the read API above. It is silent when the visible bars and bar spacing are unchanged, so a drag that stays between bar boundaries produces no events and float drift from wheel or pinch arithmetic does not re-notify.
+
+**`atRealtime` is the live-edge latch, and the chart draws no UI about it.** A live chart is right-anchored: the newest bar is parked half a bar inside the plot's right edge and the view scrolls leftward as bars arrive. Panning takes the view over — the feed keeps appending into a window the caller has claimed, which from outside the chart is indistinguishable from a feed that has stopped. That is a state a caller has to be able to read, and a `LIVE` badge, a jump-to-latest button and a dimmed newest-price tag are all consequences of it that belong to the caller's own UI, not to the chart. Nothing is drawn, no element is created and no text is chosen here; the event reports `true`/`false` and the application decides what that looks like.
+
+It rides on the events that were already firing rather than adding any, which is why adding the field did not change when the event fires. The latch moves in exactly three places — a pan away from the edge, `fitContent()` and `scrollToRealtime()` — and each of those changes which bars are on screen, which is already a reason to notify. So there is no transition `atRealtime` can report that the event's existing firing rule does not cover, and no way for it to go stale between events. `fitContent()` and `scrollToRealtime()` both re-arm following, so a caller that wants the feed to reclaim the view has two ways to ask and they do the same thing. A chart with no data reports `true`: there is no state to be behind.
 
 **`PaneRangeEvent` carries `{ pane, range }`** — one pane's vertical bounds, low first, in that pane's own units: prices for pane 0, indicator values for the rest. It is its own event rather than a field on `VisibleRangeEvent`, and it is deduplicated *per pane* and coalesced to one per animation frame.
 

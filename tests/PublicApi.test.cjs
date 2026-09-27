@@ -54,12 +54,48 @@ test('the public read and write API is present, and nothing internal leaked besi
         'getPriceRange',
         'subscribePaneRangeChange',
         'coordinateToSlot',
+        // The live-edge pair. A chart that has been panned takes its view over and the
+        // feed keeps appending into it, which from outside is indistinguishable from a
+        // feed that has stopped — so a caller needs both the question and the way back.
+        'isAtRealtime',
+        'scrollToRealtime',
     ]) {
         assert.equal(typeof publicApi.Chart.prototype[method], 'function', `${method} must be public`);
     }
     // And they are not the seam: a factory that replaces a layer is not public API.
     for (const internal of ['createRenderer', 'setRendererFactory', 'paneAtClientY', 'paneAtRow']) {
         assert.equal(internal in publicApi, false, `${internal} must not be exported`);
+    }
+});
+
+test('the visible-range payload carries the live-edge state, additively', () => {
+    // `atRealtime` was added after the event was frozen, which the contract permits —
+    // fields are added, never removed or repurposed. What must not change is that the
+    // fields already there keep their names, their types and their meanings, so a caller
+    // written against v1.0.0 destructures exactly what it did before and simply ignores
+    // the new one. Pinned as a key set so a rename cannot pass unnoticed.
+    const { createHeadlessChart, flatCandles } = require('./support/headlessChart.cjs');
+    const harness = createHeadlessChart();
+    try {
+        const events = [];
+        harness.chart.subscribeVisibleRangeChange((event) => events.push(event));
+        harness.chart.setData(flatCandles(40));
+        harness.flush();
+        assert.ok(events.length > 0, 'no range event to inspect');
+
+        for (const event of events) {
+            assert.deepEqual(
+                Object.keys(event).sort(),
+                ['atRealtime', 'barSpacing', 'logical', 'time'],
+                'the payload shape changed, which is a breaking change to a frozen event',
+            );
+            assert.equal(typeof event.atRealtime, 'boolean');
+            assert.equal(typeof event.barSpacing, 'number');
+            assert.equal(typeof event.logical.from, 'number');
+            assert.equal(typeof event.logical.to, 'number');
+        }
+    } finally {
+        harness.dispose();
     }
 });
 
