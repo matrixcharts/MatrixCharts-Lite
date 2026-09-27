@@ -1,6 +1,6 @@
 {
   "name": "matrixcharts",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "WebGL2 candlestick chart with a sequenced live candle feed.",
   "license": "ISC",
   "type": "module",
