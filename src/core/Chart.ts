@@ -495,7 +495,7 @@ export class Chart {
         const nextScale: number = this.clampBarSpacing(previousScale * requestedFactor);
         if (nextScale === previousScale) return;
         const appliedFactor: number = nextScale / previousScale;
-        this.scaleX = nextScale;
+        this.setBarSpacingLive(nextScale);
         this.offsetX = anchorX - (anchorX - this.offsetX) * appliedFactor;
         this.followsLiveEdge = this.isAtLiveEdge();
         this.updateViewport();
@@ -583,6 +583,29 @@ export class Chart {
         return this.resolvedOptions;
     }
 
+    /**
+     * Adopts a bar spacing the user arrived at by interaction, and records it as their
+     * configured choice.
+     *
+     * The explicit options are written as well as the resolved ones because
+     * `applyOptions` rebuilds the resolved snapshot from the explicit pair. Syncing only
+     * the resolved copy would leave the live scale correct until the next unrelated
+     * `applyOptions` — a theme change, a colour — and then quietly revert it, which is
+     * worse than never syncing at all because it looks like a rendering fault.
+     *
+     * The value recorded is the *effective* spacing, after clamping. Recording the
+     * requested value instead would put the lie back for anyone who asks for a bar
+     * spacing past `maxBarSpacing`, and that is precisely when a readout matters most.
+     */
+    private setBarSpacingLive(spacing: number): void {
+        this.scaleX = spacing;
+        this.resolvedOptions.timeScale.barSpacing = spacing;
+        this.explicitOptions.timeScale = {
+            ...(this.explicitOptions.timeScale ?? {}),
+            barSpacing: spacing,
+        };
+    }
+
     private clampBarSpacing(spacing: number): number {
         const { minBarSpacing, maxBarSpacing } = this.resolvedOptions.timeScale;
         return Math.max(minBarSpacing, Math.min(maxBarSpacing, spacing));
@@ -596,12 +619,12 @@ export class Chart {
     private applyBarSpacing(nextSpacing: number, previousSpacing: number): void {
         const clamped: number = this.clampBarSpacing(nextSpacing);
         if (previousSpacing <= 0 || clamped === previousSpacing) {
-            this.scaleX = clamped;
+            this.setBarSpacingLive(clamped);
             return;
         }
 
         if (this.followsLiveEdge) {
-            this.scaleX = clamped;
+            this.setBarSpacingLive(clamped);
             this.offsetX = liveEdgeOffsetX(
                 plotRight(this.viewport),
                 this.slotOffsets,
@@ -626,7 +649,7 @@ export class Chart {
         // rather than by coincidence.
         const centreX: number = plotCentreX(this.viewport);
         const centreSlot: number = coordinateToSlot(this.viewport, centreX);
-        this.scaleX = clamped;
+        this.setBarSpacingLive(clamped);
         this.offsetX = centreX - centreSlot * clamped;
         this.followsLiveEdge = this.isAtLiveEdge();
     }
@@ -1271,7 +1294,7 @@ export class Chart {
         // series of two bars is not blown up past `maxBarSpacing`.
         const plot: PlotRect = this.viewport.plot;
         const spacing: number = this.clampBarSpacing(plot.width / count);
-        this.scaleX = spacing;
+        this.setBarSpacingLive(spacing);
         this.offsetX = liveEdgeOffsetX(plotRight(this.viewport), this.slotOffsets, count, spacing);
         this.followsLiveEdge = true;
         this.updateViewport();
