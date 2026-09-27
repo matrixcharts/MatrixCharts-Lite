@@ -34,7 +34,8 @@
     "verify:package": "npm run build && node scripts/verify-package.mjs",
     "verify": "npm test && npm run verify:package",
     "benchmark": "tsc -p tsconfig.test.json && node scripts/write-dual-package-json.cjs && node benchmarks/sustained-feed.cjs",
-    "screenshot": "node scripts/screenshot.cjs"
+    "screenshot": "node scripts/screenshot.cjs",
+    "check:interaction": "node scripts/check-interaction.mjs"
   },
   "keywords": [
     "candlestick",

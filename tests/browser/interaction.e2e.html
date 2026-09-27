@@ -1,0 +1,68 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>MatrixCharts interaction invariants</title>
+<style>
+    body { margin: 0; background: #0d1117; color: #e6edf3; font: 13px system-ui, sans-serif; }
+    #chart { width: 1200px; height: 600px; }
+</style>
+</head>
+<body>
+<div id="chart"></div>
+<script type="module">
+// Interaction invariants, driven by scripts/check-interaction.cjs.
+//
+// This page exists to hold a chart with a *gapped* series and hand the runner a
+// handle on it. The assertions live in the runner rather than here because they have
+// to dispatch real wheel and drag events, and because a failing assertion has to be
+// legible in a terminal rather than in a console nobody reads.
+//
+// The invariant under test: a bar that is under the pointer stays under the pointer.
+// That is the whole of "feels natural" as a number, and it is the one property that a
+// range or count assertion cannot see — a chart can report the right number of bars
+// and still be sliding sideways under the cursor.
+import { Chart } from '../../src/index.ts';
+import { MockCandleSource } from '../../src/feed/MockCandleSource.ts';
+
+const MINUTE = 60_000;
+
+// A gapped series: 30 bars to a session, then a 17-hour close. Long enough that a
+// break is a visible fraction of the plot rather than a rounding error, and several
+// of them, so a drift accumulates instead of hiding inside one.
+const source = new MockCandleSource(300, 100_000, 30);
+const chart = new Chart(document.getElementById('chart'), { timeScale: { barSpacing: 12 } });
+
+// Start before awaiting. Subscribing, then starting, then awaiting a promise the
+// subscriber resolves is the only order that terminates: the alternative — await the
+// snapshot, then start — waits forever for an event only `start` can emit.
+let resolveSnapshot;
+const loaded = new Promise((resolve) => { resolveSnapshot = resolve; });
+source.subscribe((message) => {
+    if (message.type === 'snapshot') {
+        chart.setData(message.candles);
+        resolveSnapshot();
+    }
+}, () => undefined);
+source.start();
+await loaded;
+
+// The runner drives real events, so it needs the plot's box in CSS pixels and a
+// handle on the chart itself.
+globalThis.__mc = {
+    chart,
+    plot: () => {
+        const r = document.querySelector('canvas').getBoundingClientRect();
+        return { x: r.x, y: r.y, width: r.width, height: r.height };
+    },
+    count: () => chart.getCandleCount(),
+    // indexToCoordinate is the public read API, so the assertion is written against
+    // the same call a caller would make rather than against internals.
+    xOf: (index) => chart.indexToCoordinate(index),
+    indexAt: (x) => chart.coordinateToNearestIndex(x),
+    spacing: () => chart.options().timeScale.barSpacing,
+};
+globalThis.__mcReady = true;
+</script>
+</body>
+</html>
