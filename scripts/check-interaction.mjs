@@ -11,8 +11,12 @@
 //   node scripts/check-interaction.mjs [url]
 //
 // Exits non-zero if any invariant fails, and prints the measurement rather than a
-// verdict. Skips cleanly when no browser is available, so it can live in `verify`
-// without making packaging depend on one.
+// verdict. It runs as part of `npm run verify`, so a failing gesture breaks the build.
+//
+// When no browser can be found it skips with a zero exit — but only when `CI` is unset.
+// Under `CI` (or with `MC_REQUIRE_BROWSER=1`) a missing browser is a hard failure
+// instead, because a pipeline that reports green having run none of these is worse than
+// one that never claimed to check: it looks like coverage and is not.
 
 import { existsSync } from 'node:fs';
 import { createRequire } from 'node:module';
@@ -95,8 +99,36 @@ function resolveCore() {
 }
 
 const core = resolveCore();
+const missing = [];
+if (core === null) missing.push('puppeteer-core');
+if (CHROME_CANDIDATES.length === 0) missing.push('a Chrome binary');
+
 if (core === null || CHROME_CANDIDATES.length === 0) {
-    console.log('interaction: skipped — no Chrome and/or puppeteer-core.');
+    // A skip is only honest where skipping is allowed. On a build server it is the
+    // opposite: the pipeline reports green having executed none of these invariants, and
+    // the first thing anyone hears about a broken drag is a user. Both serious defects in
+    // this phase were found by measurement rather than by a failing test, and this
+    // harness is the only coverage of real pointer plumbing — so "it skipped" and "it
+    // passed" must not look the same in a build log.
+    //
+    // `CI` is the conventional marker and is set by essentially every provider, so this
+    // needs no configuration to take effect. A developer with no browser keeps the
+    // graceful skip, because their `npm test` should not require a Chrome download.
+    //
+    // `MC_REQUIRE_BROWSER=1` forces the hard failure anywhere, for a local run that
+    // wants to prove the harness is real rather than skipped.
+    const required = process.env.CI !== undefined && process.env.CI !== ''
+        || process.env.MC_REQUIRE_BROWSER === '1';
+    if (required) {
+        console.error(`interaction: FAILED — no ${missing.join(' and no ')}.`);
+        console.error('  These invariants are the build gate; a skipped run is not a pass.');
+        console.error('  Install Chrome, set CHROME_PATH, or make puppeteer-core resolvable.');
+        if (process.env.CI === undefined || process.env.CI === '') {
+            console.error('  (unset CI to allow a local skip, or set MC_REQUIRE_BROWSER=1 to force this)');
+        }
+        process.exit(1);
+    }
+    console.log(`interaction: skipped — no ${missing.join(' and no ')}.`);
     console.log('  set CHROME_PATH, or make puppeteer-core resolvable, to enforce it');
     process.exit(0);
 }

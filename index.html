@@ -93,6 +93,13 @@
             white-space: pre-wrap;
         }
         #readout .muted { color: #8b949e; }
+        #pane-readout {
+            width: min(800px, 100%);
+            margin-bottom: 12px;
+            padding: 0 12px 10px;
+            font: 13px ui-monospace, SFMono-Regular, Menlo, monospace;
+            color: #8b949e;
+        }
         /* This is the target container we pass to the library */
         #chart-container {
             width: 800px;
@@ -161,10 +168,13 @@
             </select>
         </label>
         <label class="swatch">Scale lock
-            <select id="scale-lock" aria-label="Lock the price range">
+            <select id="scale-lock" aria-label="Lock the selected pane's vertical range">
                 <option value="auto">auto</option>
                 <option value="locked">locked</option>
             </select>
+        </label>
+        <label class="swatch">Lock pane
+            <select id="lock-pane" aria-label="Which pane the scale lock applies to"></select>
         </label>
         <label class="swatch">Panes
             <select id="pane-weights" aria-label="Pane layout">
@@ -215,6 +225,11 @@
         <span id="feed-status" role="status">disconnected</span>
     </div>
     <div id="readout">move the pointer over the chart</div>
+<!-- Driven only by subscribePaneRangeChange. Kept separate from the readout above
+     because that one is overwritten wholesale by the crosshair handler, and a
+     vertical-bounds readout that vanished every time the pointer moved would
+     demonstrate the event by hiding it. -->
+<div id="pane-readout" class="muted">pane bounds: —</div>
 
     <!-- The Empty Container -->
     <div id="chart-container"></div>
@@ -237,6 +252,8 @@
         const disconnectButton = document.querySelector('#feed-disconnect');
         const status = document.querySelector('#feed-status');
         const readout = document.querySelector('#readout');
+        const paneReadout = document.querySelector('#pane-readout');
+        const lockPaneSelect = document.querySelector('#lock-pane');
         let feedController = null;
 
         // Everything below is public API from the v1 contract: the demo never
@@ -278,6 +295,42 @@
                 ? `clicked index ${event.index} @ ${new Date(event.time).toISOString().slice(11, 19)}`
                 : `clicked empty space (button ${event.button})`;
         });
+
+        // Vertical bounds, pushed by the chart rather than polled. It fires for a drag of
+        // the axis gutter, for setPaneRange and fitPaneRange, and for the auto-fit when a
+        // candle prints outside the range — so this readout cannot lag the screen, which
+        // is the whole reason the event exists. A version of this that only listened for
+        // deliberate locks would go stale at the first new high.
+        const paneName = (pane) => (pane === 0 ? 'price' : `pane ${pane}`);
+        const paneBounds = new Map();
+        chart.subscribePaneRangeChange((event) => {
+            paneBounds.set(event.pane, event.range);
+            const parts = Array.from(paneBounds.entries())
+                .sort((a, b) => a[0] - b[0])
+                .map(([pane, range]) => `${paneName(pane)} ${formatPrice(range[0])}..${formatPrice(range[1])}`);
+            paneReadout.textContent = `pane bounds: ${parts.join('   ')}`;
+        });
+
+        // The lock controls name a pane, so the selector has to follow the layout. Names
+        // are the chart's business, but which panes exist is a public question and this
+        // is the public way to ask it.
+        const refreshLockPanes = () => {
+            const count = chart.getPaneCount();
+            const previous = lockPaneSelect.value;
+            lockPaneSelect.textContent = '';
+            for (let pane = 0; pane < count; pane++) {
+                const option = document.createElement('option');
+                option.value = String(pane);
+                option.textContent = paneName(pane);
+                lockPaneSelect.append(option);
+            }
+            // Keep the selection if that pane still exists, else fall back to the price
+            // pane rather than leaving the control pointing at a pane that is gone.
+            const keep = previous !== '' && Number(previous) < count;
+            lockPaneSelect.value = keep ? previous : '0';
+        };
+        const selectedPane = () => Number(lockPaneSelect.value || '0');
+        refreshLockPanes();
 
         chart.subscribeVisibleRangeChange((event) => {
             const from = event.logical.from;
@@ -537,6 +590,7 @@
                 // naming a pane that was never declared is refused by the chart.
                 const weights = kind === 'rsi' ? [3, 1] : [3, 1, 1];
                 chart.applyOptions({ panes: { weights } });
+                refreshLockPanes();
                 // Keep the layout control showing what the chart is actually doing,
                 // rather than leaving it claiming a pane count that was replaced.
                 const paneSelect = document.querySelector('#pane-weights');
@@ -599,6 +653,10 @@
             const weights = paneInput.value.split(',').map(Number);
             try {
                 chart.applyOptions({ panes: { weights } });
+                // The lock selector names a pane, so it follows the layout. Shrinking
+                // under an indicator is refused by the chart, and the count is unchanged
+                // in that case, so this is safe to call before the error is reported.
+                refreshLockPanes();
                 // Growing the layout is fine; shrinking it under an indicator that
                 // needs the pane is refused, and the chart says so.
                 if (overlayInput.value !== 'off') setOverlays(overlayInput.value);
@@ -742,8 +800,16 @@
         scaleInput.addEventListener('change', () => {
             const [mode, inverted] = scaleInput.value.split(',');
             try {
+                // `autoScale` is the price scale's option, so it describes pane 0 and
+                // nothing else. With a lower pane selected the control must not write it:
+                // changing the price axis's mode is not a reason to release, or take
+                // over, the price pane's own fitting. Pane 0's existing state is carried
+                // through untouched.
+                const autoScale = selectedPane() === 0
+                    ? lockInput.value !== 'locked'
+                    : chart.options().priceScale.autoScale;
                 chart.applyOptions({
-                    priceScale: { mode, inverted: inverted === '1', autoScale: lockInput.value !== 'locked' },
+                    priceScale: { mode, inverted: inverted === '1', autoScale },
                 });
                 status.textContent = `scale ${chart.options().priceScale.mode}`;
             } catch (error) {
@@ -751,14 +817,22 @@
             }
         });
         lockInput.addEventListener('change', () => {
+            // The lock names a pane, so it is pane 0's job only when pane 0 is selected.
+            // A lower pane's lock lives in the chart and is untouched by this, which is
+            // why stretching a volume pane does not stop the price chart auto-fitting.
+            const pane = selectedPane();
             if (lockInput.value === 'locked') {
                 // Locked to the range already on screen, which is the useful thing to
-                // compare two instruments on: the same range, not a chosen one.
-                const [low, high] = chart.getPriceRange();
-                chart.setPriceRange([low, high]);
+                // compare two instruments on: the same range, not a chosen one. Read per
+                // pane, so an oscillator locks to its own values rather than to prices.
+                const current = chart.getPaneValueRange(pane);
+                if (current) chart.setPaneRange(pane, current);
             } else {
-                chart.fitPriceRange();
+                // Releasing one pane. Explicitly per pane: a double-click on an RSI axis
+                // should fit the RSI and leave a hand-stretched price scale alone.
+                chart.fitPaneRange(pane);
             }
+            refreshLockPanes();
         });
         setInterval(() => {
             if (decorationInput.value !== 'none') setDecorations(decorationInput.value);

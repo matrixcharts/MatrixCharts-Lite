@@ -34,6 +34,10 @@ npm run benchmark
 npm run verify:package
 ```
 
+`npm run verify` runs the unit suite, then the interaction harness, then the packaging check — in that order, so a broken gesture fails before the slow part.
+
+**The interaction harness is a hard gate on a build server.** It needs a Chrome binary and `puppeteer-core`; with neither resolvable it normally skips with a zero exit, which is right for a developer who has no browser. Under `CI` — or with `MC_REQUIRE_BROWSER=1` — a missing browser exits non-zero instead. A pipeline that reports green having executed none of the pointer invariants is worse than one that never claimed to check, because it reads as coverage. `CI` is set by essentially every provider, so this needs no configuration to take effect; `CHROME_PATH` selects the binary.
+
 **`Chart` itself is unit-testable.** `npm test` builds a real `Chart` in node — no WebGL, no browser, no canvas — by standing in twice: a DOM stub covering the fifteen globals `Chart` reaches for, and a pair of renderer doubles installed through an internal `rendererFactory` seam. The doubles are fakes rather than mocks. They implement the real interfaces, so the compiler holds them and `WebGL2Renderer` to the same shape, and a double typed to its own looser shape would keep passing after the real interface grew a method — which is how a test seam turns into a way of not testing. A test that needs a scheduled viewport update calls `flush()` rather than waiting on a timer, so it is not at the mercy of one.
 
 The seam is deliberately unreachable from the package. The barrel is an explicit allow-list and `Chart`'s constructor signature is untouched; a third constructor parameter would have had to be typed against an unexported interface, putting that interface into the shipped `Chart.d.ts`, and `stripInternal` cannot rescue it because it removes whole declarations and would delete the entire constructor signature. `PublicApi.test.cjs` asserts the seam's names stay off the barrel.
