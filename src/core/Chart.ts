@@ -419,12 +419,29 @@ export class Chart {
         this.capturePointer(event.pointerId);
 
         if (this.activePointers.size === 1) {
-            // A press on the price axis owns the vertical scale; anywhere else it is a
-            // pan. The two are mutually exclusive on purpose — a drag that started on
-            // the axis must not also slide the series sideways, because the caller
-            // asked for a price span and would silently get a moved one as well.
-            if (this.isOnPriceAxis(event.clientX)) {
-                this.beginPriceAxisDrag(event.clientY);
+            // Three outcomes, not two, and the middle one is the point of this shape.
+            //
+            // A press in the price pane's gutter owns the vertical scale and a press in
+            // the plot pans, and those two are mutually exclusive on purpose: a drag
+            // that started on the axis must not also slide the series sideways, because
+            // the caller asked for a price span and would silently get a moved one too.
+            //
+            // A press in a *lower* pane's gutter is the third case and does nothing at
+            // all. Falling through to the pan would have been the easy way to write
+            // this and it is wrong twice over: dragging beside an RSI or a MACD would
+            // slide the series sideways, which is not what a vertical drag should ever
+            // do, and it would do it for a pane that has no vertical gesture of its
+            // own yet. Sub-pane scaling is not wired up, so the honest answer is that
+            // the gesture does not exist there — and the one thing it must never become
+            // is a way to reach up and stretch the price chart from the bottom of the
+            // screen, which is what treating the whole gutter as the price axis did.
+            if (this.isInPriceAxisGutter(event.clientX)) {
+                this.priceAxisDrag = null;
+                if (this.isWithinPricePaneRows(event.clientY)) {
+                    this.beginPriceAxisDrag(event.clientY);
+                } else {
+                    this.isDragging = false;
+                }
             } else {
                 this.priceAxisDrag = null;
                 this.isDragging = true;
@@ -442,18 +459,41 @@ export class Chart {
     };
 
     /**
-     * Whether a press at this client x landed on the price axis rather than the plot.
+     * Whether a press at this client x is in the price axis gutter rather than the plot.
      *
-     * The price axis is the left gutter, `layout.priceAxisWidth` wide, exactly as
-     * `plotRect` reserves it. Read from the same option and the same rect, so the
-     * hit region and the drawn gutter cannot drift apart — a hit test measuring the
-     * canvas centre instead would claim the whole left half of the plot.
+     * The gutter is the left strip, `layout.priceAxisWidth` wide, exactly as `plotRect`
+     * reserves it. Read from the same option and the same rect, so the hit region and
+     * the drawn gutter cannot drift apart — a hit test measuring the canvas centre
+     * instead would claim the whole left half of the plot.
+     *
+     * This is deliberately only the horizontal question. Whether the press is in the
+     * *price pane's* rows is asked separately, because the two answers are not the same
+     * and conflating them is what made a drag beside a lower pane stretch the price
+     * chart.
      */
-    private isOnPriceAxis(clientX: number): boolean {
+    private isInPriceAxisGutter(clientX: number): boolean {
         const width: number = this.resolvedOptions.layout.priceAxisWidth;
         if (!(width > 0)) return false;
         const rect: DOMRect = this.canvasWrapper.getBoundingClientRect();
         return clientX - rect.left < width;
+    }
+
+    /**
+     * Whether a client y falls inside the price pane's own rows.
+     *
+     * Half-open, `[pane.y, pane.y + pane.height)`, so a press on the pixel below the
+     * last row is already outside it. That matters because `paneRects` leaves the
+     * `separatorHeight` band between two panes belonging to *neither* — the boundaries
+     * are snapped to whole pixels precisely so two panes cannot both claim a separator.
+     * A drag that began on the divider is therefore inert, which is the only safe
+     * answer for a band that is not part of any pane.
+     */
+    private isWithinPricePaneRows(clientY: number): boolean {
+        const pane: PlotRect = this.pricePaneRect();
+        if (pane.height <= 0) return false;
+        const rect: DOMRect = this.canvasWrapper.getBoundingClientRect();
+        const y: number = clientY - rect.top;
+        return y >= pane.y && y < pane.y + pane.height;
     }
 
     /**
@@ -1356,12 +1396,14 @@ export class Chart {
      * and hand the pane back to the auto-scaler, which is the same half-sync that
      * made `options().timeScale.barSpacing` disagree with the bars.
      *
-     * It applies the range directly rather than going through `updateViewport`,
-     * because a vertical change moves no bar: the viewport update would re-upload
-     * the visible candles and re-emit the decorations for a change that touches
-     * neither. The lock is still the single source of truth, because `autoScaleY`
-     * re-applies this same range on every later frame — this is the fast path into
-     * the state that path reads, not a second source of truth beside it.
+     * It applies the range and broadcasts the frame rather than going through
+     * `updateViewport`, because a vertical change moves no bar: the full path would
+     * re-slice the visible candles and re-upload them for a change that touches
+     * neither, and this runs on every pointermove of a drag. What it must not skip is
+     * the broadcast — see `emitViewportFrame`. The lock is still the single source of
+     * truth either way, since `autoScaleY` re-applies this same range on every later
+     * frame; this is the fast path into the state that path reads, not a second source
+     * of truth beside it.
      */
     private adoptLockedPriceRange(range: readonly [number, number]): void {
         this.lockedPriceRange = [range[0], range[1]];
@@ -1371,6 +1413,11 @@ export class Chart {
             autoScale: false,
         };
         this.applyPriceRange(range);
+        this.emitViewportFrame();
+        // The last-price tag and the price lines are positioned from the pane layout,
+        // so they move with the broadcast above and are re-emitted for the same reason
+        // `updateViewport` re-emits them.
+        this.emitDecorations(false);
         this.refreshCrosshairAfterViewportChange();
         this.redraw();
     }
@@ -2154,21 +2201,28 @@ export class Chart {
         return visibleLogicalRange(this.viewport, this.candlePyramid.candleCount);
     }
 
-    private updateViewport(): void {
-        this.cancelScheduledViewportUpdate();
-        // Self-heal the backing store before anything reads it, so a container
-        // that resized without notifying us still renders at the right size.
-        this.syncRendererSize();
-        this.flushPendingData();
-        this.updateVisibleCandles();
-        this.autoScaleY();
+    /**
+     * Recomputes the pane table and broadcasts the spatial update.
+     *
+     * Split out of `updateViewport` because a change that only moves the vertical
+     * scale still has to reach the renderers, and the renderers take `scaleY` from
+     * this payload and from nowhere else — `redraw` re-renders whatever transform they
+     * were last handed. So a path that sets `scaleY` and calls `redraw` without
+     * emitting here changes the model and leaves the pixels exactly where they were,
+     * which is what `setPriceRange` did: it reported `[100, 200]` while the canvas was
+     * byte-for-byte unchanged, and only caught up on the next unrelated pan.
+     *
+     * One definition of the payload rather than a second copy beside it, because a
+     * payload that quietly drifts out of step with the one `updateViewport` sends is the
+     * same class of rot this fixes, one level down.
+     */
+    private emitViewportFrame(): void {
         this.paneRects = paneRects(
             this.viewport.plot,
             this.resolvedOptions.panes.weights,
             this.resolvedOptions.panes.separatorHeight,
         );
         this.paneLayout = this.computePaneLayout();
-        // Broadcast the spatial update to all subscribed renderers without coupling
         this.emitter.emit('viewport', {
             offsetX: this.offsetX,
             offsetY: this.offsetY,
@@ -2178,6 +2232,17 @@ export class Chart {
             plot: this.viewport.plot,
             panes: this.paneLayout,
         });
+    }
+
+    private updateViewport(): void {
+        this.cancelScheduledViewportUpdate();
+        // Self-heal the backing store before anything reads it, so a container
+        // that resized without notifying us still renders at the right size.
+        this.syncRendererSize();
+        this.flushPendingData();
+        this.updateVisibleCandles();
+        this.autoScaleY();
+        this.emitViewportFrame();
         this.uploadVisibleCandles();
         // The last-price tag is derived from the newest candle, so it has to follow
         // every append; emitting it here is what makes it track the live edge

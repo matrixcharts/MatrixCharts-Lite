@@ -1,0 +1,73 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>MatrixCharts pane interaction</title>
+<style>
+    body { margin: 0; background: #0d1117; color: #6e7681; font: 13px system-ui, sans-serif; }
+    #chart { width: 1200px; height: 600px; }
+</style>
+</head>
+<body>
+<div id="chart"></div>
+<script type="module">
+// Pane interaction: the price axis belongs to the price pane's rows and to nothing else.
+//
+// This page exists because the price-axis drag was first hit-tested against the whole
+// left gutter, which meant a drag beside an indicator pane stretched the *price* chart.
+// On a one-pane chart that is invisible — the gutter and the price pane's rows are the
+// same rectangle — so the bug could not be seen on interaction.e2e.html at all. It
+// needs a second pane to exist, which is why it gets its own page rather than a flag on
+// the other one.
+//
+// Two panes, weighted 3:1, with an oscillator in the lower one so the divider is a real
+// boundary with something on both sides of it.
+import { Chart } from '../../src/index.ts';
+import { MockCandleSource } from '../../src/feed/MockCandleSource.ts';
+
+const source = new MockCandleSource(300, 100_000, 30);
+const chart = new Chart(document.getElementById('chart'), {
+    timeScale: { barSpacing: 12 },
+    panes: { weights: [3, 1] },
+});
+
+let resolveSnapshot;
+const loaded = new Promise((r) => { resolveSnapshot = r; });
+source.subscribe((message) => {
+    if (message.type === 'snapshot') {
+        const candles = message.candles;
+        chart.setData(candles);
+        // A stand-in oscillator: bounded, unrelated to price, and confined to pane 1.
+        // The point is only that the lower pane has a scale of its own to be beside.
+        const points = candles.map((candle, index) => ({
+            time: candle.time,
+            value: 50 + 18 * Math.sin(index / 7) + (index % 5) * 0.4,
+        }));
+        chart.setOverlays([{ id: 'osc', points, pane: 1 }]);
+        resolveSnapshot();
+    }
+}, () => undefined);
+source.start();
+await loaded;
+
+globalThis.__mc = {
+    chart,
+    plot: () => {
+        const r = document.querySelector('canvas').getBoundingClientRect();
+        return { x: r.x, y: r.y, width: r.width, height: r.height };
+    },
+    count: () => chart.getCandleCount(),
+    xOf: (index) => chart.indexToCoordinate(index),
+    indexAt: (x) => chart.coordinateToNearestIndex(x),
+    spacing: () => chart.options().timeScale.barSpacing,
+    // Pane 0 is the price pane. Reported rather than recomputed so the runner asserts
+    // against the chart's own idea of where the divider is, not a second guess at it.
+    panes: () => {
+        const ranges = [0, 1].map((i) => chart.getPaneValueRange(i));
+        return { count: chart.options().panes.weights.length, ranges };
+    },
+};
+globalThis.__mcReady = true;
+</script>
+</body>
+</html>

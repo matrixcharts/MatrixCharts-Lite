@@ -23,6 +23,40 @@ const require_ = createRequire(import.meta.url);
 const here = dirname(fileURLToPath(import.meta.url));
 const root = resolve(here, '..');
 const URL = process.argv[2] ?? 'http://localhost:5173/tests/browser/interaction.e2e.html';
+// The pane cases need a second pane to exist, and a one-pane chart cannot show whether
+// a gutter belongs to the price pane or to the chart, so they get their own page.
+// Derived from the URL under test so a caller pointing at another host keeps working.
+const PANES_URL = URL.replace(/[^/]*\.e2e\.html$/, 'panes.e2e.html');
+
+/**
+ * Cheap digest of every 2D canvas on the page, from its own `toDataURL`.
+ *
+ * This is the only trustworthy way to ask "did the renderer actually repaint" in this
+ * environment. `page.screenshot` returns an all-white frame for this chart under
+ * swiftshader, and an element screenshot of the WebGL layer reads back a stale buffer
+ * because it has no `preserveDrawingBuffer`. Both report two different states as
+ * byte-identical. A 2D canvas read back through its own context is faithful.
+ */
+const readUiLayer = (target) => target.evaluate(() => {
+    const parts = [];
+    for (const canvas of document.querySelectorAll('canvas')) {
+        try {
+            const context = canvas.getContext('2d');
+            if (context) parts.push(canvas.toDataURL());
+        } catch {
+            // A canvas that refuses a readback contributes nothing; the ones that
+            // answer are what the assertion is about.
+        }
+    }
+    // Length plus a sample of the payload: enough to tell "repainted" from "identical"
+    // without carrying a megabyte of data URL around.
+    const joined = parts.join('|');
+    let hash = 0;
+    for (let i = 0; i < joined.length; i++) {
+        hash = (Math.imul(hash, 31) + joined.charCodeAt(i)) | 0;
+    }
+    return `${parts.length} layers, ${joined.length} chars, hash ${hash}`;
+});
 
 const CHROME_CANDIDATES = [
     process.env.CHROME_PATH,
@@ -664,6 +698,146 @@ try {
         `(wanted ${(panGuard.offsetX - 120).toFixed(2)}), scale-space span moved by ` +
         `${Math.abs(spanOf(panGuardAfter) - spanOf(panGuard)).toExponential(2)}`,
     );
+
+    // 7. The lock has to reach the renderer, not just the model.
+    //
+    // `setPriceRange` set `scaleY`/`offsetY` and called `redraw()`, and the renderers
+    // take `scaleY` from the 'viewport' payload and from nowhere else — so a redraw
+    // re-rendered the transform they were last handed. The pane table went stale, the
+    // axis labels stayed on the old range, and the chart caught up only on the next
+    // unrelated pan. `getPriceRange()` reported the new range throughout, so the model
+    // and the screen disagreed: the same rot as the `getPriceRange` bug above, one
+    // layer out.
+    //
+    // Asserted two ways, because they fail differently. The pane table is the cheap
+    // deterministic half. The 2D layer's own pixels are the half that proves a repaint
+    // actually happened, read back with `toDataURL` over every 2D canvas.
+    //
+    // Not asserted with a screenshot. `page.screenshot` returns an all-white frame for
+    // this chart under swiftshader — verified by looking at the image, not by reading
+    // its hash — and an element screenshot of the WebGL layer is worse still, since it
+    // has no `preserveDrawingBuffer` and reads back a stale buffer. Both were tried and
+    // both report two different states as byte-identical, which is the worst kind of
+    // test: one that looks like evidence and is not. A hash that never changes is not a
+    // weak assertion, it is a vacuous one.
+    await page.evaluate(() => globalThis.__mc.chart.fitPriceRange());
+    await wait(300);
+    const repaintBefore = await readUiLayer(page);
+    await page.evaluate(() => globalThis.__mc.chart.setPriceRange([100, 200]));
+    await wait(300);
+    const repaintAfter = await readUiLayer(page);
+    const lockReach = await page.evaluate(() => {
+        const c = globalThis.__mc.chart;
+        const price = c.getPriceRange();
+        const pane = c.getPaneValueRange(0);
+        return { priceSpan: price[1] - price[0], paneSpan: pane[1] - pane[0] };
+    });
+    record(
+        'locking the price range repaints the pane, it does not only move the model',
+        Math.abs(lockReach.priceSpan - lockReach.paneSpan) <= 1e-9 && repaintBefore !== repaintAfter,
+        `pane table span ${lockReach.paneSpan.toFixed(4)} vs model ${lockReach.priceSpan.toFixed(4)}; ` +
+        `the 2D layer ${repaintBefore === repaintAfter ? 'DID NOT REPAINT' : 'repainted'} ` +
+        `(${repaintBefore} -> ${repaintAfter})`,
+    );
+    await page.evaluate(() => globalThis.__mc.chart.fitPriceRange());
+    await wait(200);
+
+    // --- Panes: the price axis belongs to the price pane's rows alone -----------
+    //
+    // Needs a second pane to mean anything. On a one-pane chart the gutter and the
+    // price pane's rows are the same rectangle, so the leak this covers is invisible
+    // there — which is why it gets its own page rather than a flag on the one above.
+    const panePage = await browser.newPage();
+    const paneErrors = [];
+    panePage.on('pageerror', (e) => paneErrors.push(e.message));
+    await panePage.setViewport({ width: 1280, height: 700, deviceScaleFactor: 1 });
+    await panePage.goto(PANES_URL, { waitUntil: 'networkidle2' });
+    await panePage.waitForFunction(() => globalThis.__mcReady === true, { timeout: 20000 });
+    await wait(600);
+
+    // Pane geometry read from the chart rather than recomputed here, so the assertions
+    // are against the same numbers the renderer used.
+    const paneGeom = await panePage.evaluate(() => {
+        const mc = globalThis.__mc;
+        const options = mc.chart.options();
+        const timeAxisHeight = options.layout.timeAxisHeight;
+        const plotHeight = mc.plot().height;
+        const separatorHeight = options.panes.separatorHeight;
+        // paneRects: the first pane takes round(w0 / total * available), the rest follow.
+        const available = plotHeight - timeAxisHeight - separatorHeight * (mc.panes().count - 1);
+        const priceHeight = Math.round((options.panes.weights[0] /
+            options.panes.weights.reduce((a, b) => a + b, 0)) * available);
+        return {
+            priceAxisWidth: options.layout.priceAxisWidth,
+            priceBottom: priceHeight,
+            separatorTop: priceHeight,
+            lowerTop: priceHeight + separatorHeight,
+            plotBottom: plotHeight - timeAxisHeight,
+            paneCount: mc.panes().count,
+        };
+    });
+    const paneAxisX = Math.round(paneGeom.priceAxisWidth / 2);
+
+    // Lock the price range so the live feed cannot move it and disguise a leak.
+    const paneRead = () => panePage.evaluate(() => {
+        const mc = globalThis.__mc;
+        const price = mc.chart.getPriceRange();
+        return {
+            priceSpan: price[1] - price[0],
+            lowerSpan: mc.panes().ranges[1][1] - mc.panes().ranges[1][0],
+            offsetX: mc.xOf(0),
+        };
+    });
+    const dragInPaneGutter = async (y) => {
+        await panePage.evaluate(() => globalThis.__mc.chart.setPriceRange([100, 200]));
+        await wait(200);
+        const before = await paneRead();
+        await panePage.mouse.move(paneAxisX, y);
+        await panePage.mouse.down();
+        await panePage.mouse.move(paneAxisX, y + 160, { steps: 10 });
+        await panePage.mouse.up();
+        await wait(250);
+        return { before, after: await paneRead() };
+    };
+
+    const inPrice = await dragInPaneGutter(Math.round(paneGeom.priceBottom / 2));
+    const onSeparator = await dragInPaneGutter(paneGeom.separatorTop);
+    const inLower = await dragInPaneGutter(
+        Math.round((paneGeom.lowerTop + paneGeom.plotBottom) / 2));
+    const onLastRow = await dragInPaneGutter(paneGeom.priceBottom - 3);
+
+    const moved = (d, key) => Math.abs(d.after[key] - d.before[key]) > 1e-9;
+    const held = (d, key) => !moved(d, key);
+    record(
+        'a drag in the price pane gutter scales the price pane',
+        moved(inPrice, 'priceSpan') && held(inPrice, 'offsetX'),
+        `price span ${inPrice.before.priceSpan.toFixed(2)} -> ${inPrice.after.priceSpan.toFixed(2)}, ` +
+        `offsetX held at ${inPrice.after.offsetX.toFixed(2)}`,
+    );
+    // The one that matters: a lower pane's gutter must do *nothing*. Not scale the
+    // price chart, not scale itself, and not pan — a vertical drag that slid the
+    // series sideways would be a second gesture nobody asked for.
+    record(
+        'a drag in a lower pane gutter does nothing at all',
+        held(inLower, 'priceSpan') && held(inLower, 'lowerSpan') && held(inLower, 'offsetX')
+            && held(onSeparator, 'priceSpan') && held(onSeparator, 'offsetX'),
+        `lower gutter: price, lower pane and offsetX all unchanged; ` +
+        `separator at y=${paneGeom.separatorTop} also inert`,
+    );
+    // The boundary has to be right, not merely "mostly right" — if the rows were
+    // computed too generously the price pane would lose its last few rows.
+    record(
+        'the last row above the divider still scales, so the boundary is exact',
+        moved(onLastRow, 'priceSpan') && held(onLastRow, 'offsetX'),
+        `y=${paneGeom.priceBottom - 3} scaled the price span to ` +
+        `${onLastRow.after.priceSpan.toFixed(2)}; the divider starts at y=${paneGeom.separatorTop}`,
+    );
+    record(
+        'no page error escaped a pane handler',
+        paneErrors.length === 0,
+        paneErrors.length === 0 ? 'clean' : paneErrors.slice(0, 3).join(' | '),
+    );
+    await panePage.close();
 
     record(
         'no page error escaped a handler',

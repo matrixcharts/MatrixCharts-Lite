@@ -223,16 +223,21 @@ A press that travels more than a few CSS pixels is a pan, not a click, and repor
 |---|---|---|
 | Drag | the plot | pans horizontally, about the pointer |
 | Wheel, pinch | the plot | zooms horizontally, about the pointer |
-| Drag | the **price axis** (left gutter) | changes the price span vertically |
-| Drag, pinch | the time axis (bottom gutter) | reserved; currently a pan |
+| Drag | the **price axis** beside the price pane | changes the price span vertically |
+| Drag | the price axis beside a *lower* pane | nothing |
+| Drag | the time axis (bottom gutter) | reserved; currently a pan |
 
-A press on the left gutter is a vertical gesture and nowhere else is. It does not pan, it does not move the series, and it does not disturb the live-edge latch, so the two axes stay independent and a caller never gets one gesture's side effects along with the other's.
+A press in the price pane's gutter is a vertical gesture and nowhere else is. It does not pan, it does not move the series, and it does not disturb the live-edge latch, so the two axes stay independent and a caller never gets one gesture's side effects along with the other's.
+
+**The price axis belongs to the price pane's rows, and to nothing else.** With `panes.weights` declaring more than one pane, only the rows of pane 0 own the gesture. A drag beside a lower pane does *nothing*: it does not scale the price chart, it does not scale the pane it is beside, and it does not pan. Sub-pane scaling is not part of the surface, and the one thing that must never happen is a drag at the bottom of the screen reaching up and stretching the price chart — which is what treating the whole gutter as the price axis did, and which a one-pane chart cannot show, because there the gutter and the price pane's rows are the same rectangle. The `separatorHeight` band between two panes belongs to neither, so a drag that starts on a divider is inert too. `priceAxisWidth: 0` disables the gesture entirely.
 
 **The price-axis drag changes the price span, and it takes the vertical scale off `autoScale` to do it.** Dragging down expands and dragging up compresses, one pane height of travel for a factor of two, applied about the middle of the range — so the span is what moves and the middle is what stays. That is the same thing `setPriceRange` does, arrived at by dragging, and it goes through the same lock: the range survives every later append until `fitPriceRange()` hands the pane back to the auto-scaler. A drag of more than one pane height in a single gesture is clamped to a tenth or ten times the span, so the pointer cannot invert or flatten the axis, and dragging back out retraces the range exactly.
 
 The arithmetic is in scale space, so on a log axis the drag scales the *ratio* `high / low` rather than the difference — a log pane's headroom is a ratio of log, which is the same reason the auto-fit applies its padding there. A press that does not travel past the same few-pixel slop as a pan is a click and changes nothing, so brushing the axis cannot silently take the scale away from the caller.
 
-`setPriceRange([low, high])` sets that range directly, `fitPriceRange()` releases the lock, and `getPriceRange()` reports what the pane is currently showing. `getPriceRange()` and `coordinateToPrice()` agree at the pane edges to within float error, so a readout built on either matches the bars.
+`setPriceRange([low, high])` sets that range directly, `fitPriceRange()` releases the lock, and `getPriceRange()` reports what the pane is currently showing. All three act on the price pane alone; a lower pane's scale is fitted to the values in it and is not directly settable.
+
+`getPriceRange()` and `coordinateToPrice()` agree at the pane edges to within float error, so a readout built on either matches the bars, and `getPriceRange()` agrees with `getPaneValueRange(0)` because both are driven by the same broadcast frame. Locking a range repaints the pane: the vertical transform reaches the renderers through the viewport broadcast, so the axis labels, the candles and `getPriceRange()` all move together.
 
 ## Runtime options
 
