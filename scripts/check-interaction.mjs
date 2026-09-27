@@ -891,6 +891,316 @@ try {
         pageErrors.length === 0,
         pageErrors.length === 0 ? 'clean' : pageErrors.slice(0, 3).join(' | '),
     );
+
+    // --- the time axis, measured rather than asserted ---------------------------------
+    //
+    // Everything about these two is a question about the width of text, and the headless
+    // stub reports a `measureText` width of zero. So neither could be caught there: the
+    // reported symptom was a row of clipped half-dates (`Sep 1, 01:30 PM  Sep 1 Sep 1`),
+    // which is not a wrong value anywhere, it is fourteen correct values too wide for the
+    // space between them.
+
+    // The feed is stopped for these two. Not tidiness: the source redraws on a timer, so
+    // a recorder read across a frame boundary holds two views' worth of labels, and
+    // sorting them by x pairs a label from the right of one view with one from the left of
+    // the other. That first showed as a 1200px "overlap", and then — once the scan was
+    // fixed — as two identical labels 32px apart, which is the same artefact wearing a
+    // more convincing disguise. The chart does not need a live feed to have a time axis.
+    await page.evaluate(() => globalThis.__mc.source.stop());
+    await wait(150);
+
+    // Reset the recorder and force a redraw **in the same evaluate**, so the measurement
+    // cannot race the render. `scrollToRealtime` is used only to guarantee a frame; the
+    // labels are filtered by position so the price gutter's own labels cannot be mistaken
+    // for axis ones.
+    const axisText = await page.evaluate(async () => {
+        const { chart, drawn, labelWidth, timeAxisHeight, plot } = globalThis.__mc;
+        drawn.labels.length = 0;
+        drawn.lines.length = 0;
+        chart.scrollToRealtime();
+        await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+        const r = plot();
+        const stripTop = r.y + r.height - timeAxisHeight();
+        return {
+            stripTop,
+            labels: drawn.labels
+                .filter((entry) => entry.y > stripTop)
+                .map((entry) => ({
+                    text: entry.text,
+                    half: labelWidth(entry.text) / 2,
+                    x: entry.x - r.x,
+                })),
+        };
+    });
+
+    record(
+        'the time axis has labels to measure',
+        axisText.labels.length >= 2,
+        `${axisText.labels.length} labels in the ${(await page.evaluate(() => globalThis.__mc.plot().height))}px canvas`,
+    );
+    // The invariant itself: no two labels overlap, so nothing is clipped or overprinted.
+    // The old code could not satisfy this at any width, because every label carried the
+    // date and the step is chosen from the pixel budget alone.
+    // Deduped by text, and this is the load-bearing step rather than a convenience.
+    // The 2D layer renders in several passes per frame and the axis labels go down more
+    // than once, so a recorder holds each label repeatedly — the same price tag twice at
+    // identical coordinates was the first thing that showed it. Left in, those repeats
+    // sorted by x become "two identical labels 32px apart" and read as a collision that
+    // is not there. Deduping by text is safe because a single axis cannot draw the same
+    // text twice: the full form of a label names an instant-group, so two labels with the
+    // same text are the same label, drawn again. With the repeats gone, any overlap left
+    // is between two *different* labels, which is the actual defect.
+    const byText = new Map();
+    for (const label of axisText.labels) {
+        if (!byText.has(label.text)) byText.set(label.text, label);
+    }
+    const sorted = [...byText.values()].sort((a, b) => a.x - b.x);
+    let worstOverlap = 0;
+    let overlapPair = '';
+    for (let i = 1; i < sorted.length; i++) {
+        const previous = sorted[i - 1];
+        const current = sorted[i];
+        const overlap = previous.x + previous.half - (current.x - current.half);
+        if (overlap > worstOverlap) {
+            worstOverlap = overlap;
+            overlapPair = `"${previous.text}" / "${current.text}"`;
+        }
+    }
+    record(
+        'no two time-axis labels overlap',
+        worstOverlap <= 0,
+        worstOverlap <= 0
+            // Abutting is allowed and reported as such: the renderer drops a label whose box
+            // reaches *back into* the previous one, so a pair that exactly touches is the
+            // intended outcome rather than a near-miss, and printing "clears by 0.0px"
+            // would read as one.
+            ? `${sorted.length} distinct labels, tightest pair ${worstOverlap === 0 ? 'abuts exactly' : `clears by ${(-worstOverlap).toFixed(1)}px`}`
+            : `worst overlap ${worstOverlap.toFixed(1)}px at ${overlapPair}`,
+    );
+    // The compaction, stated as the property it is rather than as a count that only holds
+    // at one detail: **not every label carries the date.** A minute-level axis is one
+    // dated label in eight; a day-level one is roughly one per month. Both are "a small
+    // minority", and the old code made it "all of them" at every level. Asserting an exact
+    // count here would be asserting the fixture's detail rather than the behaviour.
+    const dated = sorted.filter((entry) =>
+        /\b(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\b/.test(entry.text));
+    record(
+        'most time-axis labels drop the date rather than repeating it',
+        dated.length > 0 && dated.length * 2 <= sorted.length,
+        `${dated.length} of ${sorted.length} labels carry a date` +
+        // Joined on a pipe, not a comma: a full label is `Oct 02, 11:55 AM` and a comma
+        // separator makes three labels read as five.
+        (dated.length ? ` (${[...new Set(dated.map((d) => d.text))].join(' | ')})` : ''),
+    );
+
+    // --- the grid closes where there are no candles -----------------------------------
+    //
+    // A view parked in the space past the last candle is the case `setVisibleLogicalRange`
+    // makes reachable on purpose, and the reported symptom was that the cells never closed
+    // out there: the horizontal lines come from the price scale and ran the full width,
+    // while the vertical lines stopped dead at the newest candle.
+    const gridPastData = await page.evaluate(async () => {
+        const { chart, drawn, plot } = globalThis.__mc;
+        const count = chart.getCandleCount();
+        drawn.lines.length = 0;
+        // Fifty bar-widths of empty space after the last candle, forced in the same
+        // evaluate as the reset so the frame cannot be missed.
+        chart.setVisibleLogicalRange({ from: count - 20, to: count + 50 });
+        await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+        const r = plot();
+        // A stroked path is not a line: the grid and the plot border go down in one
+        // `beginPath`/`stroke`, so a path is split into its consecutive point pairs and
+        // each *segment* judged on its own. Treating a path as a line is how an earlier
+        // version of this found only the border and concluded the grid was empty.
+        const segments = [];
+        for (const path of drawn.lines) {
+            for (let i = 1; i < path.length; i++) {
+                const [x1, y1] = path[i - 1];
+                const [x2, y2] = path[i];
+                segments.push({ x1, y1, x2, y2 });
+            }
+        }
+        const plotBottom = r.y + r.height;
+        // A vertical grid line: the same x twice, spanning most of the plot's height. One
+        // that stops short, or sits outside the plot, is the defect being looked for.
+        const verticals = segments
+            .filter((s) => s.x1 === s.x2 && Math.abs(s.y2 - s.y1) > 40)
+            .map((s) => ({ x: s.x1 - r.x, top: s.y1, bottom: s.y2 }));
+        const inPlot = verticals.filter((v) => v.x > 1 && v.x < r.width - 1 && v.bottom <= plotBottom + 1);
+        return {
+            count,
+            verticals: verticals.length,
+            inPlot: inPlot.length,
+            rightMost: inPlot.length ? Math.max(...inPlot.map((v) => v.x)) : 0,
+            plotWidth: r.width,
+            lastBarX: chart.indexToCoordinate(count - 1) - r.x,
+        };
+    });
+    record(
+        'vertical grid lines reach past the newest candle',
+        gridPastData.rightMost > gridPastData.lastBarX,
+        `rightmost vertical line at x=${gridPastData.rightMost.toFixed(1)} against the last ` +
+        `candle at x=${gridPastData.lastBarX.toFixed(1)} in a ${gridPastData.plotWidth.toFixed(0)}px plot ` +
+        `(${gridPastData.inPlot} verticals)`,
+    );
+
+    // --- the chrome the caller is expected to own --------------------------------------
+    //
+    // The floating OHLC panel and the last-price tag were both drawn unconditionally, and
+    // neither could be removed: `crosshair.visible: false` took the crosshair lines, the
+    // panel and both gutter tags together, and the last-price tag had no option at all.
+    // Both are options now, defaulting to off, and these assert the drawing.
+    //
+    // This can only be measured here. The headless 2D layer is a deliberate no-op double
+    // whose `fillText` records nothing, so a test suite can assert that the option exists
+    // and nothing about whether it is honoured.
+
+    /** Hovers the middle of the plot and reports the OHLC panel's own text. */
+    const readPanel = async (applyOptions) => {
+        const box = await page.evaluate(() => globalThis.__mc.plot());
+        await page.mouse.move(box.x + box.width * 0.5, box.y + box.height * 0.5);
+        await wait(120);
+        return page.evaluate(async (patch) => {
+            const { chart, drawn, plot } = globalThis.__mc;
+            if (patch !== null) chart.applyOptions(patch);
+            drawn.labels.length = 0;
+            // One redraw after the option lands, so what is measured is the option's
+            // effect and not the frame that happened to be on screen already.
+            chart.scrollToRealtime();
+            await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+            return drawn.labels
+                .map((entry) => entry.text)
+                .filter((text) => /^(O|H|L|C|T) /.test(text));
+        }, applyOptions);
+    };
+
+    // Off by default: a hover draws no OHLC text at all.
+    const panelOff = await readPanel(null);
+    record(
+        'the library draws no OHLC panel by default',
+        panelOff.length === 0,
+        panelOff.length === 0 ? 'no O/H/L/C or T text on hover' : panelOff.slice(0, 3).join(' | '),
+    );
+    // On when asked, and the crosshair is unaffected either way — this is the panel, not
+    // the crosshair.
+    const panelOn = await readPanel({ crosshair: { readout: true } });
+    const wanted = ['O ', 'H ', 'L ', 'C ', 'T '];
+    record(
+        'crosshair.readout draws the OHLC panel when asked',
+        wanted.every((prefix) => panelOn.some((text) => text.startsWith(prefix))),
+        `${panelOn.length} lines: ${panelOn.join(' | ') || 'none'}`,
+    );
+    await page.evaluate(() => globalThis.__mc.chart.applyOptions({ crosshair: { readout: false } }));
+    await wait(120);
+
+    // The last-price tag, measured directly rather than through its side effect.
+    //
+    // An earlier version of this asserted the *consequence* — that a price line sitting at
+    // the newest close gets its axis label back when the tag is off — and that was the
+    // worst possible fixture: a price line at the same value as the last price draws the
+    // same text at the same y, so the two are indistinguishable and the counts came out
+    // equal with the tag both on and off. The tag's own presence is measurable on its own:
+    // lock the price range so the ticks are round numbers well away from the newest close,
+    // and then a label at the newest close's y can only be the tag.
+    const lastPriceTagLabels = async (patch) => page.evaluate(async (p) => {
+        const { chart, drawn } = globalThis.__mc;
+        if (p !== null) chart.applyOptions(p);
+        // A locked range puts the ticks at round numbers, so the newest close is not one.
+        const last = chart.getLastCandle();
+        const lo = Math.floor(last.close) - 4;
+        chart.setPriceRange([lo, lo + 8]);
+        await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+        drawn.labels.length = 0;
+        chart.scrollToRealtime();
+        await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+        const plotRect = chart.getPlotRect();
+        // Where the newest close sits in y, so the tag can be looked for by position.
+        const priceY = chart.priceToCoordinate(last.close);
+        return {
+            priceY,
+            close: last.close,
+            atTag: drawn.labels
+                .filter((entry) => entry.x > 0 && entry.x <= plotRect.x
+                    && Math.abs(entry.y - priceY) < 2)
+                .map((entry) => entry.text),
+        };
+    }, patch);
+
+    const tagOn = await lastPriceTagLabels({ candlestick: { lastPriceTag: true } });
+    const tagOff = await lastPriceTagLabels({ candlestick: { lastPriceTag: false } });
+    record(
+        'candlestick.lastPriceTag draws the price-axis tag only when asked',
+        tagOn.atTag.length > 0 && tagOff.atTag.length === 0,
+        `close ${tagOn.close} at y=${tagOn.priceY.toFixed(1)} — tag on: ` +
+        `[${tagOn.atTag.join(', ') || 'none'}], tag off: [${tagOff.atTag.join(', ') || 'none'}]`,
+    );
+    await page.evaluate(() => globalThis.__mc.chart.applyOptions({ candlestick: { lastPriceTag: false } }));
+    await wait(120);
+
+    // --- the text is actually legible on the chip it is drawn on -----------------------
+    //
+    // Reported as "the price line badge text is not visible". That is not a wrong value
+    // anywhere: the tag was filled with a saturated candle colour and its text painted in
+    // the theme's text colour, which on the dark theme is a light ink on saturated green.
+    // Nothing was incorrect, so nothing could be asserted about it — legibility is a
+    // relationship between two colours, and only the drawn pair shows it.
+    const chipContrast = await page.evaluate(async () => {
+        const { chart, drawn, rgb } = globalThis.__mc;
+        chart.applyOptions({ crosshair: { readout: true }, candlestick: { lastPriceTag: true } });
+        await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+        drawn.labels.length = 0;
+        drawn.rects.length = 0;
+        chart.scrollToRealtime();
+        await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+        const plotRect = chart.getPlotRect();
+        // A label sitting on a chip: the most recent rect, drawn before it, that contains
+        // its anchor. `drawTag` and the OHLC panel both fill then write, so the pairing is
+        // by order as well as by geometry.
+        const linear = (c) => (c <= 0.03928 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4));
+        const luminance = (rgba) =>
+            0.2126 * linear(rgba[0]) + 0.7152 * linear(rgba[1]) + 0.0722 * linear(rgba[2]);
+        const ratio = (a, b) => {
+            const hi = Math.max(luminance(a), luminance(b));
+            const lo = Math.min(luminance(a), luminance(b));
+            return (hi + 0.05) / (lo + 0.05);
+        };
+        const measured = [];
+        for (const label of drawn.labels) {
+            const ink = rgb(label.fill);
+            if (ink === null) continue;
+            const chip = [...drawn.rects].reverse().find((rect) =>
+                label.x >= rect.x && label.x <= rect.x + rect.w
+                && label.y >= rect.y && label.y <= rect.y + rect.h);
+            if (chip === undefined) continue;
+            const fill = rgb(chip.fill);
+            if (fill === null || fill[3] === 0) continue;
+            measured.push({
+                text: label.text,
+                ratio: ratio(ink, fill),
+                // Only the gutter chips and the OHLC panel, not the plain axis labels,
+                // which sit on the plot and are the theme's business rather than a chip's.
+                chip: chip.x < plotRect.x + 200,
+            });
+        }
+        return measured;
+    });
+
+    const onChips = chipContrast.filter((entry) => entry.chip);
+    const worst = onChips.reduce((min, entry) => Math.min(min, entry.ratio), Infinity);
+    record(
+        'text on every chip is legible against the chip it sits on',
+        onChips.length >= 2 && worst >= 4.5,
+        onChips.length === 0
+            ? 'no chip text was found to measure'
+            : `${onChips.length} labels on chips, worst ${worst.toFixed(2)}:1` +
+              (worst < 4.5
+                  ? ` — "${onChips.find((entry) => entry.ratio === worst).text}"`
+                  : ''),
+    );
+    await page.evaluate(() => globalThis.__mc.chart.applyOptions({
+        crosshair: { readout: false },
+        candlestick: { lastPriceTag: false },
+    }));
 } finally {
     await browser.close();
 }

@@ -6,7 +6,108 @@ records what moved and why, per release.
 
 ## Unreleased
 
-Nothing yet.
+Three defects on paths that had no test, three additions, and one behaviour change to an
+existing option. No export, option or event field was removed or repurposed.
+
+### Added
+
+**`Chart.getPlotRect()`**, and `PlotRect` as an exported type. The region the series is drawn
+into, in CSS px from the container's top-left — the canvas minus the price gutter and the
+time-axis strip. `x = 0` in element coordinates is inside the price labels, not at the first
+bar, so every hit-test, clamp and overlay a caller writes has to know where the data starts
+and there was no way to ask. Returned by value, so writing to it cannot move the plot.
+
+**`Chart.setVisibleLogicalRange(range)`**, the counterpart to the existing
+`getVisibleLogicalRange()`. The only public way to place the viewport, and the one that was
+missing: the complete list of mutators had no way to set a range, so a saved view could be
+read but never restored. Sets position *and* bar spacing, because honouring a range that does
+not fit at the current spacing is impossible and quietly showing a different range than the
+one asked for is worse than not honouring it.
+
+**A range past the data is honoured, and that is the point.** `from` may be below zero and
+`to` above the candle count; outside the series the index axis continues at one bar per slot.
+Drawing tools want somewhere to put a projection, and a viewport that can only be moved by
+gesture is not one the caller owns. Held to the same bound as a pan, so an ask and a gesture
+cannot disagree; throws on a non-finite or empty range, matching `setPriceRange()`.
+
+**`crosshair.readoutBorderColor`**, a border colour for the OHLC panel that is its own option
+rather than borrowed. Unset, the panel takes the candle's direction colour — a *data* colour
+doing a *chrome* job, so the frame changes meaning with whatever the pointer is over, and on
+a light theme it reads as an error state. It also could not be themed without recolouring the
+candles, which is the one thing that must not double as UI.
+
+
+### Fixed
+
+**Vertical grid lines stopped at the newest candle, so grid cells never closed in empty
+space.** Reported as "the horizontal lines can be seen but the vertical lines don't form and
+close a grid till the candles fully close". The two directions are derived differently:
+horizontal lines come from each pane's price ticks, a statement about the scale, so they
+always spanned the full width; vertical lines come from the time-axis tick list, and every
+tick in it named a real candle. The window was clamped to the series, and each tick was
+positioned with `indexToCoordinate`, which clamps its index to the slot table — so a window in
+the void produced one label, on the newest candle.
+
+A tick now carries the **slot** it belongs on, which extrapolates past either end of the
+series at one bar per slot, and both the line and its label are drawn from it. Inside the
+series the slot is exactly what `indexToCoordinate` would have said, so no existing chart
+moves. Two asymmetries had to go with it: `barsBeforeSlot` extrapolates for a break-free
+series and clamps for a gapped one, so the empty space was labelled on a continuous chart and
+not on one with an overnight break in it — the difference being whether the instrument trades
+overnight, which is what makes a code branch look like a data bug.
+
+**The time axis repeated the date on every label.** A five-minute chart read `Sep 1, 09:35 AM
+Sep 1, 09:40 AM Sep 1, 09:45 AM` and, being far wider than the space between labels,
+overprinted itself into a row of clipped half-dates. Only a label that changes the coarse
+part carries it now — the date on a minute-level axis, the month on a day-level one, the year
+on a monthly one — with the first label in view always full so a view opening mid-day still
+says what day it is. A label whose box would reach back into the previous one is dropped
+rather than overprinted.
+
+**Panning was unbounded in both directions.** The drag and pinch paths added a pointer delta
+to the view offset with nothing bounding them, so the chart could be flung arbitrarily far
+into empty space. The right-hand case is the one that hurt: flinging past the newest candle
+clears the live-edge latch, the feed carries on appending into a window nobody is looking at,
+and the chart is indistinguishable from a dead one until someone calls `scrollToRealtime()`.
+
+The bound is **half the plot width** of slack past either end, in slots — a plot fraction
+rather than a bar count, which is load-bearing. The first attempt used one bar and the
+browser harness caught it: a 220px drag moved the series 11.76px, because the chart had
+stopped following the pointer. A trading chart that does not track 1:1 cannot ship.
+
+A **zoom is deliberately not bounded.** It is anchored on the bar under the pointer, so it
+cannot throw the view where the user is not already pointing; clamping it would only pull
+that bar out from under the cursor. The bound is on the gesture and not on the view, so
+appends, `fitContent()` and a live-edge re-anchor are exempt — a panned viewport is the
+caller's, and a bound that moved with every appended bar would pull it sideways underneath
+them.
+
+**A collapsed container was drawn into at fallback geometry.** `clientWidth || 800` cannot
+tell "not measured yet" from "measured, and it is zero", so a panel taken through zero by a
+divider drag got a frame laid out for 800×500 — labels sized for a wide plot and crammed
+into a fraction of it. The chart now stops drawing into a container that has been sized and
+is now zero-sized, leaving the last frame on the canvas. Feeding is not skipped: appends are
+applied first, so a live feed does not build a backlog behind a collapsed panel.
+
+### Changed
+
+**The floating OHLC panel and the last-price tag are off by default.** Both were drawn unconditionally and neither could be removed: `crosshair.visible: false` took the crosshair lines, the panel and both gutter tags together, and the last-price tag had no option at all. They are UI, and a chart library's job is to report state, so they are now `crosshair.readout` and `candlestick.lastPriceTag`, both defaulting to `false`. A caller who wants one reads `crosshairMove` — which carries the whole `candle` — or `getLastCandle()`, and draws it in their own components.
+
+This is a visible change: upgrading removes both. It is listed here rather than buried because the panel has been in every screenshot anyone has looked at.
+
+The crosshair lines and the price and time tags in the gutters are **not** affected. They label the crosshair's own position and are part of the crosshair rather than the readout.
+
+**`candlestick.lastPriceTag: false` also stops the tag reserving space on the axis.** The tag competes with price-line labels and wins, so leaving it in the layout while not drawing it would keep a caller's own price line from getting its label. The side effect is that a price line sitting at the newest close now keeps its axis label, where before the tag took the space.
+
+**`priceFormat.precision` is a fixed number of fraction digits rather than a maximum**, so
+`100` reads `100.00` and `100.1` reads `100.10`. A price axis where `100` sits beside
+`100.1` and `763.25` makes the reader count decimals to find the tick spacing, which is the
+one job an axis has. It also makes the float artefacts unreachable: tick values come out of
+the tick arithmetic as doubles, so `100.1000001` was displayed whenever the configured
+precision was wide enough to show it.
+
+**If you are seeing seven decimals, something set `precision` to seven.** The default is `2`
+and a chart at the default now reads `100.10`.
 
 ## v1.0.2
 

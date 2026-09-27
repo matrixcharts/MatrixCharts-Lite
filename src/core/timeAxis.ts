@@ -30,7 +30,8 @@
 //   Alignment only moves the phase. It can never change the spacing, because the phase
 //   is snapped once and the step is counted in bars from there.
 
-import { barsBeforeSlot, modalInterval } from './sessionScale.js';
+import { barsBeforeSlotExtended, modalInterval, slotAtIndex } from './sessionScale.js';
+import { slotForIndex } from './coordinates.js';
 
 /**
  * Smallest gap between two time labels, in CSS pixels.
@@ -91,10 +92,141 @@ const TICK_LADDER: readonly number[] = [
 
 /** One label on the time axis. */
 export interface TimeAxisTick {
-    /** Ordinal of the candle this label belongs to. */
+    /**
+     * Ordinal of the candle this label belongs to, clamped to the series.
+     *
+     * Out of series it names no candle — see `slot` and `time`, which are what a label
+     * is actually drawn from. Kept because a caller reading the tick list wants the
+     * ordinal where there is one, and clamping rather than going negative keeps every
+     * reader's index arithmetic in range.
+     */
     index: number;
-    /** That candle's own timestamp, so a caller need not look it up to format it. */
+    /**
+     * That candle's own timestamp, so a caller need not look it up to format it.
+     *
+     * Extrapolated from the nearest real candle by the series' own bar interval when
+     * the tick is out of series, so it keeps advancing instead of repeating the last
+     * candle's time across the empty space.
+     */
     time: number;
+    /**
+     * Where the label belongs, in **slot** space, and what both the grid line and the
+     * text are drawn from.
+     *
+     * Additive, and the reason an axis can describe a region with no candles. A slot
+     * rather than an index because "index 340" names no position once the series has
+     * 300 candles and a break in it — the distance from bar 300 to bar 301 is not a
+     * number of bars. Inside the series this is exactly what `indexToCoordinate` would
+     * have returned for `index`, so existing charts are unaffected; it is carried
+     * explicitly because the alternative was to ask `indexToCoordinate` for a position,
+     * and that clamps the index to the slot table, which is what collapsed every
+     * out-of-series tick onto the newest candle.
+     */
+    slot: number;
+}
+
+/** How much of a timestamp a time-axis label spells out. */
+export type TimeAxisDetail = 'minute' | 'day' | 'month';
+
+/**
+ * The detail a visible span calls for.
+ *
+ * A function of the span alone so the axis and anything else labelling the same span
+ * cannot pick different levels, and so the choice is testable without a renderer.
+ */
+export function timeAxisDetail(firstTime: number, lastTime: number): TimeAxisDetail {
+    const span: number = Math.abs(lastTime - firstTime);
+    if (!Number.isFinite(span)) return 'minute';
+    if (span < 2 * DAY_MS) return 'minute';
+    if (span < 365 * DAY_MS) return 'day';
+    return 'month';
+}
+
+/** One drawn label on the time axis. */
+export interface TimeAxisLabel {
+    /** Slot this label belongs on, carried from the tick so the two cannot disagree. */
+    slot: number;
+    /** The text to draw. Narrower than the full form whenever `major` is false. */
+    text: string;
+    /**
+     * Whether this label carries the coarse part of the timestamp — the date on a
+     * minute-level axis, the month on a day-level one, the year on a month-level one.
+     *
+     * Every label used to carry it, so a five-minute chart read
+     * `Sep 1, 09:35 AM  Sep 1, 09:40 AM  Sep 1, 09:45 AM` and, being far too wide for
+     * the space between labels, overlapped itself into an unreadable row of clipped
+     * half-dates. Only a label that changes the coarse part needs to say it; the ones
+     * between it are unambiguous beside it, and a reader scanning left to right gets the
+     * date from the label that introduced it.
+     */
+    major: boolean;
+}
+
+export interface TimeAxisLabelsInput {
+    /** Ticks from `timeAxisTicks`, in order. */
+    ticks: readonly TimeAxisTick[];
+    /** BCP 47 locale, as `options.locale`. */
+    locale: string;
+    /** IANA time zone, as `options.timeZone`. */
+    timeZone: string;
+    /** How much of a timestamp to spell out. */
+    detail: TimeAxisDetail;
+}
+
+/**
+ * The labels for a tick list, each already chosen in its full or short form.
+ *
+ * The first label is always full, whatever else is true of it, so a view that opens on
+ * the middle of a day still says what day it is. After that a label is full only where
+ * the coarse part changes. Nothing is dropped here — a caller still gets one label per
+ * tick, in order — because deciding which of them would *collide* needs text widths, and
+ * a width is a renderer fact.
+ *
+ * The group key is read through `Intl` in the configured time zone rather than by
+ * dividing epoch milliseconds, because "the same day" is a calendar question in the
+ * reader's zone and not an arithmetic one: 23:00 and 01:00 either side of a UTC midnight
+ * are the same day in London and different days in New York.
+ */
+export function timeAxisLabels(input: TimeAxisLabelsInput): TimeAxisLabel[] {
+    const { ticks, locale, timeZone, detail } = input;
+    if (ticks.length === 0) return [];
+    const full: Intl.DateTimeFormat = new Intl.DateTimeFormat(locale, fullDetailOptions(detail, timeZone));
+    const short: Intl.DateTimeFormat = new Intl.DateTimeFormat(locale, shortDetailOptions(detail, timeZone));
+    const group: Intl.DateTimeFormat = new Intl.DateTimeFormat(locale, groupOptions(detail, timeZone));
+
+    const labels: TimeAxisLabel[] = [];
+    let previousGroup: string | null = null;
+    for (const tick of ticks) {
+        const date: Date = new Date(tick.time);
+        const key: string = group.format(date);
+        const major: boolean = previousGroup === null || key !== previousGroup;
+        labels.push({ slot: tick.slot, text: (major ? full : short).format(date), major });
+        previousGroup = key;
+    }
+    return labels;
+}
+
+function fullDetailOptions(detail: TimeAxisDetail, timeZone: string): Intl.DateTimeFormatOptions {
+    if (detail === 'minute') {
+        return { month: 'short', day: '2-digit', hour: '2-digit', minute: '2-digit', timeZone };
+    }
+    if (detail === 'day') return { month: 'short', day: '2-digit', timeZone };
+    return { year: 'numeric', month: 'short', timeZone };
+}
+
+function shortDetailOptions(detail: TimeAxisDetail, timeZone: string): Intl.DateTimeFormatOptions {
+    // The short form drops exactly the part a neighbouring major label already carries.
+    if (detail === 'minute') return { hour: '2-digit', minute: '2-digit', timeZone };
+    if (detail === 'day') return { day: '2-digit', timeZone };
+    return { month: 'short', timeZone };
+}
+
+function groupOptions(detail: TimeAxisDetail, timeZone: string): Intl.DateTimeFormatOptions {
+    // The unit the short form drops, so a label is major exactly when dropping its date
+    // would have lost information.
+    if (detail === 'minute') return { year: 'numeric', month: '2-digit', day: '2-digit', timeZone };
+    if (detail === 'day') return { year: 'numeric', month: '2-digit', timeZone };
+    return { year: 'numeric', timeZone };
 }
 
 export interface TimeAxisTicksInput {
@@ -134,8 +266,17 @@ export function timeAxisTicks(input: TimeAxisTicksInput): TimeAxisTick[] {
     // Bars, from bars. `barsBeforeSlot` rather than `indexAtSlot` because a bar whose
     // left edge is exactly on the right edge is not visible, and the pixel budget
     // below is only right if the window is the set of bars actually on screen.
-    const first: number = Math.max(0, Math.min(count - 1, barsBeforeSlot(slots, input.fromSlot)));
-    const last: number = Math.max(0, Math.min(count - 1, barsBeforeSlot(slots, input.toSlot)));
+    //
+    // The window is the **slot** range on screen, and it is deliberately not clamped to
+    // the series. Clamping is what stopped the axis at the newest candle: a window
+    // running fifty slots past the last bar produced exactly the same ticks as one
+    // stopping at it, so the empty space a caller had deliberately parked the view in
+    // had no labels and no grid lines, and the horizontal lines that come from the price
+    // scale ran the full width regardless. The cells never closed out there. An index
+    // outside the series is a position on the same axis, so it is stepped through like
+    // any other and its time extrapolated.
+    const first: number = barsBeforeSlotExtended(slots, input.fromSlot, count);
+    const last: number = barsBeforeSlotExtended(slots, input.toSlot, count);
     if (last < first) return [];
 
     const barsVisible: number = last - first + 1;
@@ -150,13 +291,75 @@ export function timeAxisTicks(input: TimeAxisTicksInput): TimeAxisTick[] {
     const step: TickStep = interval > 0
         ? chooseTickStep(barsVisible, interval, budget)
         : { bars: Math.max(1, Math.ceil(barsVisible / budget)), ms: 0 };
-    const start: number = pickAnchor(times, first, last, step.ms, step.bars);
+    //
+    // The *phase* comes from the part of the window that overlaps real candles, because
+    // alignment is a wall-clock question and a wall clock needs real timestamps. The
+    // *start* comes from the window itself, stepped to the same congruence class as the
+    // anchor. Keeping the two apart is what lets a window reach past either end of the
+    // data and still come out on round times: anchoring on the overlap and looping from
+    // there would emit a label for every bar between the anchor and the window edge —
+    // hundreds of off-screen ones for a window scrolled into the empty space — and
+    // anchoring on the window directly would have nothing to align to.
+    const overlapFirst: number = Math.max(0, Math.min(count - 1, first));
+    const overlapLast: number = Math.max(0, Math.min(count - 1, last));
+    const hasOverlap: boolean = overlapLast >= overlapFirst;
+    const anchor: number = pickAnchor(
+        times,
+        hasOverlap ? overlapFirst : 0,
+        hasOverlap ? overlapLast : count - 1,
+        step.ms,
+        step.bars,
+    );
+    // Non-negative modulo, because the window can start before the anchor when the window
+    // reaches back past the oldest candle and the two are unrelated integers otherwise.
+    const phase: number = (((anchor - first) % step.bars) + step.bars) % step.bars;
+    const start: number = first + phase;
 
     const ticks: TimeAxisTick[] = [];
     for (let index = start; index <= last; index += step.bars) {
-        ticks.push({ index, time: times[index] });
+        ticks.push({
+            index: Math.max(0, Math.min(count - 1, index)),
+            time: timeAtIndex(times, index, count, interval),
+            slot: tickSlot(slots, index, count),
+        });
     }
     return ticks;
+}
+
+/**
+ * The slot a tick's index sits on, matching what `indexToCoordinate` would have said.
+ *
+ * Inside the series this is `slotAtIndex` verbatim, so an existing chart's labels and
+ * grid lines land on exactly the pixel they did before — the field is carried so a
+ * *rendering* path can use it, not to change where anything is. Outside it, the index
+ * axis continues at one bar per slot, which is the only continuation that matches how
+ * the bars inside are spaced.
+ */
+function tickSlot(slots: Float64Array | null, index: number, count: number): number {
+    if (index >= 0 && index < count) return slotAtIndex(slots, index);
+    return slotForIndex(slots, index, count);
+}
+
+/**
+ * The timestamp at an index, extrapolated past either end of the series.
+ *
+ * A label's whole job is to name an instant, and out there is no candle to ask. Carrying
+ * the last candle's own time forward would put a column of identical labels in the empty
+ * space, which is the same repetition the in-series labels had and the reason they are
+ * compacted — so the series' own modal bar interval is the extrapolation, and the labels
+ * keep advancing at the rate the bars do.
+ */
+function timeAtIndex(
+    times: readonly number[],
+    index: number,
+    count: number,
+    interval: number,
+): number {
+    if (index >= 0 && index < count) return times[index];
+    // No interval to extrapolate by means no honest answer, so the nearest real candle's
+    // time is the least-wrong one and is at least stable rather than NaN.
+    if (!(interval > 0)) return times[index >= count ? count - 1 : 0];
+    return times[index >= count ? count - 1 : 0] + (index >= count ? index - count + 1 : index) * interval;
 }
 
 /** A label every `bars` bars, on a `ms` boundary where one is meaningful. */

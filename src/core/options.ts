@@ -136,6 +136,14 @@ export interface CrosshairOptions {
     visible?: boolean;
     /** Additive in 1.x: lets the crosshair be themed alongside the plot. */
     color?: string;
+    readout?: boolean;
+    readoutBorderColor?: string;
+    readoutBackgroundColor?: string;
+    readoutTextColor?: string;
+    /** Background colour of the axis labels for the crosshair. */
+    axisLabelBackgroundColor?: string;
+    /** Text colour of the axis labels for the crosshair. */
+    axisLabelTextColor?: string;
 }
 
 /**
@@ -227,6 +235,12 @@ export interface CandlestickOptions {
      * 1.x. Defaults to `lineColor` at half alpha.
      */
     areaFillColor?: string;
+    /** Whether to show a tag on the price axis for the last known price. */
+    lastPriceTag?: boolean;
+    /** Background colour for the last price tag. */
+    lastPriceTagBackgroundColor?: string;
+    /** Text colour for the last price tag. */
+    lastPriceTagTextColor?: string;
 }
 
 /** Caller-supplied options. Every field is optional and merges over the preset. */
@@ -279,7 +293,17 @@ export interface ResolvedPanes {
     separatorHeight: number;
     separatorColor: string;
 }
-export interface ResolvedCrosshair { visible: boolean; color: string }
+export interface ResolvedCrosshair {
+    visible: boolean;
+    color: string;
+    readout: boolean;
+    readoutBorderColor: Rgba;
+    readoutBackground: Rgba;
+    /** Zero alpha means "choose it against `readoutBackground`". */
+    readoutText: Rgba;
+    axisLabelBackground: Rgba;
+    axisLabelText: Rgba;
+}
 export interface ResolvedSessionBreaks {
     enabled: boolean;
     mode: 'collapsed' | 'proportional';
@@ -305,6 +329,9 @@ export interface ResolvedCandlestick {
     /** RGBA for the line and area styles, parsed from CSS when options are applied. */
     lineColor: Rgba;
     areaFillColor: Rgba;
+    lastPriceTag: boolean;
+    lastPriceTagBackground: Rgba;
+    lastPriceTagText: Rgba;
 }
 
 /** Every option resolved to a concrete value. Returned by `chart.options()`. */
@@ -358,11 +385,11 @@ const THEME_PRESETS: Record<ChartTheme, {
     /** Volume colours are theme colours, but visibility and height are not. */
     volume: { colors: { up: string; down: string } };
     grid: ResolvedGrid;
-    crosshair: ResolvedCrosshair;
+    crosshair: Omit<ResolvedCrosshair, 'readout' | 'readoutBorderColor' | 'readoutBackground' | 'readoutText' | 'axisLabelBackground' | 'axisLabelText'>;
     /** Style choice and baseline are not theme colours, so they are omitted. */
     candlestick: Omit<
         ResolvedCandlestick,
-        'style' | 'baselinePrice' | 'lineColor' | 'areaFillColor'
+        'style' | 'baselinePrice' | 'lineColor' | 'areaFillColor' | 'lastPriceTag' | 'lastPriceTagBackground' | 'lastPriceTagText'
     >;
 }> = {
     dark: {
@@ -541,6 +568,32 @@ function requireColor(value: unknown, label: string): string {
     return value as string;
 }
 
+/** Calculates luminance for auto-contrast. */
+export function luminanceOf(rgba: readonly [number, number, number, number]): number {
+    const sRGB = [rgba[0], rgba[1], rgba[2]].map(c => c <= 0.03928 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4));
+    return 0.2126 * sRGB[0] + 0.7152 * sRGB[1] + 0.0722 * sRGB[2];
+}
+
+/** Chooses a high-contrast text colour. */
+export function contrastText(bgRgba: readonly [number, number, number, number]): readonly [number, number, number, number] {
+    const bgLum = luminanceOf(bgRgba);
+    const darkInk = [11/255, 15/255, 20/255, bgRgba[3]] as const;
+    const lightInk = [240/255, 246/255, 252/255, bgRgba[3]] as const;
+    const darkLum = luminanceOf(darkInk);
+    const lightLum = luminanceOf(lightInk);
+    const darkRatio = (Math.max(bgLum, darkLum) + 0.05) / (Math.min(bgLum, darkLum) + 0.05);
+    const lightRatio = (Math.max(bgLum, lightLum) + 0.05) / (Math.min(bgLum, lightLum) + 0.05);
+    return darkRatio >= lightRatio ? darkInk : lightInk;
+}
+
+export function priceLabelFormatter(locale: string, precision: number): Intl.NumberFormat {
+    const clamped = Math.max(0, Math.min(20, isNaN(precision) ? 0 : Math.floor(precision)));
+    return new Intl.NumberFormat(locale, {
+        minimumFractionDigits: clamped,
+        maximumFractionDigits: clamped,
+    });
+}
+
 function requireLocale(value: unknown): string {
     if (typeof value !== 'string' || value.trim().length === 0) {
         fail(`locale must be a non-empty BCP 47 tag, received ${describe(value)}.`);
@@ -651,7 +704,15 @@ export function themeDefaults(theme: ChartTheme): ResolvedChartOptions {
             weights: [...BASE_DEFAULTS.panes.weights],
             separatorColor: preset.grid.color,
         },
-        crosshair: { ...preset.crosshair },
+        crosshair: {
+            ...preset.crosshair,
+            readout: false,
+            readoutBorderColor: parseCssColor('transparent', ''),
+            readoutBackground: parseCssColor('transparent', ''),
+            readoutText: parseCssColor('transparent', ''),
+            axisLabelBackground: parseCssColor(preset.crosshair.color, ''),
+            axisLabelText: parseCssColor('transparent', ''),
+        },
         candlestick: {
             ...preset.candlestick,
             style: DEFAULT_CANDLE_STYLE,
@@ -661,6 +722,9 @@ export function themeDefaults(theme: ChartTheme): ResolvedChartOptions {
                 parseCssColor(preset.candlestick.upColor, 'candlestick.upColor'),
                 0.25,
             ),
+            lastPriceTag: false,
+            lastPriceTagBackground: parseCssColor('transparent', ''),
+            lastPriceTagText: parseCssColor('transparent', ''),
         },
     };
 }
@@ -834,6 +898,12 @@ export function resolveOptions(partial: ChartOptions, fallbackTheme: ChartTheme 
         const crosshair = requirePlainObject(partial.crosshair, 'crosshair');
         if (crosshair.visible !== undefined) resolved.crosshair.visible = requireBoolean(crosshair.visible, 'crosshair.visible');
         if (crosshair.color !== undefined) resolved.crosshair.color = requireColor(crosshair.color, 'crosshair.color');
+        if (crosshair.readout !== undefined) resolved.crosshair.readout = requireBoolean(crosshair.readout, 'crosshair.readout');
+        if (crosshair.readoutBorderColor !== undefined) resolved.crosshair.readoutBorderColor = parseCssColor(requireColor(crosshair.readoutBorderColor, 'crosshair.readoutBorderColor'), 'crosshair.readoutBorderColor');
+        if (crosshair.readoutBackgroundColor !== undefined) resolved.crosshair.readoutBackground = parseCssColor(requireColor(crosshair.readoutBackgroundColor, 'crosshair.readoutBackgroundColor'), 'crosshair.readoutBackgroundColor');
+        if (crosshair.readoutTextColor !== undefined) resolved.crosshair.readoutText = parseCssColor(requireColor(crosshair.readoutTextColor, 'crosshair.readoutTextColor'), 'crosshair.readoutTextColor');
+        if (crosshair.axisLabelBackgroundColor !== undefined) resolved.crosshair.axisLabelBackground = parseCssColor(requireColor(crosshair.axisLabelBackgroundColor, 'crosshair.axisLabelBackgroundColor'), 'crosshair.axisLabelBackgroundColor');
+        if (crosshair.axisLabelTextColor !== undefined) resolved.crosshair.axisLabelText = parseCssColor(requireColor(crosshair.axisLabelTextColor, 'crosshair.axisLabelTextColor'), 'crosshair.axisLabelTextColor');
     }
 
     if (partial.timeScale !== undefined) {
@@ -890,6 +960,9 @@ export function resolveOptions(partial: ChartOptions, fallbackTheme: ChartTheme 
                 'candlestick.areaFillColor',
             );
         }
+        if (candlestick.lastPriceTag !== undefined) resolved.candlestick.lastPriceTag = requireBoolean(candlestick.lastPriceTag, 'candlestick.lastPriceTag');
+        if (candlestick.lastPriceTagBackgroundColor !== undefined) resolved.candlestick.lastPriceTagBackground = parseCssColor(requireColor(candlestick.lastPriceTagBackgroundColor, 'candlestick.lastPriceTagBackgroundColor'), 'candlestick.lastPriceTagBackgroundColor');
+        if (candlestick.lastPriceTagTextColor !== undefined) resolved.candlestick.lastPriceTagText = parseCssColor(requireColor(candlestick.lastPriceTagTextColor, 'candlestick.lastPriceTagTextColor'), 'candlestick.lastPriceTagTextColor');
     }
 
     return resolved;

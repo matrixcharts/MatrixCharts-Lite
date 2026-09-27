@@ -6,6 +6,9 @@ import {
     parseCssColor,
     themeDefaults,
     type ResolvedChartOptions,
+    type Rgba,
+    contrastText,
+    priceLabelFormatter,
 } from '../core/options.js';
 import {
     type ChartViewport,
@@ -14,11 +17,12 @@ import {
     coordinateToIndex,
     coordinateToSlot,
     indexToCoordinate,
+    slotToCoordinate,
 } from '../core/coordinates.js';
 import { paneValueAt, type PaneLayout } from '../core/panes.js';
 import { fromScaleSpace, priceTicks, toScaleSpace, type PriceScale, type Tick } from '../core/priceScale.js';
 import { contiguousRuns } from '../core/sessionScale.js';
-import { timeAxisTicks, type TimeAxisTick } from '../core/timeAxis.js';
+import { timeAxisDetail, timeAxisLabels, timeAxisTicks, type TimeAxisTick } from '../core/timeAxis.js';
 import {
     LABEL_PRIORITY,
     layoutLabels,
@@ -112,7 +116,7 @@ export class Canvas2DRenderer implements IRenderer {
     private options: ResolvedChartOptions = themeDefaults('dark');
     // Parsed once per apply, not per label or per frame.
     private colors = this.parseColors(themeDefaults('dark'));
-    private priceFormatter: Intl.NumberFormat = new Intl.NumberFormat(undefined, { maximumFractionDigits: 2 });
+    private priceFormatter: Intl.NumberFormat = priceLabelFormatter('en-US', 2);
     private timeFormatter: Intl.DateTimeFormat | null = null;
     private timeFormatterKey: string = '';
     /**
@@ -185,9 +189,7 @@ public init(canvas: HTMLCanvasElement, emitter: EventEmitter<ChartEvents>): void
     private handleOptionsEvent = (options: ResolvedChartOptions): void => {
         this.options = options;
         this.colors = this.parseColors(options);
-        this.priceFormatter = new Intl.NumberFormat(options.locale, {
-            maximumFractionDigits: options.priceFormat.precision,
-        });
+        this.priceFormatter = priceLabelFormatter(options.locale, options.priceFormat.precision);
         this.timeFormatterKey = '';
         this.timeFormatter = null;
     };
@@ -215,10 +217,8 @@ public init(canvas: HTMLCanvasElement, emitter: EventEmitter<ChartEvents>): void
         this.crosshairCandle = payload.candle;
         this.crosshairPane = payload.pane;
         this.crosshairValue = payload.value;
-        if (!this.isGridLayer) {
-            this.clear();
-            this.render();
-        }
+        this.clear();
+        this.render();
     };
 
     private handleDataEvent = (payload: ChartEvents['data']): void => {
@@ -330,11 +330,17 @@ public init(canvas: HTMLCanvasElement, emitter: EventEmitter<ChartEvents>): void
             // No progress guard needed, and that is the point of the rewrite. The old
             // loop stepped in slots, so a slot inside a break resolved to the bar before
             // it, two of them resolved to the same x, and `x <= previousX` ended the
-            // loop at the *first* session break — taking every grid line to the right of
+            // loop at the *first* session break - taking every grid line to the right of
             // it with it. The exit is now "past the last visible bar", which is a
             // statement about bars and so cannot be tripped by geometry.
+            //
+            // Positioned from the tick's own slot rather than `indexToCoordinate`, which
+            // clamped its index to the slot table and so put every out-of-series tick on
+            // the newest candle — the reason a region with no candles had no vertical
+            // lines in it and the grid cells never closed there, while the horizontal
+            // lines, coming from the price scale, ran the full width regardless.
             for (const tick of ticks) {
-                const x: number = indexToCoordinate(viewport, tick.index);
+                const x: number = slotToCoordinate(viewport, tick.slot);
                 if (x < plot.x || x > plotRight) continue;
                 const crispX: number = Math.floor(x) + 0.5;
                 this.ctx.moveTo(crispX, plot.y);
@@ -396,8 +402,14 @@ public init(canvas: HTMLCanvasElement, emitter: EventEmitter<ChartEvents>): void
             lines.push({ y, line });
         }
 
+        // Gated on the option *before* it becomes a candidate, not after. The tag competes
+        // with price-line labels for room on the axis and wins, being the higher priority,
+        // so leaving it in the layout while not drawing it would keep a caller's own price
+        // line from getting its label — an invisible label suppressing a visible one. The
+        // side effect is that with the tag off, a price line sitting at the newest close
+        // keeps its label where the tag used to take the space.
         let lastY: number | null = null;
-        if (this.lastPrice !== null && priceBand !== undefined) {
+        if (this.options.candlestick.lastPriceTag && this.lastPrice !== null && priceBand !== undefined) {
             const y: number = priceBand.y(toScaleSpace(this.lastPrice.price, this.options.priceScale.mode));
             if (y >= priceBand.rect.y && y <= priceBand.rect.y + priceBand.rect.height) lastY = y;
         }
@@ -416,6 +428,9 @@ public init(canvas: HTMLCanvasElement, emitter: EventEmitter<ChartEvents>): void
         }
         if (lastY !== null) {
             candidates.push({ y: lastY, priority: LABEL_PRIORITY.lastPrice, height: LAST_PRICE_LABEL_HEIGHT });
+        }
+        if (this.crosshairY !== null) {
+            candidates.push({ y: this.crosshairY, priority: LABEL_PRIORITY.crosshair, height: AXIS_LABEL_HEIGHT });
         }
 
         const keep: boolean[] = layoutLabels(candidates);
@@ -567,7 +582,12 @@ public init(canvas: HTMLCanvasElement, emitter: EventEmitter<ChartEvents>): void
 
         const plot: PlotRect = viewport.plot;
         const candle: CandleData | null = this.crosshairCandle;
-        if (candle) {
+        // The floating OHLC panel, which is the only part of the crosshair a caller is
+        // expected to replace with their own. Off by default; see `crosshair.readout`.
+        // The gutter tags below are *not* gated by it: they label the crosshair's own
+        // position, the way a crosshair does in a terminal, and removing them would take
+        // away the reading the crosshair exists to give.
+        if (candle && this.options.crosshair.readout) {
             const panelX: number = plot.x + 10;
             const panelY: number = plot.y + 10;
             const panelWidth: number = 158;
@@ -582,15 +602,34 @@ public init(canvas: HTMLCanvasElement, emitter: EventEmitter<ChartEvents>): void
                 `C ${this.formatAxisValue(close)}`,
             ];
             const bullish: boolean = close >= open;
+            // An explicit border colour wins. Unset, the frame follows the candle's
+            // direction, which is what it always did and what makes it read as an error
+            // state on a light theme: a *data* colour doing a *chrome* job.
+            const border: Rgba = this.options.crosshair.readoutBorderColor;
+            const borderColor: readonly [number, number, number, number] = border[3] > 0
+                ? border
+                : (bullish ? this.colors.up : this.colors.down);
 
             this.ctx.save();
             this.ctx.font = '11px sans-serif';
             this.ctx.textBaseline = 'middle';
-            this.ctx.fillStyle = this.withAlpha(this.colors.background, 0.96);
+            // Fill and text come as a pair, and the text falls back to a colour chosen
+            // against the fill rather than to the theme's. A chip drawn in the plot's own
+            // background was a hole in the plot, and on a saturated fill the theme's text
+            // colour was close to invisible.
+            this.ctx.fillStyle = this.cssColor(this.options.crosshair.readoutBackground);
             this.ctx.fillRect(panelX, panelY, panelWidth, panelHeight);
-            this.ctx.strokeStyle = this.withAlpha(bullish ? this.colors.up : this.colors.down, 0.95);
+            this.ctx.strokeStyle = this.withAlpha(borderColor, 0.95);
             this.ctx.strokeRect(panelX + 0.5, panelY + 0.5, panelWidth - 1, panelHeight - 1);
-            this.ctx.fillStyle = this.options.layout.textColor;
+            const effectiveBg = this.options.crosshair.readoutBackground[3] === 0
+                ? this.colors.background
+                : this.options.crosshair.readoutBackground;
+
+            this.ctx.fillStyle = this.cssColor(
+                this.options.crosshair.readoutText[3] === 0
+                    ? contrastText(effectiveBg)
+                    : this.options.crosshair.readoutText,
+            );
             this.ctx.fillText(timeLabel, panelX + 8, panelY + 10);
             for (let valueIndex: number = 0; valueIndex < valueLabels.length; valueIndex++) {
                 const columnX: number = panelX + 8 + (valueIndex % 2) * 76;
@@ -610,22 +649,41 @@ public init(canvas: HTMLCanvasElement, emitter: EventEmitter<ChartEvents>): void
         // showing 30 to 86 — on an oscillator's axis. On a divider there is no pane, so
         // the tag is suppressed rather than guessed at.
         if (this.crosshairValue !== null) {
-            this.drawLabel(
+            const background = this.options.crosshair.axisLabelBackground;
+            const effectiveBg = background[3] === 0 ? this.colors.background : background;
+            const text = this.options.crosshair.axisLabelText[3] === 0 
+                    ? contrastText(effectiveBg) 
+                    : this.options.crosshair.axisLabelText;
+
+            this.drawTag(
                 this.formatAxisValue(this.crosshairValue),
                 plot.x - 6,
                 this.crosshairY as number,
-                'right',
+                background,
+                text,
+                'right'
             );
         }
-        const timeTag: string = this.crosshairTime === null
-            ? this.formatAxisValue(this.crosshairX)
+        const timeTag: string | null = this.crosshairTime === null
+            ? null
             : this.formatTimeAtTimestamp(this.crosshairTime);
-        this.drawLabel(
-            timeTag,
-            this.crosshairX,
-            plot.y + plot.height + TIME_LABEL_OFFSET_Y,
-            'center',
-        );
+            
+        if (timeTag !== null) {
+            const bg = this.options.crosshair.axisLabelBackground;
+            const effectiveBg = bg[3] === 0 ? this.colors.background : bg;
+            const fg = this.options.crosshair.axisLabelText[3] === 0 
+                    ? contrastText(effectiveBg) 
+                    : this.options.crosshair.axisLabelText;
+
+            this.drawTag(
+                timeTag,
+                this.crosshairX,
+                plot.y + plot.height + TIME_LABEL_OFFSET_Y,
+                bg,
+                fg,
+                'center'
+            );
+        }
     }
 
     /**
@@ -679,15 +737,58 @@ public init(canvas: HTMLCanvasElement, emitter: EventEmitter<ChartEvents>): void
         // than looking the bar up again: a lookup by index is a second answer to a
         // question the tick has already answered, and the label must name the candle the
         // line is drawn on.
-        for (const tick of ticks) {
-            const x: number = indexToCoordinate(viewport, tick.index);
+        //
+        // Positioned from the tick's slot, for the same reason the grid lines are: an
+        // index is not a position once it can be past the end of the data, and asking
+        // `indexToCoordinate` for one puts the label back on the newest candle.
+        //
+        // `labels` has already chosen each text in its full or short form, so the date
+        // appears once per day rather than on every tick. What is left is collision, and
+        // that needs text widths, so it is decided here rather than in the label pass: a
+        // label whose box would reach back into the previous one is dropped, and the one
+        // after it is free to be drawn. Dropping the later label rather than the earlier
+        // keeps the sequence anchored to the left edge, so the reading starts where the
+        // plot does.
+        // The detail is read off the ticks themselves rather than off the series, because
+        // the window can reach past either end of the data and the tick times are the only
+        // ones that describe what is actually on screen. An empty list has no detail to
+        // read and no label to draw, so it is not a case to answer.
+        if (ticks.length === 0) {
+            this.ctx.restore();
+            return;
+        }
+
+        let crosshairTimeTagLeft = Number.POSITIVE_INFINITY;
+        let crosshairTimeTagRight = Number.NEGATIVE_INFINITY;
+        if (this.crosshairX !== null) {
+            const timeTagText = this.crosshairTime === null
+                ? null
+                : this.formatTimeAtTimestamp(this.crosshairTime);
+            if (timeTagText !== null) {
+                const hw: number = this.ctx.measureText(timeTagText).width / 2 + 5; // 3 padding + 2 margin
+                crosshairTimeTagLeft = this.crosshairX - hw;
+                crosshairTimeTagRight = this.crosshairX + hw;
+            }
+        }
+
+        let previousRight: number = Number.NEGATIVE_INFINITY;
+        for (const label of timeAxisLabels({
+            ticks,
+            locale: this.options.locale,
+            timeZone: this.options.timeZone,
+            detail: timeAxisDetail(ticks[0].time, ticks[ticks.length - 1].time),
+        })) {
+            const x: number = slotToCoordinate(viewport, label.slot);
             if (x < plot.x || x > plotRight) continue;
-            this.drawLabel(
-                this.formatTimeAtTimestamp(tick.time),
-                x,
-                plotBottom + TIME_LABEL_OFFSET_Y,
-                'center',
-            );
+            const halfWidth: number = this.ctx.measureText(label.text).width / 2;
+            const left = x - halfWidth;
+            const right = x + halfWidth;
+            if (left < previousRight) continue;
+            
+            if (right >= crosshairTimeTagLeft && left <= crosshairTimeTagRight) continue;
+            
+            previousRight = right;
+            this.drawLabel(label.text, x, plotBottom + TIME_LABEL_OFFSET_Y, 'center');
         }
 
         this.ctx.restore();
@@ -780,11 +881,21 @@ public init(canvas: HTMLCanvasElement, emitter: EventEmitter<ChartEvents>): void
         if (labels.lastShown && labels.lastY !== null && this.lastPrice !== null) {
             const y: number = this.pricePaneY(this.lastPrice.price);
             const crispY: number = Math.floor(y) + 0.5;
-            const color: readonly [number, number, number, number] = this.lastPrice.direction === 'up'
-                ? this.colors.up
-                : this.colors.down;
+            const directionColor: readonly [number, number, number, number] =
+                this.lastPrice.direction === 'up' ? this.colors.up : this.colors.down;
+            // The rule keeps the candle's direction colour — it is a statement about the
+            // series, and it is a line rather than a chip. The *tag* is a chip, so it takes
+            // the configured background. If unset/transparent, it falls back to the candle's direction color.
+            const configuredBg: readonly [number, number, number, number] =
+                this.options.candlestick.lastPriceTagBackground;
+            const background: readonly [number, number, number, number] =
+                configuredBg[3] === 0 ? directionColor : configuredBg;
+            const text: readonly [number, number, number, number] =
+                this.options.candlestick.lastPriceTagText[3] === 0
+                    ? contrastText(background)
+                    : this.options.candlestick.lastPriceTagText;
             this.ctx.save();
-            this.ctx.strokeStyle = this.cssColor(color);
+            this.ctx.strokeStyle = this.cssColor(directionColor);
             this.ctx.lineWidth = 1;
             // Dashed so it reads as "where price is now" rather than as another
             // annotation the caller placed.
@@ -794,7 +905,7 @@ public init(canvas: HTMLCanvasElement, emitter: EventEmitter<ChartEvents>): void
             this.ctx.lineTo(plotRight, crispY);
             this.ctx.stroke();
             this.ctx.restore();
-            this.drawTag(this.formatAxisValue(this.lastPrice.price), plot.x - 6, crispY, color);
+            this.drawTag(this.formatAxisValue(this.lastPrice.price), plot.x - 6, crispY, background, text);
         }
     }
 
@@ -950,10 +1061,21 @@ public init(canvas: HTMLCanvasElement, emitter: EventEmitter<ChartEvents>): void
     /**
      * A tag in the price gutter, filled in its own colour so it reads as belonging
      * to the line or candle it labels rather than as another axis label.
+     *
+     * `textColor` is passed in rather than read from the theme because the text has to be
+     * chosen against `color`, and the theme's text colour is a statement about the plot
+     * rather than about a saturated fill. Omit it and the choice is made here.
      */
-    private drawTag(text: string, x: number, y: number, color: readonly [number, number, number, number]): void {
+    private drawTag(
+        text: string,
+        x: number,
+        y: number,
+        color: readonly [number, number, number, number],
+        textColor?: readonly [number, number, number, number],
+        alignment: CanvasTextAlign = 'right'
+    ): void {
         this.ctx.save();
-        this.drawLabel(text, x, y, 'right');
+        this.drawLabel(text, x, y, alignment);
         // drawLabel painted the usual background and text; repaint the box in the
         // tag's colour and the text over it, so the shape is the same size for every
         // tag and the collision planning above stays honest.
@@ -961,9 +1083,15 @@ public init(canvas: HTMLCanvasElement, emitter: EventEmitter<ChartEvents>): void
         const metrics: TextMetrics = this.ctx.measureText(text);
         const padding: number = 3;
         const width: number = metrics.width + padding * 2;
-        this.ctx.fillRect(x - width + padding, y - AXIS_LABEL_HEIGHT / 2, width, AXIS_LABEL_HEIGHT);
-        this.ctx.fillStyle = this.options.layout.textColor;
-        this.ctx.textAlign = 'right';
+        const boxLeft = alignment === 'right' 
+            ? x - width + padding 
+            : alignment === 'center'
+                ? x - width / 2
+                : x - padding;
+                
+        this.ctx.fillRect(boxLeft, y - AXIS_LABEL_HEIGHT / 2, width, AXIS_LABEL_HEIGHT);
+        this.ctx.fillStyle = this.cssColor(textColor ?? contrastText(color));
+        this.ctx.textAlign = alignment;
         this.ctx.textBaseline = 'middle';
         this.ctx.fillText(text, x, y);
         this.ctx.restore();

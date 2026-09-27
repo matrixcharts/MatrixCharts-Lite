@@ -106,6 +106,7 @@ export const LABEL_PRIORITY = {
     tick: 0,
     priceLine: 1,
     lastPrice: 2,
+    crosshair: 3,
 } as const;
 
 export interface LabelCandidate {

@@ -2,7 +2,7 @@
 //
 // Slot helpers come from the session model. They are null-tolerant: a null slot
 // array means the identity, so an unbroken chart takes the path it always took.
-import { barsBeforeSlot, indexAtSlot, slotAtIndex } from './sessionScale.js';
+import { barsBeforeSlot, indexAtSlot, slotAtIndex, totalSlots } from './sessionScale.js';
 
 // src/core/coordinates.ts
 //
@@ -112,6 +112,22 @@ export function indexToCoordinate(viewport: ChartViewport, index: number): numbe
 }
 
 /**
+ * Screen x of a fractional slot.
+ *
+ * The inverse of `coordinateToSlot`, and the transform that makes a **slot** rather than
+ * an index the right thing to hand a renderer: an index is a position only while it names
+ * a candle, so the one thing that cannot be positioned — a tick or a label out past the
+ * end of the data, where a caller has deliberately parked the view — is exactly the thing
+ * an index cannot address. `indexToCoordinate` answers it by clamping the index to the
+ * slot table, which put every out-of-series label and grid line on the newest candle.
+ *
+ * Affine in slots, so it is exact and the round trip is the identity up to float.
+ */
+export function slotToCoordinate(viewport: ChartViewport, slot: number): number {
+    return viewport.offsetX + slot * viewport.scaleX;
+}
+
+/**
  * Fractional slot position at a screen x.
  *
  * Slot rather than index, and that is the whole reason the axis has two units. A
@@ -165,6 +181,39 @@ export function nearestCandleIndex(
         Math.round(indexAtSlot(viewport.slots, coordinateToSlot(viewport, coordinateX))),
         candleCount,
     );
+}
+
+/**
+ * The **left edge** of the slot a logical index sits on, extrapolated past either end.
+ *
+ * Left edges throughout, matching `computeSlotOffsets` and `totalSlots`, and read from the
+ * offsets table directly rather than through `slotAtIndex` — which returns a bar's centre
+ * and is deliberately not the left edge. Going through it would put every placement half a
+ * slot out on a chart whose session breaks are on and not on one whose breaks are off, and
+ * a view placed by a range would then land differently depending on a data option.
+ *
+ * `slotAtIndex` only answers for indices a candle exists at, which is correct for
+ * everything that draws or hit-tests — there is no bar out there to be at. A *range* is
+ * different: asking to see `count + 50` is asking for fifty bar-widths of space past the
+ * newest candle, and the answer has to be a position or the request is unmeetable. Outside
+ * the series the index axis simply continues at one bar per slot, which is the only
+ * continuation that matches how the bars inside it are spaced.
+ *
+ * Index `count` is `totalSlots`, which is the slot just past the last bar's left edge — so
+ * the first whole slot of empty space after the newest candle.
+ */
+export function slotForIndex(
+    slots: Float64Array | null,
+    index: number,
+    candleCount: number,
+): number {
+    if (candleCount <= 0) return index;
+    if (index <= 0) return index;
+    if (index < candleCount) {
+        if (slots === null) return index;
+        return slots[Math.max(0, Math.min(slots.length - 1, Math.trunc(index)))];
+    }
+    return (slots === null ? candleCount : totalSlots(slots)) + (index - candleCount);
 }
 
 /** Visible candle indices, partial bars included, clamped to the series. */
@@ -240,6 +289,71 @@ export function isSameVisibleRange(
     if (previous === null) return false;
     if (previous.logical.from !== logical.from || previous.logical.to !== logical.to) return false;
     return Math.abs(previous.barSpacing - barSpacing) < BAR_SPACING_EPSILON;
+}
+
+/**
+ * How much empty space a fling may leave on screen, as a fraction of the plot width.
+ *
+ * A *plot* fraction rather than a number of bars, and that is the whole design. A bar-sized
+ * margin is arithmetically tidy and practically wrong: it stops the chart roughly one bar
+ * past the newest candle, so an ordinary drag of a couple of hundred pixels runs into it
+ * and the series stops following the pointer. That is a chart that does not track 1:1, which
+ * is the one property a trading chart cannot trade away — a cursor and the data under it
+ * must never disagree.
+ *
+ * Half a plot is enough room that no realistic drag meets it, and small enough that the
+ * chart cannot be flung into empty space: past it there is nothing to see, and the bound
+ * is what turns "I have scrolled the data off the screen" into a dead end the caller can
+ * undo with `scrollToRealtime()`.
+ */
+export const PANNING_MARGIN_RATIO = 0.5;
+
+/** The margin is never less than this many bars, so a heavily zoomed chart still has slack. */
+export const PANNING_MARGIN_SLOTS = 1;
+
+/**
+ * Bounds `offsetX` so the series cannot be scrolled out of sight in either direction.
+ *
+ * Without this the drag and pinch paths add a delta to `offsetX` unconditionally, so the
+ * view can be flung arbitrarily far into empty space on the right or the left. On a live
+ * feed the right-hand case is the one that hurts: flinging past the newest bar clears the
+ * live-edge latch, the feed carries on appending into a window nobody is looking at, and
+ * the chart is indistinguishable from a dead one until someone calls `scrollToRealtime()`.
+ *
+ * Applied to **panning only**. A zoom is anchored on the bar under the pointer, so it
+ * cannot move the view anywhere the user is not already pointing — clamping it would not
+ * prevent a fling, it would break the anchor, and the two "scales about one fixed anchor"
+ * and "holds the bar under the pointer" invariants exist to say exactly that.
+ *
+ * Both bounds are in slots, via the series' drawn extent, so a chart with session gaps
+ * allows the same *plot fraction* of slack past a gap rather than a bar's worth.
+ *
+ * When the series is narrower than the plot the two bounds cross — there is slack on both
+ * sides at once — and the answer is the span between them, so a chart that fits is free to
+ * sit anywhere in the plot rather than being pinned to an edge and fighting the user.
+ */
+export function clampOffsetX(
+    offsetX: number,
+    plotX: number,
+    plotWidth: number,
+    scaleX: number,
+    slots: Float64Array | null,
+    candleCount: number,
+    minMarginSlots: number = PANNING_MARGIN_SLOTS,
+): number {
+    // Nothing to bound against, or a degenerate scale. Returning the input rather than
+    // zeroing it keeps a collapsed container from teleporting the view to the origin.
+    if (candleCount === 0 || !(scaleX > 0) || !Number.isFinite(offsetX)) return offsetX;
+    const extent: number = slots === null ? candleCount : totalSlots(slots);
+    const margin: number = Math.max(minMarginSlots, (plotWidth * PANNING_MARGIN_RATIO) / scaleX);
+    // Largest: the oldest bar's left edge may sit at most `margin` slots left of the plot.
+    const oldest: number = plotX + margin * scaleX;
+    // Smallest: the series' right edge may sit at most `margin` slots right of the plot.
+    const newest: number = plotX + plotWidth - (extent + margin) * scaleX;
+    const low: number = Math.min(oldest, newest);
+    const high: number = Math.max(oldest, newest);
+    if (!Number.isFinite(low) || !Number.isFinite(high)) return offsetX;
+    return Math.max(low, Math.min(high, offsetX));
 }
 
 /**

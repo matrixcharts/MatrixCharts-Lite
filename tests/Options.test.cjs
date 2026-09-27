@@ -6,12 +6,33 @@ const { test } = require('node:test');
 const {
     DEFAULT_MAX_BAR_SPACING,
     DEFAULT_MIN_BAR_SPACING,
+    contrastText,
     mergeOptionPartials,
     parseCssColor,
     resolveCandleColors,
     resolveOptions,
     themeDefaults,
 } = require('../.test-build/core/options.js');
+
+/**
+ * The two inks `contrastText` chooses between, named so a failure says which one moved.
+ * Channels are 0-to-1, which is what `parseCssColor` returns and what every colour in this
+ * file is in — a hand-written `[233, 237, 242, 255]` is a clipped pure white.
+ */
+const DARK_INK = [11 / 255, 15 / 255, 20 / 255, 1];
+const LIGHT_INK = [240 / 255, 246 / 255, 252 / 255, 1];
+
+/** WCAG relative luminance, so "is this ink lighter or darker than that" has one answer. */
+const luminanceOf = (rgba) => {
+    const linear = (c) => (c <= 0.03928 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4));
+    return 0.2126 * linear(rgba[0]) + 0.7152 * linear(rgba[1]) + 0.0722 * linear(rgba[2]);
+};
+/** WCAG contrast ratio between two colours, on the 1-to-21 scale. */
+const contrastRatio = (a, b) => {
+    const hi = Math.max(luminanceOf(a), luminanceOf(b));
+    const lo = Math.min(luminanceOf(a), luminanceOf(b));
+    return (hi + 0.05) / (lo + 0.05);
+};
 
 test('one chart\'s options never become the next chart\'s defaults', () => {
     // A shipped defect, and the reason this file's tests all construct their own options
@@ -315,4 +336,148 @@ test('default spacing bounds are sane and ordered', () => {
     assert.ok(timeScale.minBarSpacing < timeScale.barSpacing);
     assert.ok(timeScale.barSpacing < timeScale.maxBarSpacing);
     assert.equal(timeScale.minBarSpacing, DEFAULT_MIN_BAR_SPACING);
+});
+
+// --- the UI toggles -------------------------------------------------------------------
+//
+// The library reports state and the caller draws the UI, so both chrome elements the
+// renderer used to draw unconditionally are now options that default to off. What is
+// asserted here is the *option* � that it exists, defaults off, merges, and validates. That
+// the drawing honours it cannot be asserted here at all: the headless 2D layer is a
+// deliberate no-op double, so `fillText` records nothing, and that is enforced in the
+// browser harness instead.
+
+test('the crosshair readout and the last-price tag are off by default, in both themes', () => {
+    for (const theme of ['dark', 'paper']) {
+        const resolved = themeDefaults(theme);
+        assert.equal(resolved.crosshair.readout, false, `${theme} draws no OHLC panel`);
+        assert.deepEqual(resolved.crosshair.readoutBorderColor, [0, 0, 0, 0], `${theme} has no border override`);
+        assert.equal(resolved.candlestick.lastPriceTag, false, `${theme} draws no last-price tag`);
+        // The crosshair itself is untouched: this is about the panel, not the crosshair.
+        assert.equal(resolved.crosshair.visible, true, `${theme} still shows the crosshair`);
+    }
+});
+
+test('a theme switch does not resurrect the chrome', () => {
+    // `themeDefaults` is called per resolve and the presets are shared objects, so a
+    // caller who turned the panel on and then switched theme is the case where a leaked
+    // mutation would show up as a panel nobody asked for.
+    const on = resolveOptions({ theme: 'dark', crosshair: { readout: true } });
+    assert.equal(on.crosshair.readout, true);
+    const after = resolveOptions({ theme: 'paper' });
+    assert.equal(after.crosshair.readout, false, 'the paper preset leaked the dark resolve');
+});
+
+test('the two toggles apply independently of the crosshair being visible', () => {
+    const resolved = resolveOptions({ crosshair: { visible: false, readout: true } });
+    assert.equal(resolved.crosshair.visible, false);
+    assert.equal(resolved.crosshair.readout, true, 'a hidden crosshair can still be asked for the panel');
+});
+
+test('the readout border colour is a colour, and an unset one is transparent', () => {
+    const set = resolveOptions({ crosshair: { readoutBorderColor: '#ff00ff' } });
+    assert.deepEqual(set.crosshair.readoutBorderColor, [1, 0, 1, 1]);
+    // Empty rather than null, because it merges as a string and `transparent` is the honest
+    // "nothing configured, follow the candle" answer.
+    assert.deepEqual(resolveOptions({}).crosshair.readoutBorderColor, [0, 0, 0, 0]);
+    throws(
+        () => resolveOptions({ crosshair: { readoutBorderColor: 'not-a-colour' } }),
+        /readoutBorderColor/,
+        'a bad border colour is rejected by name',
+    );
+});
+
+test('both toggles reject a non-boolean', () => {
+    // A string `"false"` is truthy, so accepting one would turn the panel *on* for a caller
+    // who asked for it off. The library validates option types rather than coercing them.
+    throws(() => resolveOptions({ crosshair: { readout: 'yes' } }), /crosshair\.readout/);
+    throws(() => resolveOptions({ candlestick: { lastPriceTag: 1 } }), /candlestick\.lastPriceTag/);
+});
+
+// --- badge legibility ------------------------------------------------------------------
+//
+// A price-gutter tag is filled with its own colour so it reads as belonging to the line it
+// labels, and the text over it was painted in `layout.textColor`. On the dark theme that is
+// a light text on a saturated green or red box: reported as "the price line badge text is
+// not visible", and not fixable through options, because the only knob was the *text*
+// colour, which is a statement about the plot rather than a contrast calculation.
+//
+// So the text colour is chosen against the fill, and the badges are chips rather than holes
+// punched in the plot.
+
+test('text ink is chosen against the fill it sits on', () => {
+    // The fill is given as a CSS colour and parsed, so the test says "the dark theme's own
+    // down colour" rather than a hand-typed triple that could be in the wrong scale.
+    const inkOn = (css) => contrastText(parseCssColor(css, 'fill'));
+    assert.deepEqual(inkOn('#1ad98c'), DARK_INK, 'the dark theme up colour takes dark ink');
+    assert.deepEqual(inkOn('#f24059'), DARK_INK, 'the dark theme down colour takes dark ink');
+    assert.deepEqual(inkOn('#e9edf2'), DARK_INK, 'near-white takes dark ink');
+    assert.deepEqual(inkOn('#0d1117'), LIGHT_INK, 'near-black takes light ink');
+    assert.deepEqual(inkOn('#000000'), LIGHT_INK);
+    assert.deepEqual(inkOn('#ffffff'), DARK_INK);
+    assert.deepEqual(inkOn('#057a52'), LIGHT_INK, 'the paper theme up colour is dark enough for light ink');
+    // The paper theme's down colour takes *light* ink even though it is a red, and the dark
+    // theme's takes *dark* ink: the ratio decides, not the hue. `#c22633` is deep enough that
+    // light ink is 5.3:1 against dark ink's 3.3:1, which is the whole reason this computes
+    // both ratios rather than thresholding brightness.
+    assert.deepEqual(inkOn('#c22633'), LIGHT_INK, 'the paper theme down colour is deep enough for light ink');
+});
+
+test('whichever ink is chosen is the legible one, by contrast ratio', () => {
+    // The property, rather than a list of expected triples: for every colour the library
+    // ships or a caller is likely to pick, the ink actually returned is the better of the
+    // two. A threshold on brightness gets this wrong — `#f24059` reads as 120/255 and so
+    // looks "dark" to a threshold near the midpoint, when dark ink on it is 5.1:1 against
+    // light ink's 3.4:1.
+    for (const css of ['#1ad98c', '#f24059', '#e9edf2', '#0d1117', '#22272e', '#e6edf3',
+        '#057a52', '#c22633', '#f4f1e8', '#343b41', '#000000', '#ffffff', '#808080']) {
+        const fill = parseCssColor(css, 'fill');
+        const chosen = contrastText(fill);
+        const other = chosen[0] === DARK_INK[0] ? LIGHT_INK : DARK_INK;
+        assert.ok(
+            contrastRatio(fill, chosen) >= contrastRatio(fill, other),
+            `${css}: chose the worse ink (${contrastRatio(fill, chosen).toFixed(2)} against ` +
+            `${contrastRatio(fill, other).toFixed(2)})`,
+        );
+        // And legible in absolute terms, not merely the better of two poor options.
+        assert.ok(
+            contrastRatio(fill, chosen) >= 4.5,
+            `${css}: ${contrastRatio(fill, chosen).toFixed(2)}:1 is below 4.5:1`,
+        );
+    }
+});
+
+test('the ink keeps the fill alpha, so a translucent chip is not made opaque', () => {
+    assert.equal(contrastText(parseCssColor('#e9edf280', 'fill'))[3], 128 / 255);
+    assert.equal(contrastText(parseCssColor('#0d111740', 'fill'))[3], 64 / 255);
+});
+
+
+
+test('the badge colours are settable, and a bad one is rejected by name', () => {
+    const set = resolveOptions({
+        crosshair: { readoutBackgroundColor: '#ff0000', readoutTextColor: '#00ff00' },
+        candlestick: { lastPriceTagBackgroundColor: '#0000ff', lastPriceTagTextColor: '#ffff00' },
+    });
+    assert.deepEqual(set.crosshair.readoutBackground, parseCssColor('#ff0000', 'x'));
+    assert.deepEqual(set.crosshair.readoutText, parseCssColor('#00ff00', 'x'));
+    assert.deepEqual(set.candlestick.lastPriceTagBackground, parseCssColor('#0000ff', 'x'));
+    assert.deepEqual(set.candlestick.lastPriceTagText, parseCssColor('#ffff00', 'x'));
+    throws(() => resolveOptions({ crosshair: { readoutBackgroundColor: 'nope' } }), /readoutBackgroundColor/);
+    throws(() => resolveOptions({ crosshair: { readoutTextColor: 'nope' } }), /readoutTextColor/);
+    throws(() => resolveOptions({ candlestick: { lastPriceTagBackgroundColor: 'nope' } }), /lastPriceTagBackgroundColor/);
+    throws(() => resolveOptions({ candlestick: { lastPriceTagTextColor: 'nope' } }), /lastPriceTagTextColor/);
+});
+
+test('setting a badge background without a text colour leaves the ink to be chosen', () => {
+    // The asymmetric case, and the one a caller hits by setting only what they care about.
+    // The theme deliberately leaves the ink unset for exactly this reason: had it pinned one,
+    // a caller who overrode only the background would keep the theme's ink and could put dark
+    // ink on their own dark background with no way to see that from the option they set.
+    const resolved = resolveOptions({ crosshair: { readoutBackgroundColor: '#ffff00' } });
+    assert.deepEqual(resolved.crosshair.readoutBackground, parseCssColor('#ffff00', 'x'));
+    assert.equal(resolved.crosshair.readoutText[3], 0, 'unset, so the renderer chooses');
+    // And the theme leaves it unset too, which is what makes the promise above true.
+    assert.equal(themeDefaults('dark').crosshair.readoutText[3], 0);
+    assert.equal(themeDefaults('dark').candlestick.lastPriceTagText[3], 0);
 });

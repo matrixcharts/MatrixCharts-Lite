@@ -314,6 +314,34 @@ export function barsBeforeSlot(offsets: Float64Array | null, slot: number): numb
 }
 
 /**
+ * The number of bars before a slot, extrapolated past either end of the series.
+ *
+ * `barsBeforeSlot` clamps, which is right for "which bars are on screen" and wrong for
+ * "where does this slot sit on the axis". The two answers diverge outside the data, and
+ * they diverge *asymmetrically*: with no breaks the clamped version is
+ * `Math.ceil(slot)` and extrapolates by accident, while with breaks the slot lookup finds
+ * a containing bar, clamps it to an end, and stops. A chart with an overnight break would
+ * therefore have got labels in its empty space and a chart without would not — the
+ * difference being whether the instrument trades overnight, which is exactly the kind of
+ * thing that looks like a data bug and is a code branch.
+ *
+ * Outside the series the index axis continues at one bar per slot, which is the only
+ * continuation matching how the bars inside it are spaced.
+ */
+export function barsBeforeSlotExtended(
+    offsets: Float64Array | null,
+    slot: number,
+    count: number,
+): number {
+    // Nothing to extrapolate against, and the unclamped formula is already the answer.
+    if (offsets === null || count <= 0) return Math.ceil(slot);
+    const extent: number = totalSlots(offsets);
+    if (slot >= extent) return count + Math.ceil(slot - extent);
+    if (slot <= 0) return Math.ceil(slot);
+    return barsBeforeSlot(offsets, slot);
+}
+
+/**
  * Slot position of a bar's centre.
  *
  * Half a slot past the bar's own left edge — and *only* half a slot, which is the whole

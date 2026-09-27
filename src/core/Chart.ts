@@ -67,6 +67,7 @@ import {
     sizeSessionBreaks,
     slotAtIndex,
     totalSlots,
+    modalInterval,
 } from './sessionScale.js';
 import {
     bucketOverlay,
@@ -91,9 +92,12 @@ import {
     coordinateToSlot,
     coordinateToPrice,
     indexToCoordinate,
+    slotToCoordinate,
     isAtLiveEdgeOffset,
     isSameVisibleRange,
+    clampOffsetX,
     liveEdgeOffsetX,
+    slotForIndex,
     nearestCandleIndex,
     nearestCandleIndexByTime,
     plotCentreX,
@@ -257,6 +261,7 @@ export class Chart {
     private crosshairY: number | null = null;
     private crosshairIndex: number = -1;
     private crosshairCandle: CandleData | null = null;
+    private crosshairTime: number | null = null;
 
     private crosshairHandlers: Set<(event: CrosshairMoveEvent) => void> = new Set();
     private clickHandlers: Set<(event: ChartClickEvent) => void> = new Set();
@@ -397,6 +402,53 @@ export class Chart {
     private lastSizedWidth: number = 0;
     private lastSizedHeight: number = 0;
     private lastSizedRatio: number = 0;
+
+    /**
+     * Bounds the view after a **pan gesture** moved it.
+     *
+     * Called from the drag and the pinch, and from nowhere else. That scoping is the
+     * design, twice over.
+     *
+     * *Not* the zooms. A zoom is anchored on the bar under the pointer, so it cannot
+     * throw the view anywhere the user is not already pointing. There is no fling to
+     * prevent, and clamping it would pull the anchored bar out from under the cursor —
+     * which is the property the interaction harness asserts twice, and which is worth
+     * more than the fling the clamp would have prevented.
+     *
+     * *Not* the data paths either. The bound moves whenever the series does, so clamping
+     * in `updateViewport` would pull a chart the caller has taken over sideways every time
+     * a bar printed. The user did not move it; the slack around it did. A viewport someone
+     * has panned is theirs, and the feed appending is not a reason to move it.
+     *
+     * The one case that can leave a view genuinely out of bounds — retention trimming
+     * under a panned chart — corrects itself on the next gesture.
+     */
+    private clampView(): void {
+        const plot: PlotRect = this.viewport.plot;
+        this.offsetX = clampOffsetX(
+            this.offsetX,
+            plot.x,
+            plot.width,
+            this.scaleX,
+            this.slotOffsets,
+            this.candlePyramid.candleCount,
+        );
+    }
+
+    /**
+     * Whether this chart has ever measured a non-zero container.
+     *
+     * The distinction that `clientWidth || FALLBACK` cannot make on its own: zero
+     * before the first measurement is "not ready", and zero afterwards is "collapsed".
+     */
+    private hasBeenSized(): boolean {
+        return this.lastSizedWidth > 0 || this.lastSizedHeight > 0;
+    }
+
+    /** Whether the container is right now measuring zero in either axis. */
+    private containerIsZero(): boolean {
+        return this.canvasWrapper.clientWidth === 0 || this.canvasWrapper.clientHeight === 0;
+    }
 
     /**
      * Sizes the renderer canvases to the wrapper when that has changed.
@@ -724,6 +776,9 @@ export class Chart {
         const deltaX: number = event.clientX - this.lastPointerX;
         this.lastPointerX = event.clientX;
         this.offsetX += deltaX;
+        // Bounded before the latch is read, so `followsLiveEdge` describes where the
+        // view actually ended up rather than where an unbounded drag would have put it.
+        this.clampView();
         this.followsLiveEdge = this.isAtLiveEdge();
         this.updateViewport();
     };
@@ -792,6 +847,10 @@ export class Chart {
         const appliedFactor: number = nextScale / previousScale;
         this.setBarSpacingLive(nextScale);
         this.offsetX = anchorX - (anchorX - this.offsetX) * appliedFactor;
+        // Deliberately not clamped. The anchor is the bar under the pointer, so a zoom
+        // cannot move the view somewhere the user is not already pointing — there is no
+        // fling to prevent here, and clamping would only pull the anchored bar back out
+        // from under the cursor, which is the one thing a zoom must never do.
         this.followsLiveEdge = this.isAtLiveEdge();
         this.updateViewport();
     }
@@ -1034,7 +1093,7 @@ export class Chart {
         const payload: ChartEvents['crosshair'] = {
             x: this.crosshairX,
             y: this.crosshairY,
-            time: this.crosshairCandle ? this.crosshairCandle.time : null,
+            time: this.crosshairTime,
             candle: this.crosshairCandle,
             pane: scope.pane,
             value: scope.value,
@@ -1046,7 +1105,7 @@ export class Chart {
                 x: this.crosshairX as number,
                 y: this.crosshairY as number,
                 index: this.crosshairIndex,
-                time: this.crosshairCandle.time,
+                time: this.crosshairTime as number,
                 price: this.coordinateToPrice(this.crosshairY as number),
                 candle: this.crosshairCandle,
             }
@@ -1058,17 +1117,44 @@ export class Chart {
         const rect: DOMRect = this.canvasWrapper.getBoundingClientRect();
         const x: number = clientX - rect.left;
         const y: number = clientY - rect.top;
-        const index: number = this.coordinateToNearestIndex(x);
-        const candle: CandleData | null = index < 0 ? null : this.getCandleAt(index);
+        
+        let index: number = this.coordinateToNearestIndex(x);
+        let candle: CandleData | null = index < 0 ? null : this.getCandleAt(index);
+        let snappedX: number;
+        let time: number | null = candle ? candle.time : null;
 
-        if (!candle) {
-            this.clearCrosshair();
-            return;
+        const slot = this.coordinateToSlot(x);
+        const candleCount = this.candlePyramid.candleCount;
+        const lastSlot = candleCount > 0 ? slotForIndex(this.slotOffsets, candleCount - 1, candleCount) : -1;
+        
+        if (slot < -0.5 || (candleCount > 0 && slot > lastSlot + 0.5)) {
+            // Out of bounds: snap to the nearest slot instead of clamping to the first/last candle.
+            const roundedSlot = Math.round(slot);
+            snappedX = slotToCoordinate(this.viewport, roundedSlot);
+            index = -1;
+            candle = null;
+
+            if (candleCount > 0) {
+                const interval = modalInterval(this.candleTimes);
+                if (interval > 0) {
+                    if (roundedSlot > lastSlot) {
+                        const lastCandle = this.getCandleAt(candleCount - 1);
+                        if (lastCandle) {
+                            time = lastCandle.time + (roundedSlot - lastSlot) * interval;
+                        }
+                    } else if (roundedSlot < 0) {
+                        const firstCandle = this.getCandleAt(0);
+                        if (firstCandle) {
+                            time = firstCandle.time + roundedSlot * interval;
+                        }
+                    }
+                }
+            }
+        } else {
+            // The crosshair snaps to the bar it points at; the price line keeps
+            // following the pointer so the price readout tracks the cursor.
+            snappedX = this.indexToCoordinate(index);
         }
-
-        // The crosshair snaps to the bar it points at; the price line keeps
-        // following the pointer so the price readout tracks the cursor.
-        const snappedX: number = this.indexToCoordinate(index);
         if (this.crosshairX === snappedX && this.crosshairY === y && this.crosshairIndex === index) {
             return;
         }
@@ -1076,6 +1162,7 @@ export class Chart {
         this.crosshairY = y;
         this.crosshairIndex = index;
         this.crosshairCandle = candle;
+        this.crosshairTime = time;
         this.emitCrosshair();
     }
 
@@ -1085,6 +1172,7 @@ export class Chart {
         this.crosshairY = null;
         this.crosshairIndex = -1;
         this.crosshairCandle = null;
+        this.crosshairTime = null;
         this.emitCrosshair();
     }
 
@@ -1148,6 +1236,24 @@ export class Chart {
         return { x: priceAxisWidth, y: 0, width, height };
     }
 
+    /**
+     * The region the series is drawn into, in CSS pixels from the container's top left.
+     *
+     * Not the canvas. The canvas is the canvas plus a price gutter on the left and a time
+     * gutter along the bottom, so `x = 0` is inside the price labels rather than at the
+     * first bar — and a caller placing a drawing, clamping one to the plot, or hit-testing
+     * against the data needs to know where the data starts, not where the element does.
+     *
+     * Returned as a copy, since a caller holding the live object could otherwise move the
+     * plot by writing to it. Zero width or height means the container is collapsed, and
+     * the same "not measured yet" caveat as everywhere else applies.
+     */
+    public getPlotRect(): PlotRect {
+        this.assertAlive();
+        const plot: PlotRect = this.viewport.plot;
+        return { x: plot.x, y: plot.y, width: plot.width, height: plot.height };
+    }
+
     /** CSS pixels per candle index. */
     public getBarSpacing(): number {
         this.assertAlive();
@@ -1177,6 +1283,78 @@ export class Chart {
         const last: CandleData | null = this.getCandleAt(to - 1);
         if (!first || !last) return null;
         return { from: first.time, to: last.time };
+    }
+
+    /**
+     * Places the view on a logical candle range, the counterpart to
+     * `getVisibleLogicalRange`.
+     *
+     * A range in, a view out: both the position and the bar spacing are set, because
+     * honouring a range that does not happen to fit at the current spacing is impossible
+     * and quietly showing a different range than the one asked for is worse than useless.
+     * That makes this a complete view description, so a caller can persist
+     * `getVisibleLogicalRange()` and restore it here — the gap that made a saved view
+     * unreproducible, since the getter had no counterpart.
+     *
+     * **A range past the data is honoured, and that is the point.** `from` may be below
+     * zero and `to` above the candle count, and the space out there is real: it is drawn,
+     * it is hit-testable, and a drawing anchored to it stays put. A tool that projects
+     * forward, or a caller laying out a panel with room beside the series, needs somewhere
+     * to put that room, and a viewport that cannot be moved is a viewport the caller does
+     * not own. Outside the series the index axis continues at one bar per slot, so `to:
+     * count + 50` is fifty bar-widths of space past the newest candle.
+     *
+     * The one thing it will not do is exceed the same bound a drag is held to — half a
+     * plot of slack past the data at either end. Two rules that disagreed would mean a
+     * view you could ask for and then lose on the first drag, so there is one rule, and
+     * this is where to change it. A request beyond it is honoured as far as the bound
+     * allows rather than rejected.
+     *
+     * The range is also limited by `minBarSpacing`/`maxBarSpacing`: a two-bar range in a
+     * wide plot cannot be honoured, because bars have a maximum size, and the result is
+     * the closest view those limits allow. Exactly as `fitContent` behaves.
+     *
+     * Throws on a non-finite or empty range, matching `setPriceRange`. A degenerate range
+     * is a caller bug, and a silent no-op would look like the chart ignoring the request.
+     */
+    public setVisibleLogicalRange(range: LogicalRange): void {
+        this.assertAlive();
+        const { from, to } = range;
+        if (!Number.isFinite(from) || !Number.isFinite(to)) {
+            throw new Error('MatrixCharts: setVisibleLogicalRange expects two finite indices.');
+        }
+        if (to <= from) {
+            throw new Error(`MatrixCharts: setVisibleLogicalRange expects a "to" above its "from", got {from: ${from}, to: ${to}}.`);
+        }
+        const count: number = this.candlePyramid.candleCount;
+        // Nothing to place a range against, and a collapsed container has no plot to fill.
+        if (count === 0) return;
+        const plot: PlotRect = this.viewport.plot;
+        if (!(plot.width > 0)) return;
+
+        // Slots, not indices, because a break between two of the requested bars is drawn
+        // as whitespace and has to be included in the width the range is fitted to. Using
+        // indices here would silently squeeze a gapped range to fit the plot.
+        //
+        // Both edges are placed half a slot inside the bars they frame. That is the same
+        // half-bar inset the live edge parks the newest candle with, and it is what makes
+        // the range stable to read back: an edge placed exactly on a bar's left edge sits
+        // on the boundary the getter's `from` and `to` are defined against, and there
+        // float decides which side it falls, so a range asked for as 40..80 came back as
+        // 40..81 on a chart with a session break in it.
+        const fromLeft: number = slotForIndex(this.slotOffsets, from, count);
+        const lastLeft: number = slotForIndex(this.slotOffsets, to - 1, count);
+        // Zero only when the request is a single bar, where `plot.width / 0` is Infinity
+        // and `clampBarSpacing` turns that into the maximum bar spacing — one bar, as big
+        // as a bar is allowed to be, which is the right reading of a one-bar request.
+        const next: number = this.clampBarSpacing(plot.width / (lastLeft - fromLeft));
+        this.setBarSpacingLive(next);
+        this.offsetX = plot.x - (fromLeft + 0.5) * next;
+        // Bounded like a drag, so an ask and a gesture cannot disagree about how far the
+        // view may go — see the note above on why there is one bound and not two.
+        this.clampView();
+        this.followsLiveEdge = this.isAtLiveEdge();
+        this.updateViewport();
     }
 
     /** Number of candles retained in chart memory. */
@@ -2321,6 +2499,7 @@ export class Chart {
             this.zoomAt(distance / this.lastPinchDistance, centerX - rect.left);
         } else {
             this.offsetX += centerX - this.lastPinchCenterX;
+            this.clampView();
             this.updateViewport();
         }
         this.lastPinchDistance = distance;
@@ -2629,6 +2808,19 @@ export class Chart {
         // that resized without notifying us still renders at the right size.
         this.syncRendererSize();
         this.flushPendingData();
+        // A container that has been sized and is now zero-sized is *collapsed*, and
+        // that is not the same as unsized. The fallback geometry above exists for the
+        // first frame on a container the layout has not resolved; laying 800x500 worth
+        // of axis into a panel with no height is how a divider drag through zero
+        // produces a mangled time axis, which is a frame nobody asked for drawn over a
+        // panel that cannot show it.
+        //
+        // The data is flushed first, so a live feed does not build a backlog behind a
+        // collapsed panel, and nothing is cleared, so the last frame stays on the canvas
+        // because there is nothing better to put there. The view is left untouched for
+        // the same reason the clamp below is not reached: the fallback geometry is not
+        // the panel's geometry, and measuring the view against it would move it.
+        if (this.hasBeenSized() && this.containerIsZero()) return;
         this.updateVisibleCandles();
         this.autoScaleY();
         this.emitViewportFrame();

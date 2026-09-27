@@ -47,10 +47,88 @@ source.subscribe((message) => {
 source.start();
 await loaded;
 
+// A recorder for the text the 2D layer actually drew, and for the lines it stroked.
+//
+// The headless stub reports a `measureText` width of zero, so nothing about label layout
+// can be asserted there — which is how a time axis reading `Sep 1, 01:30 PM  Sep 1 Sep 1
+// ...` survived a green suite: the defect is entirely about the width of the text, and
+// the only place a width exists is a browser. Installed before the chart is constructed
+// so the very first frame is recorded too.
+const drawn = { labels: [], lines: [], rects: [] };
+const proto = CanvasRenderingContext2D.prototype;
+const realFillText = proto.fillText;
+const realFillRect = proto.fillRect;
+const realStroke = proto.stroke;
+// One sequence across every record, because a label has to be paired with a chip that was
+// painted *before* it. `drawTag` draws the text twice — once as a plain axis label and
+// again over its own filled box — and pairing by geometry alone matches the first of those
+// against the second one's box, which reports a catastrophic contrast ratio for a chip that
+// is in fact perfectly legible.
+let sequence = 0;
+proto.fillText = function (text, x, y) {
+    // The fill in force is the text's own colour, and recording it is what lets the runner
+    // measure whether that text is legible against the chip it was drawn on. A defect
+    // reported as "the badge text is not visible" is not a wrong value anywhere — it is a
+    // correct colour that nobody chose against its background, and the only way to see it
+    // is to have both numbers.
+    drawn.labels.push({ text: String(text), x, y, fill: String(this.fillStyle), seq: sequence++ });
+    return realFillText.call(this, text, x, y);
+};
+proto.fillRect = function (x, y, w, h) {
+    drawn.rects.push({ x, y, w, h, fill: String(this.fillStyle), seq: sequence++ });
+    return realFillRect.call(this, x, y, w, h);
+};
+proto.stroke = function () {
+    // A stroke is only recorded when a path is pending, so the calls that merely close a
+    // path do not add a phantom line.
+    if (this.__mcPath) drawn.lines.push(this.__mcPath.slice());
+    return realStroke.call(this);
+};
+for (const method of ['moveTo', 'lineTo']) {
+    const real = proto[method];
+    proto[method] = function (x, y) {
+        (this.__mcPath ??= []).push([x, y]);
+        return real.call(this, x, y);
+    };
+}
+const realBeginPath = proto.beginPath;
+proto.beginPath = function () {
+    this.__mcPath = [];
+    return realBeginPath.call(this);
+};
+
 // The runner drives real events, so it needs the plot's box in CSS pixels and a
 // handle on the chart itself.
 globalThis.__mc = {
     chart,
+    source,
+    drawn,
+    // Parses what a canvas reports back for `fillStyle` into channels 0-to-1, so the runner
+    // can compute a contrast ratio without re-implementing a colour parser.
+    //
+    // Both forms, because a canvas does not hand back what was written to it: assigning
+    // `rgba(233, 237, 242, 1)` and reading it again yields `#e9edf2`, and a parser that
+    // only understood the `rgb()` form silently measures nothing — which is exactly what
+    // the first version of this did, reporting "no chip text was found" for a frame that
+    // was covered in chips.
+    rgb: (value) => {
+        const hex = /^#([0-9a-f]{6})([0-9a-f]{2})?$/i.exec(value);
+        if (hex !== null) {
+            const part = (i) => parseInt(hex[1].substr(i * 2, 2), 16) / 255;
+            return [part(0), part(1), part(2), hex[2] === undefined ? 1 : parseInt(hex[2], 16) / 255];
+        }
+        const match = /rgba?\(([^)]+)\)/.exec(value);
+        if (match === null) return null;
+        const parts = match[1].split(',').map((part) => parseFloat(part));
+        return [parts[0] / 255, parts[1] / 255, parts[2] / 255, parts.length > 3 ? parts[3] : 1];
+    },
+    // Measured with the chart's own font, so a width is the width the renderer used.
+    labelWidth: (text) => {
+        const ctx = document.createElement('canvas').getContext('2d');
+        ctx.font = '11px sans-serif';
+        return ctx.measureText(text).width;
+    },
+    timeAxisHeight: () => chart.options().layout.timeAxisHeight,
     plot: () => {
         const r = document.querySelector('canvas').getBoundingClientRect();
         return { x: r.x, y: r.y, width: r.width, height: r.height };

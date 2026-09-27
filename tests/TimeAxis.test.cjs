@@ -319,10 +319,25 @@ test('degenerate windows answer without throwing or inventing bars', () => {
     // real bar. It gets one label, which is the whole of what is on screen.
     const sliver = timeAxisTicks({ ...base, fromSlot: 0, toSlot: 0 });
     assert.ok(sliver.length <= 1, `expected at most one label, got ${sliver.length}`);
-    // A window entirely past the end of the series clamps to the last bar rather than
-    // reporting bars that are not there, so it yields that one bar and no more.
+    // A window entirely past the end of the series used to clamp to the last bar and
+    // yield that one label, on the reasoning that reporting bars "that are not there"
+    // would be inventing them. That is right about the *index* and wrong about the
+    // position, and the two were the same field: a caller who has parked the view in the
+    // empty space past the last candle got one label and one grid line sitting on the
+    // newest candle, so the region they deliberately framed had neither. Position and
+    // ordinal are now separate — `slot` and `time` extrapolate, `index` stays clamped —
+    // so the window is labelled where it is and nothing invents a bar.
     const past = timeAxisTicks({ ...base, fromSlot: 1e6, toSlot: 2e6 });
-    assert.ok(past.length <= 1, `expected at most one label past the end, got ${past.length}`);
+    assert.ok(past.length >= 1, 'a window in empty space still gets labels');
+    assert.ok(
+        past.every((tick) => tick.slot >= 1e6),
+        `every label is inside the window asked for, got ${past.map((t) => t.slot).join(', ')}`,
+    );
+    // Still strictly increasing, so the axis reads left to right rather than
+    // collapsing several labels onto one x.
+    for (let i = 1; i < past.length; i++) {
+        assert.ok(past[i].slot > past[i - 1].slot, 'labels advance across empty space');
+    }
     // A zero-width plot still gets a label, rather than an empty gutter.
     const narrow = timeAxisTicks({ ...base, fromSlot: 0, toSlot: 20, widthPx: 0 });
     assert.ok(narrow.length >= 1);

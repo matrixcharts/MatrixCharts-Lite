@@ -25,6 +25,7 @@ Installable entry is the package root (`matrixcharts`). Only these names are pub
 | `CandlestickOptions` | type |
 | `ResolvedChartOptions` | type |
 | `LogicalRange` | type |
+| `PlotRect` | type (additive in 1.x) |
 | `TimeRange` | type |
 | `CrosshairMoveEvent` | type |
 | `CrosshairData` | type |
@@ -164,6 +165,7 @@ Every method below is synchronous, works in CSS pixels relative to the container
 | Method | Returns |
 |---|---|
 | `getBarSpacing()` | CSS px per candle index. |
+| `getPlotRect()` | `{ x, y, width, height }` of the region the series is drawn into, in CSS px from the container's top-left. A copy, so writing to it cannot move the plot. Additive in 1.x. |
 | `getVisibleLogicalRange()` | `{ from, to }` candle indices, **half-open**: `from`..`to - 1`. Partial bars at either edge are included. `from === to` means nothing is visible. |
 | `getVisibleTimeRange()` | `{ from, to }` epoch ms of the first and last visible candle, **both inclusive**, or `null` when empty. |
 | `getCandleCount()` | Retained candle count. |
@@ -183,7 +185,35 @@ Every method below is synchronous, works in CSS pixels relative to the container
 
 The index range is half-open because it names a set of bars. The time range is inclusive on both ends because it names two real candles, and a closed session has no end instant to report. The two are related by `getVisibleTimeRange().from === getCandleAt(range.from).time` and `.to === getCandleAt(range.to - 1).time`.
 
+### `getPlotRect()` is the plot, not the canvas
+
+`PlotRect` is exported as a type, and it is the one rectangle a caller needs and could not previously get: the region the **series** is drawn into, which is the canvas minus the price gutter on the left and the time-axis strip along the bottom.
+
+That distinction is not cosmetic. `x = 0` in element coordinates is inside the price labels, not at the first bar, so every hit-test, clamp and overlay a caller writes has to know where the data starts — and there was no way to ask, which left callers hardcoding the default gutter width. It is returned by value rather than by reference for the same reason the rest of this table returns values: the plot rect is internal state that every render reads, and a stray write to a live one would corrupt the next frame in a way nothing else would explain. A zero width or height means the container is collapsed, and the "not measured yet" caveat below applies.
+
+### `setVisibleLogicalRange(range)`
+
+The counterpart to `getVisibleLogicalRange()`, and the only public way to place the viewport. Added in 1.x. Additive.
+
+A range in, a view out: **both** the position and the bar spacing are set. Honouring a range that does not happen to fit at the current spacing is impossible, and quietly showing a different range than the one asked for is worse than not honouring it. That makes the method a complete description of a view, so a caller can persist `getVisibleLogicalRange()` and restore it here.
+
+**A range past the data is honoured, and that is the point.** `from` may be below zero and `to` above `getCandleCount()`, and the space out there is real: it is drawn, it is hit-testable, and a drawing anchored to it stays put. Outside the series the index axis continues at one bar per slot — `to: count + 50` is fifty bar-widths of space past the newest candle — which is the only continuation that matches how the bars inside the series are spaced. A tool that projects forward, or a panel that wants room beside the series, needs somewhere to put that room, and a viewport that can only be moved by gesture is not one the caller owns.
+
+Three limits, all of them already in force elsewhere rather than new rules:
+
+- **The bar-spacing limits.** A two-bar range in a wide plot cannot be honoured, because bars have a maximum size, and the result is the closest view `minBarSpacing`/`maxBarSpacing` allow — exactly as `fitContent()` behaves.
+- **The pan bound.** A request beyond it is honoured as far as the bound goes rather than rejected, so that an ask and a gesture can never disagree about how far the view may go.
+- **A collapsed container.** No-op, since there is no plot to fill.
+
+It **throws** on a non-finite or empty range (`to <= from`), matching `setPriceRange()`. A degenerate range is a caller bug, and a silent no-op would look like the chart ignoring the request. It is a **no-op** on a chart with no data, which is a well-formed request with no series to place it on and a legitimate thing to do before data arrives.
+
+Setting a range sets the live-edge latch from the resulting position, as a pan and a zoom both do. A range that ends exactly at the newest candle at the live-edge inset is therefore a following view, and the feed will keep re-anchoring it. Pass a range that stops short if you want a static one.
+
+The range reads back exactly, which is why the plot's edges are placed **half a slot inside** the bars they frame — the same half-bar inset the live edge parks the newest candle with. An edge placed exactly on a bar's left edge sits on the precise boundary `from` and `to` are defined against, and there float error decides which side it falls: a range asked for as `40..80` came back as `40..81` on a chart with a session break in it.
+
 **`coordinateToSlot(x)` is the sub-bar precision `coordinateToIndex(x)` rounds away.** A whole index answers "which candle is under the pointer", which is what a tooltip wants; a hit-test wants "where in that candle", and a trend line grabbed at a bar's left edge and one grabbed at its right edge are the same point to `coordinateToIndex` and different points here. It returns a **slot** rather than a fractional index, and the two stop being interchangeable the moment a break is in the series: "index 20.4" names no position at all, because the distance from bar 20 to bar 21 is not a number of bars. Slot 20.4 is exactly where the pixel is, before or after a break. It is not clamped, like `coordinateToIndex`, because a caller deciding whether a pointer is inside the plot has to be able to see that it is not. There is deliberately no public inverse yet: a caller anchoring to a bar has `indexToCoordinate`, and a caller anchoring between bars interpolates, which is exact because the transform is affine in slots. The inverse is worth freezing the first time something needs it, and not before.
+
+**That has now happened, internally.** The time axis needs it: a tick out past the end of the data names no candle, so `indexToCoordinate` answers it by clamping the index to the slot table and drawing every such label on the newest candle. The renderer therefore positions ticks from a slot, and the pure `slotToCoordinate` is the inverse of `coordinateToSlot`. It is not on the public `Chart` API, because no caller has asked to place a drawing at a slot — `indexToCoordinate` covers every in-series position, and a caller working in the empty space a `setVisibleLogicalRange` opened can get there with `coordinateToSlot` and one affine step. It becomes public the first time that is not good enough.
 
 **`getPaneAtCoordinate` answers the same question the axis drag asks internally**, from the same row lookup, so a caller's own gesture cannot be routed to a different pane than the chart's would be. The gutter and the plot are treated alike, because they share rows: asking from `x = 4` gives the same answer as from `x = 400`. `null` means a pane divider, the time-axis strip, or a point off the side of the chart. It exists so a double-click on an oscillator's axis can reach `fitPaneRange(n)` without the caller reimplementing `paneRects` — and its rounding rules, which is precisely how two copies of a layout calculation drift apart.
 
@@ -191,7 +221,22 @@ The index range is half-open because it names a set of bars. The time range is i
 
 Time conversions snap to a real candle timestamp and never interpolate across a gap, so `coordinateToTime` at the midpoint of a weekend returns the Friday or Monday candle, never a Saturday.
 
-### Handler re-entrancy
+### The chrome the caller is expected to own
+
+Two elements the renderer draws are **off by default** and are the caller's to draw instead, because a chart library's job is to report state and not to render a design:
+
+- **`crosshair.readout`** — the floating OHLC panel that follows the pointer, drawn at the plot's top-left over the candles. Off, there is nothing to remove and `crosshairMove` carries the whole `candle`, its `index`, its `time` and the `price` under the pointer, so a caller can draw one in their own components with their own layout and theme.
+- **`candlestick.lastPriceTag`** — the tag on the price axis showing where the newest close sits. Off, `getLastCandle()` is the same number.
+
+Turning the readout off does **not** affect the crosshair lines or the price and time tags in the gutters. Those label the crosshair's own position, the way a crosshair does in a terminal, and are part of the crosshair rather than the readout. `crosshair.readout` is independent of `crosshair.visible`, so a hidden crosshair can still be asked for the panel.
+
+**An undrawn last-price tag stops reserving space on the axis.** The tag competes with price-line labels for room and wins, being the higher priority, so leaving it in the label layout while not drawing it would keep a caller's own price line from getting its label — an invisible label suppressing a visible one. Turning it off therefore has a side effect worth knowing: a price line sitting at the newest close now keeps its axis label, where before the tag took the space and hid it.
+
+`crosshair.readoutBorderColor` is worth setting in most designs. Unset, the panel's border takes the **candle's own direction colour** — a *data* colour doing a *chrome* job — so the frame changes meaning with whatever the pointer is over, green on an up candle and red on a down one, and on a light theme it reads as an error state. It also cannot be themed without recolouring the candles themselves, which is the one thing that must not double as UI.
+
+Both are canvas-drawn, so no stylesheet reaches them; they are set through chart options and nothing else.
+
+
 
 A handler may call back into the chart. Doing so cannot start an event loop: while `crosshairMove` or `visibleRangeChange` handlers are running, further crosshair emissions and further range notifications are suppressed. A change a handler causes for itself is therefore not re-notified, but the next change from outside still fires. This makes a handler that restyles the chart on every notification safe rather than a runaway `requestAnimationFrame` chain.
 
@@ -200,6 +245,14 @@ A handler may call back into the chart. Doing so cannot start an event loop: whi
 Canvas backing stores are sized from the container on the `ResizeObserver` notification, and re-checked at the top of every render. The re-check is what makes the chart correct in environments where the observer is late, throttled, or unavailable, such as a background tab or an embedded webview: the next time the chart renders, it renders at the right resolution, and a container that changed size while the chart was idle is picked up then. The guarantee is scoped to rendering, so a pointer hover, which repaints only the crosshair layer, deliberately does not resize canvases it is not about to redraw.
 
 `getVisibleTimeRange()` is `null` and `getVisibleLogicalRange()` is `{ from: 0, to: 0 }` when the chart is empty or scrolled entirely off the series.
+
+### A collapsed container is not an unsized one
+
+Before the first measurement the chart has no geometry at all, so the first frame is laid out against a **fallback** of 800×500 CSS px. That fallback exists only for a container the layout has not resolved yet, and it is not the answer for a container that *has* been measured and is now measuring zero — which is what a divider dragged through zero, or a panel in a collapsed flex row, looks like.
+
+The two are told apart by whether the chart has ever measured a non-zero size. A container that was sized and is now zero-sized is **collapsed**, and the chart stops drawing into it: nothing is cleared, so the last frame stays on the canvas because there is nothing better to put there, and the view is not measured or moved, because the fallback geometry is not the panel's geometry. Feeding data is *not* skipped — appends are applied and the slot table rebuilt first, so a live feed does not build a backlog behind a collapsed panel and the view is correct the moment it reopens. Drawing 800×500 worth of axis into a panel with no height is how a squeezed pane ends up with labels sized for a wide plot and crammed into a fraction of it.
+
+The same distinction governs the renderers' own guard, which already bails on a zero-sized container rather than resizing canvases to nothing.
 
 ## User events
 
@@ -262,6 +315,18 @@ A press that travels more than a few CSS pixels is a pan, not a click, and repor
 
 A press in the axis gutter is a vertical gesture and nowhere else is. It does not pan, it does not move the series, and it does not disturb the live-edge latch, so the two axes stay independent and a caller never gets one gesture's side effects along with the other's.
 
+### A pan is bounded; a zoom is not
+
+A pan and a pinch cannot scroll the series out of sight. Both hold the view to **half the plot width** of empty space past either end of the data, in slots, so the allowance is a fraction of the screen rather than a number of bars and means the same thing at any zoom and across a session break. Past the bound there is nothing to see, and the bound is what turns "I have scrolled the data off the screen" into a dead end the caller can undo with `scrollToRealtime()`.
+
+A **plot fraction rather than a bar count is load-bearing.** A margin of one bar stops the series roughly one bar past the newest candle, so an ordinary drag of a couple of hundred pixels runs into it and the series stops following the pointer — a chart that does not track 1:1, which is the one property a trading chart cannot trade away, since a cursor and the data under it must never disagree. Half a plot is past any realistic gesture and still bounded. The floor is one bar, so a heavily zoomed chart always has somewhere to go.
+
+A **zoom is deliberately not bounded.** A zoom is anchored on the bar under the pointer, so it cannot throw the view anywhere the user is not already pointing: there is no fling to prevent, and clamping it would only pull the anchored bar out from under the cursor. The two invariants that matter here are that a wheel step holds the bar under the pointer and that a bar-spacing change scales about one fixed anchor, and both are enforced in the browser harness.
+
+**The bound is on the gesture, not on the view.** A panned viewport is the caller's, and the bound moves whenever the series does — every appended bar widens it, every session break widens it by the whole gap — so a bound applied on every update would pull a chart sideways underneath the user every time a bar printed. The user did not move it; the slack around it did. So appends, `fitContent()` and a live-edge re-anchor are all exempt. The one case that can leave a view genuinely out of bounds, retention trimming under a panned chart, corrects itself on the next gesture. `setVisibleLogicalRange()` is held to the same bound, so an ask and a gesture cannot disagree.
+
+When the series is **narrower** than the plot the two bounds cross — there is slack on both sides at once — and the answer is the span between them, so a chart that fits is free to sit anywhere in the plot rather than being pinned to an edge and fighting the caller.
+
 **The gutter is shared, and the row under the pointer decides which pane owns the drag.** A drag in the price pane's rows scales the price pane; a drag beside a MACD or volume pane scales *that* pane and leaves the price chart untouched. This is what makes a lower pane worth having: one historical spike in a volume pane would otherwise flatten the recent bars permanently, and without a gesture there is no way back from that.
 
 A pane's rows are half-open, `[pane.y, pane.y + pane.height)`, and the `separatorHeight` band between two panes belongs to *neither* — the boundaries are snapped to whole pixels precisely so two panes cannot both claim a divider. A drag that starts on a divider therefore does nothing at all, which is the only safe answer for a band that is not part of any pane. `priceAxisWidth: 0` disables the gesture on every pane.
@@ -292,7 +357,7 @@ chart.setTheme(theme: ChartTheme): void   // same as applyOptions({ theme })
 | `theme` | `'dark' \| 'paper'` | `'dark'` |
 | `locale` | BCP 47 tag | the runtime locale |
 | `timeZone` | IANA zone | `'UTC'` |
-| `priceFormat.precision` | integer 0-20 | `2` |
+| `priceFormat.precision` | integer 0-20, **fixed** fraction digits | `2` |
 | `priceFormat.minMove` | positive number | `0.01` |
 | `layout.background` | CSS colour | theme preset |
 | `layout.textColor` | CSS colour | theme preset |
@@ -304,8 +369,21 @@ chart.setTheme(theme: ChartTheme): void   // same as applyOptions({ theme })
 | `volume.heightRatio` | number in (0, 1] (additive in 1.x) | `0.2` |
 | `grid.vertLines` / `grid.horzLines` | boolean | `true` |
 | `grid.color` | CSS colour, alpha honoured | theme preset |
+
+**The two grid directions are derived differently, and now both cover the whole plot.** Horizontal lines come from each pane's price ticks — a statement about the *scale* — so they always spanned the full width. Vertical lines come from the time-axis tick list, and every tick in that list used to name a real candle: the window was clamped to the series and each tick was positioned with `indexToCoordinate`, which clamps its index to the slot table. So where there were no candles there were no vertical lines, and the cells never closed in the empty space to either side of the data. A tick now carries the **slot** it belongs on, which extrapolates past either end of the series at one bar per slot, and both the line and its label are drawn from that slot. Inside the series the slot is exactly what `indexToCoordinate` would have said, so no existing chart moves.
+
+This is also what makes `setVisibleLogicalRange()` usable: a view parked in the space past the last candle has a full grid in it, rather than horizontal lines and nothing else.
+
+**A time-axis label writes the date only when the date changes.** Every label used to spell out the whole timestamp, so a five-minute chart read `Sep 1, 09:35 AM  Sep 1, 09:40 AM  Sep 1, 09:45 AM` and, being far wider than the space between labels, overprinted itself into a row of clipped half-dates. Now only a label that changes the coarse part carries it — the date on a minute-level axis, the month on a day-level one, the year on a monthly one — and the labels between it are the short form: `Sep 1, 09:35 AM  09:40 AM  09:45 AM`. **The first label in view is always full**, so a view that opens in the middle of a day still says what day it is, and a reader scanning left to right finds the date on the label that introduced it.
+
+"Which date" is a calendar question in `options.timeZone`, not arithmetic on epoch milliseconds: 23:00 and 01:00 either side of a UTC midnight are one day in London and two in New York, and the grouping is read through `Intl` so it is right in both.
+
+A label whose box would reach back into the previous one is dropped rather than overprinted, and the one after it is drawn. Abutting labels are fine; overlapping ones are not, and dropping the *later* label keeps the sequence anchored to the left edge so the reading starts where the plot does. This is a rendering property and is enforced in the browser harness rather than in a unit test, because the headless canvas reports a `measureText` width of zero and a defect that is entirely about the width of text is invisible to it.
 | `crosshair.visible` | boolean | `true` |
 | `crosshair.color` | CSS colour (additive in 1.x) | theme preset |
+| `crosshair.readout` | boolean, **defaults `false`** (behaviour change in 1.x) | `false` |
+| `crosshair.readoutBorderColor` | CSS colour, additive in 1.x | `''` = follow the candle |
+| `candlestick.lastPriceTag` | boolean, **defaults `false`** (behaviour change in 1.x) | `false` |
 | `timeScale.barSpacing` | positive number | `14` |
 | `timeScale.minBarSpacing` | positive number | `0.5` |
 | `timeScale.maxBarSpacing` | positive number | `400` |
@@ -329,6 +407,12 @@ chart.options().candlestick.upColor;    // still '#ff00ff'
 **Colours** accept `#rgb`, `#rgba`, `#rrggbb`, `#rrggbbaa`, `rgb()`, `rgba()` with numeric or percentage channels, and `transparent`. Channels clamp the way CSS clamps them. Anything else throws rather than rendering black. Colours are parsed to RGBA once per `applyOptions`, never per candle.
 
 **`maxRetainedCandles` is constructor-only.** `applyOptions` rejects it, because changing it means rebuilding the retained pyramid under a live viewport.
+
+**`priceFormat.precision` is a fixed number of fraction digits, not a maximum.** A price axis where `100` sits beside `100.1` and `763.25` makes the reader count decimals to find the tick spacing, which is the one job an axis has, and every instrument is quoted at one number of decimals. So every label is written to the configured width: `100.00`, `100.10`, `763.25`.
+
+It also makes the float artefacts unreachable. Tick values come out of the tick arithmetic as doubles, so a label of `100.1000001` was reachable whenever the configured precision was wide enough to show it, and rounding to a fixed width is what stops it reaching the canvas. **If you are seeing seven decimals, something set `precision` to seven** — the default is `2`, and a chart at the default now reads `100.10`.
+
+Grouping separators, locale and rounding mode are `Intl`'s business and are deliberately not reimplemented, so a locale that groups differently gets it right without anything here knowing which locales those are. A `precision` outside 0-20 is clamped rather than thrown at `Intl`, which raises a `RangeError` and an options object is caller-supplied.
 
 **`priceFormat.precision` and `minMove` must agree.** A `precision` that cannot display `minMove` (`precision: 0` with `minMove: 0.01`) throws, so lower precision together with a wider tick:
 

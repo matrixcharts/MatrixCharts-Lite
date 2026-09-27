@@ -145,17 +145,29 @@ test('a feed that keeps arriving while the view is panned does not re-latch it',
     // The behaviour that made the demo look broken. A view the caller has taken over must
     // stay taken over: the feed appending is not a reason to move someone's window, and
     // the flag must not quietly return to `true` because bars arrived.
+    const candles = flatCandles(60);
     const { harness, events } = watching(60);
     try {
         panBehind(harness);
         harness.flush();
         assert.equal(harness.chart.isAtRealtime(), false);
+        // Asserted as a *coordinate*, not as a visible range. The range is a property of
+        // the pixel window, so appending bars that land inside it widens the range whether
+        // or not anything scrolled — asserting on the range would fail for a reason that
+        // has nothing to do with the view staying put. The coordinate of a known bar is
+        // the thing that actually has to hold still.
+        const anchorX = harness.chart.indexToCoordinate(candles.length - 1);
         const before = harness.chart.getVisibleLogicalRange().to;
 
         harness.chart.appendBatch(flatCandles(20, { from: 1_700_000_000_000 + 60 * 60_000 }));
         harness.flush();
         assert.equal(harness.chart.isAtRealtime(), false, 'appending re-latched a panned chart');
-        assert.equal(harness.chart.getVisibleLogicalRange().to, before, 'appending moved a panned view');
+        assert.ok(
+            Math.abs(harness.chart.indexToCoordinate(candles.length - 1) - anchorX) < 1e-6,
+            'appending scrolled a panned view',
+        );
+        // The window may legitimately widen, since the new bars are inside it.
+        assert.ok(harness.chart.getVisibleLogicalRange().to >= before);
         assert.equal(events[events.length - 1].atRealtime, false);
     } finally {
         harness.dispose();
