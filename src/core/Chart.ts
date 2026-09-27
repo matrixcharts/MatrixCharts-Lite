@@ -2914,6 +2914,19 @@ export class Chart {
             this.dataRenderer.clearCandlesticks();
             this.uploadVisibleClose(style);
         } else {
+            // The two directions of this switch were not symmetric, and that is the whole
+            // defect. Moving *to* a line cleared the candle series; moving *back* cleared
+            // nothing, so the polyline — and, for an area, the fill beneath it — stayed on
+            // the GPU under the candles until something else happened to overwrite it. A
+            // chart switched from area to candlesticks showed the fill and the line it was
+            // drawn on top of, which reads as a rendering fault in the candles rather than
+            // as a style that was never switched off.
+            //
+            // The data layer holds this geometry in persistent buffers and empties them
+            // only when told to — its own `clearArea` says as much — so the two lines below
+            // are the only place the clearing can happen. They cost a `setPasses([])` each.
+            this.dataRenderer.clearLine();
+            this.dataRenderer.clearArea();
             this.dataRenderer.drawCandlesticks(this.scaledCandles(), {
                 colors: this.candleColors,
                 style,

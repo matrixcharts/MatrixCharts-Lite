@@ -8,6 +8,21 @@ records what moved and why, per release.
 
 ### Fixed
 
+**Switching back to a candle style no longer leaves the previous style on the GPU.** The
+data layer holds each series in a persistent buffer and empties it only when told to, and
+the two directions of the style switch were not symmetric: moving *to* a line cleared the
+candle series, and moving *back* cleared nothing. A chart switched from `area` to
+`candlestick` therefore kept drawing the fill and the polyline it was drawn on top of,
+which reads as a fault in the candles rather than as a style that was never switched off.
+`candlestick`, `hollow`, `ohlc` and `baseline` all share the branch and are all fixed.
+
+The rule is now the one the renderer already implies, and it is worth stating because it
+is what was half-implemented: `drawCandlesticks`, `drawLine` and `drawArea` each *replace*
+the pass list of the series they draw, so the only geometry that can survive a frame is
+geometry belonging to a series that frame never drew. Anything not drawn is now cleared
+explicitly, and the full six-by-six style matrix is asserted against that rule rather than
+against a list of the transitions that happened to be tried.
+
 **A live feed that crosses a session break kept up with it.** The slot table is the one
 place that knows where the whitespace is, and it was rebuilt on `setData`, on
 `applyOptions` and on the replace path — but not when bars were appended. So on a feed the

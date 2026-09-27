@@ -31,7 +31,7 @@
     "build:esm": "tsc -p tsconfig.json",
     "build:cjs": "tsc -p tsconfig.cjs.json && node scripts/write-dual-package-json.cjs",
     "prepack": "npm run build",
-    "test": "tsc -p tsconfig.test.json && node scripts/write-dual-package-json.cjs && node --test tests/OHLCPyramid.test.cjs tests/Decorations.test.cjs tests/CandleFeed.test.cjs tests/FeedBoundary.test.cjs tests/StreamingIntegration.test.cjs tests/CandlestickLayout.test.cjs tests/Coordinates.test.cjs tests/Options.test.cjs tests/Panes.test.cjs tests/PriceScale.test.cjs tests/SessionScale.test.cjs tests/SessionBreaks.test.cjs tests/TimeAxis.test.cjs tests/Overlays.test.cjs tests/PublicApi.test.cjs tests/ChartContainer.test.cjs tests/HeadlessSeam.test.cjs tests/VerticalApi.test.cjs",
+    "test": "tsc -p tsconfig.test.json && node scripts/write-dual-package-json.cjs && node --test tests/OHLCPyramid.test.cjs tests/Decorations.test.cjs tests/CandleFeed.test.cjs tests/FeedBoundary.test.cjs tests/StreamingIntegration.test.cjs tests/CandlestickLayout.test.cjs tests/Coordinates.test.cjs tests/Options.test.cjs tests/Panes.test.cjs tests/PriceScale.test.cjs tests/SessionScale.test.cjs tests/SessionBreaks.test.cjs tests/TimeAxis.test.cjs tests/CandleStyle.test.cjs tests/Overlays.test.cjs tests/PublicApi.test.cjs tests/ChartContainer.test.cjs tests/HeadlessSeam.test.cjs tests/VerticalApi.test.cjs",
     "verify:package": "npm run build && node scripts/verify-package.mjs",
     "verify": "npm test && npm run check:interaction && npm run verify:package",
     "benchmark": "tsc -p tsconfig.test.json && node scripts/write-dual-package-json.cjs && node benchmarks/sustained-feed.cjs",
