@@ -1,5 +1,10 @@
 // Proves the published artifact, not just the source tree:
-//   1. npm pack ships dist/esm, dist/cjs, .d.ts, and docs, and nothing internal.
+//   1. npm pack ships dist/esm, dist/cjs, .d.ts, docs, and the changelog, and
+//      nothing internal. The changelog is listed explicitly because `files` is the
+//      only thing putting it in the tarball: npm auto-includes README, LICENSE and
+//      package.json and nothing else, so a changelog left out of `files` is a
+//      changelog nobody reads on npm. Asserted here so tidying `files` cannot drop
+//      it without the gate noticing.
 //   2. require() and import resolve to the same v1 value exports, and neither
 //      can reach an internal module through a subpath.
 //   3. TypeScript resolves the "import" and "require" type conditions, and the
@@ -22,6 +27,7 @@ const VALUE_EXPORTS = ['Chart', 'ChartFeedController', 'MockCandleSource', 'WebS
 const REQUIRED_PACK_PATHS = [
     'package.json',
     'README.md',
+    'CHANGELOG.md',
     'dist/esm/index.js',
     'dist/esm/index.d.ts',
     'dist/esm/package.json',

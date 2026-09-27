@@ -21,7 +21,8 @@
   },
   "files": [
     "dist",
-    "docs"
+    "docs",
+    "CHANGELOG.md"
   ],
   "sideEffects": false,
   "scripts": {
