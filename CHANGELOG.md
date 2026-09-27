@@ -6,6 +6,14 @@ records what moved and why, per release.
 
 ## Unreleased
 
+Nothing yet.
+
+## v1.0.2
+
+Three defects on paths that had no test, and one addition. None is a change of contract: no
+export, option or event field was removed or repurposed, one field was added to an existing
+payload, and every "fix" below is a path doing the thing the rest of the engine already did.
+
 ### Added
 
 **`VisibleRangeEvent.atRealtime`**, and `isAtRealtime()` / `scrollToRealtime()` documented
@@ -70,6 +78,21 @@ The rebuild runs only when bars were appended, never for a bare `updateLast`. Th
 O(n) in the length of the series and a live feed calls `updateLast` on every tick, so
 rebuilding a million-bar table at ten hertz to accommodate a price change that moved no
 timestamp would have been a far worse defect than the one being fixed.
+
+### Verification
+
+268 unit tests (254 at v1.0.1), 21 browser interaction invariants and 10 packaging checks,
+all from one `npm run verify`. Every fix above was reverted to confirm its new tests fail
+against the old code — the three fixes took 3, 3 and 1 failing tests respectively, and the
+addition took 0 because it is an addition.
+
+Two of those regressions are worth keeping in mind when reading the diffs. The data-layer
+test double records candle *records* rather than their length, which is the assertion surface
+the slot work lives on; before that it recorded a number that said nothing about where the
+bars were, and that one gap is why six defects reached a suite that was otherwise thorough.
+And the style-switch tests state a rule — every series the next style will not draw has to be
+cleared — rather than a list of the transitions somebody happened to try, because a missing
+edge is only ever found by a rule.
 
 ## v1.0.1
 
