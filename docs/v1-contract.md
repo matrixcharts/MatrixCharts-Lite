@@ -281,6 +281,15 @@ chart.applyOptions({ priceFormat: { precision: 0, minMove: 1 } });
 
 **`timeScale.barSpacing`** sets the zoom while holding the view still: a live-following chart stays pinned to the newest bar, anything else keeps the bar under the viewport centre. `minBarSpacing` and `maxBarSpacing` clamp wheel and pinch zoom, and re-clamp immediately if the current zoom becomes illegal. These replace the old unbounded `1e-4`..`1e4` range.
 
+**`options().timeScale.barSpacing` is the live zoom, not the configured one.** After a wheel or pinch zoom, and after `setData`, it reports the spacing actually in effect — the effective value after clamping — so a readout bound to it always agrees with the bars. Read it, scale it, and apply the result to build a zoom button:
+
+```ts
+const next = chart.options().timeScale.barSpacing * 1.25;
+chart.applyOptions({ timeScale: { barSpacing: next } });
+```
+
+The value written back into the options is the clamped one, so asking for a spacing past `maxBarSpacing` reports what was applied rather than what was asked for. Note that `setData` resets the zoom to the default spacing, so a chart constructed with a `barSpacing` other than the default reports the default once data is loaded.
+
 **Time labels default to UTC** so they do not depend on the viewer's zone. `locale` and `timeZone` feed `Intl.DateTimeFormat` and `Intl.NumberFormat`; price labels use `precision` and locale separators.
 
 **The plot is the canvas less two reserved gutters.** `layout.priceAxisWidth` (default 78) is reserved on the left for price labels and `layout.timeAxisHeight` (default 22) along the bottom for time labels. Both are CSS pixels, both are non-negative, and zero restores the old behaviour of drawing labels over the data. Every part of the geometry derives from one plot rect: the visible logical and time ranges, the live edge, the zoom anchor, the vertical fit, the grid lines, the axis frame, and the crosshair rules. Nothing measures the canvas directly to decide what is visible.

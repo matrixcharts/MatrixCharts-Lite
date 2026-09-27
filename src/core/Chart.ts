@@ -1492,9 +1492,22 @@ export class Chart {
             }
         } else if (retainedLength === 0) {
             this.offsetX = 0;
-            this.scaleX = 1;
+            // Through the setter, like every other place the scale moves. A bare
+            // assignment here left `options().timeScale.barSpacing` reporting the
+            // spacing the chart was *constructed* with while the chart sat at 1, and
+            // the next `setData` put it at the default instead — so a readout bound
+            // to the option disagreed with the bars on every load. See the reset
+            // below; this is the same defect on the empty series.
+            this.setBarSpacingLive(1);
         } else {
-            this.scaleX = DEFAULT_CANDLE_SPACING_PX;
+            // This is the reset `setData` performs, and it goes through the setter for
+            // the same reason. Assigning `scaleX` directly meant the resolved and
+            // explicit options kept the construction-time bar spacing while the chart
+            // rendered at the default: a chart built with `barSpacing: 12` reported 12
+            // and drew 14. A zoom readout lies about zoom level by 17%, and a toolbar
+            // button that scales the *reported* spacing inherits the error on its very
+            // first press, before any zoom has happened to correct it.
+            this.setBarSpacingLive(DEFAULT_CANDLE_SPACING_PX);
             this.offsetX = liveEdgeOffsetX(
                 plotRight(this.viewport),
                 this.slotOffsets,

@@ -86,6 +86,30 @@ try {
     await page.waitForFunction(() => globalThis.__mcReady === true, { timeout: 20000 });
     await wait(500);
 
+    // The reported bar spacing has to be the one on screen, and it has to be so from
+    // the first frame, not only after a zoom.
+    //
+    // This is the invariant a zoom readout is built on. A toolbar button has to be
+    // able to read the current spacing, scale it, and apply the result, and that is
+    // only correct if the number it read was the number being drawn. It was not, on
+    // load: `setData` resets the chart to the default spacing by assigning `scaleX`
+    // directly, which left the options reporting the construction-time value — a
+    // chart built at 12px reported 12 and drew 14, so the very first press of a
+    // zoom-in button was 17% out, before any zoom had happened to correct it. The
+    // zoom path had already been fixed; the data-load path had not.
+    const onLoad = await page.evaluate(() => {
+        const mc = globalThis.__mc;
+        return {
+            reported: mc.chart.options().timeScale.barSpacing,
+            drawn: mc.xOf(1) - mc.xOf(0),
+        };
+    });
+    record(
+        'the reported bar spacing is the one on screen, before any zoom',
+        Math.abs(onLoad.reported - onLoad.drawn) <= 0.001,
+        `options() says ${onLoad.reported.toFixed(3)}px, the bars are ${onLoad.drawn.toFixed(3)}px apart`,
+    );
+
     const plot = await page.evaluate(() => globalThis.__mc.plot());
     const midY = plot.y + plot.height / 2;
 
@@ -209,6 +233,88 @@ try {
             '(bar spacing ' + spacingBefore.toFixed(3) + ' -> ' + spacingAfter.toFixed(3) + ')',
     );
 
+    // The same button, pressed again. A toolbar is not one call, it is five, and each
+    // one reads the current spacing, scales it and applies the result — so the value
+    // read has to be the value drawn, or the error compounds press by press.
+    //
+    // The case above cannot see this: it starts from a known spacing and asks for a
+    // multiple of it, so it passes whether or not the reported value is usable as a
+    // base. Here the base *is* the reported value, which is what a real button uses,
+    // and every press has to land on what it asked for.
+    await page.evaluate(() => globalThis.__mc.chart.applyOptions({ timeScale: { barSpacing: 12 } }));
+    await wait(250);
+    const pressTargets = [];
+    for (let press = 0; press < 5; press++) {
+        // Read the base the way a caller has to: from the public options.
+        const base = await page.evaluate(() => globalThis.__mc.chart.options().timeScale.barSpacing);
+        const want = base * 1.25;
+        await page.evaluate((t) => globalThis.__mc.chart.applyOptions({ timeScale: { barSpacing: t } }), want);
+        await wait(180);
+        const now = await page.evaluate(() => {
+            const mc = globalThis.__mc;
+            return {
+                reported: mc.chart.options().timeScale.barSpacing,
+                drawn: mc.xOf(1) - mc.xOf(0),
+            };
+        });
+        pressTargets.push({
+            press: press + 1,
+            want,
+            reported: now.reported,
+            drawn: now.drawn,
+        });
+    }
+    const pressWorst = Math.max(...pressTargets.flatMap((p) => [
+        Math.abs(p.reported - p.want),
+        Math.abs(p.drawn - p.want),
+    ]));
+    record(
+        'five successive zoom-in presses each apply, compounding from the reported value',
+        pressWorst <= 0.01,
+        pressTargets
+            .map((p) => `${p.press}:${p.drawn.toFixed(2)}`)
+            .join('px ') + 'px  (asked ' + pressTargets.map((p) => p.want.toFixed(2)).join('px ') +
+            `px, worst miss ${pressWorst.toFixed(4)}px)`,
+    );
+
+    // Put the chart back on the plot-centre branch before the anchor check.
+    //
+    // The presses above re-latch the chart to the live edge, and a live-edge zoom
+    // parks the newest bar rather than scaling about the plot centre — so without
+    // this the anchor case below would still pass, while quietly measuring the other
+    // branch of `applyBarSpacing` and no longer covering the plot-centre anchoring at
+    // all. The anchor came back as the plot's right edge instead of its centre, which
+    // is how this was noticed. A test that passes for the wrong reason is worse than
+    // one that fails, so the branch is asserted rather than assumed.
+    //
+    // The spacing is put back to 12 first so this is the same starting state the
+    // anchor case was written against, and the drag is then sized off the live bar
+    // spacing rather than fixed. It cannot be fixed: the live-edge test is
+    // `max(24, scaleX * 1.5)`, so at the 36.6px the five presses leave behind the
+    // tolerance is 55px and a 40px drag does not clear it. The chart then never
+    // detaches, `isAtRealtime()` stays true, and the case measures the wrong branch
+    // while still reporting a plausible anchor.
+    await page.evaluate(() => globalThis.__mc.chart.applyOptions({ timeScale: { barSpacing: 12 } }));
+    await wait(250);
+    await page.evaluate(() => globalThis.__mc.chart.scrollToRealtime());
+    await wait(150);
+    const detachDrag = await page.evaluate(() => {
+        const mc = globalThis.__mc;
+        // Comfortably past max(24, scaleX * 1.5), which is what a pan has to beat.
+        return -(Math.max(24, (mc.xOf(1) - mc.xOf(0)) * 1.5) + 40);
+    });
+    await page.mouse.move(plot.x + plot.width * 0.5, midY);
+    await page.mouse.down();
+    await page.mouse.move(plot.x + plot.width * 0.5 + detachDrag, midY, { steps: 8 });
+    await page.mouse.up();
+    await wait(200);
+    // `isAtRealtime()` reports the *latch*, so a chart that has successfully detached
+    // answers false. The name here is the latch, not the outcome, because the guard
+    // below reads as "must not still be latched" — the first version of this called it
+    // `detached`, tested it inverted, and failed every run while the anchors it was
+    // guarding were correct to two decimal places.
+    const stillLatched = await page.evaluate(() => globalThis.__mc.chart.isAtRealtime());
+
     // Solve for the anchor a scale was taken about, twice, and require the two to be
     // the same point. This is the gutter-independent form of the invariant: it does not
     // need to know where the plot rect is, only that the transform is a pure scale
@@ -243,11 +349,17 @@ try {
         const after = await readState();
         anchors.push(anchorFor(before, after));
     }
-    const stable = Number.isFinite(anchors[0])
-        && Math.abs(anchors[0] - anchors[1]) <= ANCHOR_TOLERANCE_PX;
+    const stable = stillLatched
+        ? false
+        : Number.isFinite(anchors[0])
+            && Math.abs(anchors[0] - anchors[1]) <= ANCHOR_TOLERANCE_PX;
     record(
         'a barSpacing change scales about one fixed anchor',
         stable,
+        (stillLatched
+            ? 'NOT MEASURABLE — still latched to the live edge, so this solved the other branch ' +
+                'of applyBarSpacing; '
+            : '') +
         `anchors ${anchors.map((a) => a.toFixed(2)).join('px, ')}px ` +
         `(canvas centre ${(await readState()).canvasCentre.toFixed(2)}px — the plot centre is ` +
         'inset by the axis gutter, so it is not expected to equal it)',
