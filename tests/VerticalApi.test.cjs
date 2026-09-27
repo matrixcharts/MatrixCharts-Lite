@@ -214,16 +214,240 @@ test('a drag of the price axis does not move the horizontal one', () => {
     }
 });
 
-test('a drag beside a lower pane does nothing, and the divider is inert', () => {
-    // The leak: the gutter runs the full height, so hit-testing it as one strip let a
-    // drag beside an oscillator reach up and stretch the price chart. A one-pane chart
-    // cannot show this, because there the gutter and the price pane's rows are the same
-    // rectangle — which is why the browser suite needs its own two-pane page and this one
-    // needs two panes declared.
-    const h = createHeadlessChart({ panes: { weights: [3, 1] } });
+/** A two-pane chart with an oscillator in the lower one, plus its exact row geometry. */
+function twoPaneChart(options = {}) {
+    const h = createHeadlessChart({ panes: { weights: [3, 1] }, ...options });
+    h.chart.setData(flatCandles(60, { start: 100, step: 0.5 }));
+    h.flush();
+    const points = flatCandles(60, { start: 50, step: 0.1 }).map((c) => ({ time: c.time, value: c.close }));
+    h.chart.setOverlays([{ id: 'osc', points, pane: 1 }]);
+    h.flush();
+
+    const { priceAxisWidth, timeAxisHeight } = h.chart.options().layout;
+    const separator = h.chart.options().panes.separatorHeight;
+    const plotHeight = 600 - timeAxisHeight;
+    const available = plotHeight - separator;
+    const priceHeight = Math.round((3 / 4) * available);
+    return {
+        h,
+        separator,
+        axisX: Math.round(priceAxisWidth / 2),
+        // The rows themselves, recomputed here rather than read back from the chart, so
+        // the test states where it thinks the boundaries are and the chart has to agree.
+        paneRows: [
+            { top: 0, bottom: priceHeight },
+            { top: priceHeight + separator, bottom: plotHeight },
+        ],
+    };
+}
+
+test('a drag in a lower pane scales that pane and leaves the price pane fitting', () => {
+    const { h, axisX, paneRows } = twoPaneChart();
     try {
         const chart = h.chart;
-        chart.setData(flatCandles(60, { start: 100, step: 0.5 }));
+        const priceBefore = chart.getPriceRange();
+        const lowerBefore = chart.getPaneValueRange(1);
+        assert.equal(chart.options().priceScale.autoScale, true, 'precondition');
+
+        // One pixel inside pane 1's first row. The boundaries are whole pixels, so this
+        // is the tightest press that can still be inside the pane at all.
+        h.drag(axisX, paneRows[1].top + 1, axisX, paneRows[1].top + 161);
+
+        const priceAfter = chart.getPriceRange();
+        const lowerAfter = chart.getPaneValueRange(1);
+        assert.ok(
+            Math.abs((lowerAfter[1] - lowerAfter[0]) - (lowerBefore[1] - lowerBefore[0])) > 1e-9,
+            `pane 1 should have been scaled, still [${lowerAfter}]`,
+        );
+        assert.deepEqual(priceAfter, priceBefore, 'the price pane moved');
+        // Pane 0's auto-scale state is genuinely untouched, not merely still fitting: the
+        // option is the price scale's, so a lower pane's lock must not write it.
+        assert.equal(chart.options().priceScale.autoScale, true, 'a lower-pane lock wrote autoScale');
+    } finally {
+        h.dispose();
+    }
+});
+
+test('a drag in the price pane does not touch a lower pane', () => {
+    const { h, axisX, paneRows } = twoPaneChart();
+    try {
+        const chart = h.chart;
+        const lowerBefore = chart.getPaneValueRange(1);
+        h.drag(axisX, paneRows[0].top + 20, axisX, paneRows[0].top + 220);
+        assert.equal(chart.options().priceScale.autoScale, false, 'the price pane should be locked');
+        assert.deepEqual(
+            chart.getPaneValueRange(1),
+            lowerBefore,
+            'locking the price pane disturbed the oscillator pane',
+        );
+    } finally {
+        h.dispose();
+    }
+});
+
+test('each pane keeps its own lock, and its own release', () => {
+    const { h, axisX, paneRows } = twoPaneChart();
+    try {
+        const chart = h.chart;
+        h.drag(axisX, paneRows[0].top + 20, axisX, paneRows[0].top + 220);
+        const priceLocked = chart.getPriceRange();
+        h.drag(axisX, paneRows[1].top + 1, axisX, paneRows[1].top + 161);
+        const lowerLocked = chart.getPaneValueRange(1);
+
+        // Both held at once: the second drag did not release the first.
+        assert.deepEqual(chart.getPriceRange(), priceLocked, 'the price lock was lost');
+        assert.deepEqual(chart.getPaneValueRange(1), lowerLocked, 'the lower lock was not taken');
+
+        // Releasing one leaves the other alone.
+        chart.fitPaneRange(1);
+        assert.notDeepEqual(chart.getPaneValueRange(1), lowerLocked, 'fitPaneRange(1) did not release');
+        assert.deepEqual(chart.getPriceRange(), priceLocked, 'releasing pane 1 released pane 0');
+        assert.equal(chart.options().priceScale.autoScale, false, 'releasing pane 1 released pane 0');
+    } finally {
+        h.dispose();
+    }
+});
+
+test('the divider belongs to no pane, at every exact boundary', () => {
+    // The divider is the band `paneRects` leaves to neither pane, and the boundaries are
+    // snapped to whole pixels precisely so two panes cannot both claim one. Checked at
+    // every pixel of the band and at both edges, because an off-by-one here is invisible
+    // in a screenshot and catastrophic in a use.
+    const { h, axisX, paneRows, separator } = twoPaneChart();
+    try {
+        const chart = h.chart;
+        const priceBefore = chart.getPriceRange();
+        const lowerBefore = chart.getPaneValueRange(1);
+
+        for (let offset = 0; offset < separator; offset++) {
+            const y = paneRows[0].bottom + offset;
+            h.drag(axisX, y, axisX, y + 160);
+            assert.deepEqual(chart.getPriceRange(), priceBefore, `divider pixel ${offset} moved the price pane`);
+            assert.deepEqual(
+                chart.getPaneValueRange(1),
+                lowerBefore,
+                `divider pixel ${offset} moved pane 1`,
+            );
+            assert.equal(
+                chart.options().priceScale.autoScale,
+                true,
+                `divider pixel ${offset} took the price pane's lock`,
+            );
+        }
+
+        // The first pixel of each pane's own rows is live, so the boundary is exact in
+        // both directions rather than merely generous.
+        h.drag(axisX, paneRows[1].top, axisX, paneRows[1].top + 160);
+        assert.notDeepEqual(
+            chart.getPaneValueRange(1),
+            lowerBefore,
+            "pane 1's own first row should be draggable",
+        );
+    } finally {
+        h.dispose();
+    }
+});
+
+test("a lower pane's drag uses the same span arithmetic, about the same centre", () => {
+    const { h, axisX, paneRows } = twoPaneChart();
+    try {
+        const chart = h.chart;
+        // A known range first, so the expectation is a number rather than a comparison
+        // against whatever the fit happened to produce.
+        chart.setPaneRange(1, [20, 80]);
+        const before = chart.getPaneValueRange(1);
+        const wanted = 1.5;
+        const paneHeight = paneRows[1].bottom - paneRows[1].top;
+        h.pointer('pointerdown', axisX, paneRows[1].top + 10);
+        const baseline = chart.getPaneValueRange(1);
+        h.pointer('pointermove', axisX, paneRows[1].top + 10 + paneHeight * (wanted - 1));
+        h.pointer('pointerup', axisX, paneRows[1].top + 10 + paneHeight * (wanted - 1));
+        const after = chart.getPaneValueRange(1);
+
+        assert.deepEqual(before, [20, 80], 'setPaneRange did not read back');
+        close((after[1] - after[0]) / (baseline[1] - baseline[0]), wanted, 1e-9, 'factor');
+        close((after[0] + after[1]) / 2, (baseline[0] + baseline[1]) / 2, 1e-9, 'middle held');
+    } finally {
+        h.dispose();
+    }
+});
+
+test('an indicator pane stays linear while the price pane is a log axis', () => {
+    // The asymmetry is the reason `paneValueToScale` is a function of the pane index. A
+    // log price scale must not reach a bounded oscillator, and a log pane's range must
+    // read back in indicator values rather than in logs.
+    const { h, axisX, paneRows } = twoPaneChart({ priceScale: { mode: 'log' } });
+    try {
+        const chart = h.chart;
+        chart.setPriceRange([50, 200]);
+        // Not `deepEqual`: a log pane's round trip is `exp(log(x))`, which is 50 to
+        // within 5e-14 rather than exactly 50. Comparing the exponent's precision against
+        // the value's is asking the wrong question.
+        close(chart.getPriceRange()[0], 50, 1e-9, 'log price round-trip low');
+        close(chart.getPriceRange()[1], 200, 1e-9, 'log price round-trip high');
+
+        // Pane 0's range reads in prices, not in logs. It was reading raw scale-space
+        // values, so a log chart reported log(50) where a caller asked for 50.
+        const paneZero = chart.getPaneValueRange(0);
+        close(paneZero[0], 50, 1e-6, 'pane 0 low on a log axis');
+        close(paneZero[1], 200, 1e-6, 'pane 0 high on a log axis');
+
+        // And pane 1 is untouched by the log axis, and draggable in its own units.
+        chart.setPaneRange(1, [10, 90]);
+        assert.deepEqual(chart.getPaneValueRange(1), [10, 90]);
+        h.drag(axisX, paneRows[1].top + 1, axisX, paneRows[1].top + 161);
+        const after = chart.getPaneValueRange(1);
+        assert.ok(after[1] - after[0] > 90, `pane 1 should have expanded past 80, got [${after}]`);
+        // Still prices, not logs, on pane 0.
+        close(chart.getPriceRange()[0], 50, 1e-6, 'price low after an indicator drag');
+    } finally {
+        h.dispose();
+    }
+});
+
+test('a pane range survives a feed append and a theme change', () => {
+    const { h, axisX, paneRows } = twoPaneChart();
+    try {
+        const chart = h.chart;
+        h.drag(axisX, paneRows[1].top + 1, axisX, paneRows[1].top + 161);
+        const locked = chart.getPaneValueRange(1);
+        // A lower pane's lock lives in the chart's own map, which `applyOptions` does not
+        // rebuild, so it survives a re-resolve for free. Pane 0's has to be written into
+        // both option objects to achieve the same thing.
+        chart.setTheme('paper');
+        assert.deepEqual(chart.getPaneValueRange(1), locked, 'a theme change released pane 1');
+        chart.appendData({
+            time: 1_700_000_000_000 + 60 * 60_000, open: 1, high: 2, low: 0, close: 1.5, volume: 1,
+        });
+        h.flush();
+        assert.deepEqual(chart.getPaneValueRange(1), locked, 'an append released pane 1');
+    } finally {
+        h.dispose();
+    }
+});
+
+test('shrinking the pane count drops a lock for a pane that no longer exists', () => {
+    const { h, axisX, paneRows } = twoPaneChart();
+    try {
+        const chart = h.chart;
+        h.drag(axisX, paneRows[1].top + 1, axisX, paneRows[1].top + 161);
+        const locked = chart.getPaneValueRange(1);
+        assert.notDeepEqual(locked, [20, 80], 'precondition: pane 1 is locked');
+
+        // The overlay goes first, and it has to: an overlay naming a pane that no longer
+        // exists is rejected by name, which is the documented behaviour and leaves the
+        // chart untouched. So the lock cannot be observed from under it.
+        chart.setOverlays([]);
+        chart.applyOptions({ panes: { weights: [1] } });
+        h.flush();
+        assert.throws(() => chart.fitPaneRange(1), /pane 1/);
+        assert.throws(() => chart.setPaneRange(1, [0, 1]), /pane 1/);
+
+        // The real claim: grow the layout back and pane 1 is fitting again, not showing
+        // the range it held before its pane was removed. A lock left in the map would
+        // come straight back, and the caller would see a pane they had released months
+        // ago still stuck at a scale they no longer remember choosing.
+        chart.applyOptions({ panes: { weights: [3, 1] } });
         h.flush();
         chart.setOverlays([{
             id: 'osc',
@@ -231,62 +455,15 @@ test('a drag beside a lower pane does nothing, and the divider is inert', () => 
             pane: 1,
         }]);
         h.flush();
-
-        const { priceAxisWidth, timeAxisHeight } = chart.options().layout;
-        const separator = chart.options().panes.separatorHeight;
-        const plotHeight = 600 - timeAxisHeight;
-        const available = plotHeight - separator;
-        const priceHeight = Math.round((3 / 4) * available);
-        const axisX = Math.round(priceAxisWidth / 2);
-
-        // Read, and a separate reset. These were one function at first, and the reset
-        // ran after the drag as well as before it, so every measurement compared
-        // [100, 200] with [100, 200] and the case failed for looking inert.
-        const read = () => ({
-            price: chart.getPriceRange(),
-            lower: chart.getPaneValueRange(1),
-            offsetX: chart.indexToCoordinate(0),
-        });
-        const dragAt = (y) => {
-            chart.setPriceRange([100, 200]);
-            const before = read();
-            h.drag(axisX, y, axisX, y + 160);
-            return { before, after: read() };
-        };
-
-        // Pane 0's rows: the gesture is live.
-        const inPrice = dragAt(Math.round(priceHeight / 2));
-        assert.ok(
-            Math.abs(inPrice.after.price[1] - inPrice.after.price[0]
-                - (inPrice.before.price[1] - inPrice.before.price[0])) > 1e-9,
-            'a drag in pane 0 rows should scale the price pane',
-        );
-
-        // The divider between them belongs to neither.
-        const onDivider = dragAt(priceHeight);
-        assert.deepEqual(onDivider.after.price, onDivider.before.price, 'the divider was not inert');
-        assert.equal(onDivider.after.offsetX, onDivider.before.offsetX, 'the divider panned');
-
-        // Pane 1's rows: nothing at all. Not the price pane, not itself, not a pan.
-        const inLower = dragAt(priceHeight + separator + Math.round((available - priceHeight) / 2));
-        assert.deepEqual(inLower.after.price, inLower.before.price, 'a lower-pane drag scaled the price chart');
-        assert.deepEqual(inLower.after.lower, inLower.before.lower, 'a lower-pane drag scaled its own pane');
-        assert.equal(inLower.after.offsetX, inLower.before.offsetX, 'a lower-pane drag panned');
-
-        // The boundary is exact, not merely generous: the last row of pane 0 still works.
-        const lastRow = dragAt(priceHeight - 1);
-        assert.ok(
-            Math.abs(lastRow.after.price[1] - lastRow.after.price[0]
-                - (lastRow.before.price[1] - lastRow.before.price[0])) > 1e-9,
-            'the last row above the divider should still scale',
-        );
+        const refitted = chart.getPaneValueRange(1);
+        assert.notDeepEqual(refitted, locked, 'a lock for a removed pane came back');
     } finally {
         h.dispose();
     }
 });
 
-test('a zero-width price axis disables the gesture', () => {
-    const h = createHeadlessChart({ layout: { priceAxisWidth: 0 } });
+test('a zero-width price axis disables the gesture on every pane', () => {
+    const h = createHeadlessChart({ panes: { weights: [3, 1] }, layout: { priceAxisWidth: 0 } });
     try {
         const chart = h.chart;
         chart.setData(flatCandles(40, { start: 100, step: 0.5 }));

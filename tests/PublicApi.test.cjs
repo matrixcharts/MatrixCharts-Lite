@@ -36,18 +36,22 @@ test('internal renderers, math, and test hooks stay unexported', () => {
     }
 });
 
-test('the renderer-injection seam stays internal', () => {
-    // The seam exists so a headless test can stand a recorder in for the GPU. It is
-    // reachable from the compiled output, so what keeps it out of an integrator's hands is
-    // that the barrel is an explicit allow-list — so the names themselves have to stay
-    // off it, and `setRendererFactory` in particular must not become a supported way to
-    // replace a layer. A published seam is not a seam, it is a second public contract
-    // nobody specified.
-    for (const internal of [
-        'createRenderer',
-        'setRendererFactory',
-        'defaultFactory',
+test('the public read and write API is present, and nothing internal leaked beside it', () => {
+    // The per-pane vertical surface: `setPaneRange`/`fitPaneRange` are what a drag of a
+    // lower pane's gutter uses, and the only way for a caller to undo one. Without them a
+    // pane a single spike had flattened could not be released from code at all.
+    for (const method of [
+        'setPaneRange',
+        'fitPaneRange',
+        'getPaneValueRange',
+        'setPriceRange',
+        'fitPriceRange',
+        'getPriceRange',
     ]) {
+        assert.equal(typeof publicApi.Chart.prototype[method], 'function', `${method} must be public`);
+    }
+    // And they are not the seam: a factory that replaces a layer is not public API.
+    for (const internal of ['createRenderer', 'setRendererFactory', 'paneAtClientY']) {
         assert.equal(internal in publicApi, false, `${internal} must not be exported`);
     }
 });

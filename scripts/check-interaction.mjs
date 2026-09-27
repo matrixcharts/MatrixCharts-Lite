@@ -742,11 +742,14 @@ try {
     await page.evaluate(() => globalThis.__mc.chart.fitPriceRange());
     await wait(200);
 
-    // --- Panes: the price axis belongs to the price pane's rows alone -----------
+    // --- Panes: the gutter routes a vertical drag to the pane under the pointer ----
     //
     // Needs a second pane to mean anything. On a one-pane chart the gutter and the
-    // price pane's rows are the same rectangle, so the leak this covers is invisible
+    // price pane's rows are the same rectangle, so none of this is distinguishable
     // there — which is why it gets its own page rather than a flag on the one above.
+    // The headless suite covers the same rule in finer detail, down to every pixel of
+    // the divider; this is here because the routing has to be right against a real
+    // pointer and a real layout, not only against synthetic events.
     const panePage = await browser.newPage();
     const paneErrors = [];
     panePage.on('pageerror', (e) => paneErrors.push(e.message));
@@ -778,7 +781,7 @@ try {
     });
     const paneAxisX = Math.round(paneGeom.priceAxisWidth / 2);
 
-    // Lock the price range so the live feed cannot move it and disguise a leak.
+    // Both ranges are locked, so the live feed cannot move either and disguise a leak.
     const paneRead = () => panePage.evaluate(() => {
         const mc = globalThis.__mc;
         const price = mc.chart.getPriceRange();
@@ -789,7 +792,10 @@ try {
         };
     });
     const dragInPaneGutter = async (y) => {
-        await panePage.evaluate(() => globalThis.__mc.chart.setPriceRange([100, 200]));
+        await panePage.evaluate(() => {
+            globalThis.__mc.chart.setPriceRange([100, 200]);
+            globalThis.__mc.chart.setPaneRange(1, [20, 80]);
+        });
         await wait(200);
         const before = await paneRead();
         await panePage.mouse.move(paneAxisX, y);
@@ -810,27 +816,36 @@ try {
     const held = (d, key) => !moved(d, key);
     record(
         'a drag in the price pane gutter scales the price pane',
-        moved(inPrice, 'priceSpan') && held(inPrice, 'offsetX'),
+        moved(inPrice, 'priceSpan') && held(inPrice, 'lowerSpan') && held(inPrice, 'offsetX'),
         `price span ${inPrice.before.priceSpan.toFixed(2)} -> ${inPrice.after.priceSpan.toFixed(2)}, ` +
-        `offsetX held at ${inPrice.after.offsetX.toFixed(2)}`,
+        `offsetX held at ${inPrice.after.offsetX.toFixed(2)}, lower pane untouched`,
     );
-    // The one that matters: a lower pane's gutter must do *nothing*. Not scale the
-    // price chart, not scale itself, and not pan — a vertical drag that slid the
-    // series sideways would be a second gesture nobody asked for.
+    // The routing rule: the row under the pointer decides which pane owns the drag, so a
+    // drag beside the oscillator scales the oscillator — and provably not the price chart.
+    // The lower pane's whole reason to exist is that one historical spike would otherwise
+    // flatten recent bars with no way back.
     record(
-        'a drag in a lower pane gutter does nothing at all',
-        held(inLower, 'priceSpan') && held(inLower, 'lowerSpan') && held(inLower, 'offsetX')
-            && held(onSeparator, 'priceSpan') && held(onSeparator, 'offsetX'),
-        `lower gutter: price, lower pane and offsetX all unchanged; ` +
-        `separator at y=${paneGeom.separatorTop} also inert`,
+        'a drag in a lower pane gutter scales that pane and not the price pane',
+        moved(inLower, 'lowerSpan') && held(inLower, 'priceSpan') && held(inLower, 'offsetX'),
+        `lower span ${inLower.before.lowerSpan.toFixed(2)} -> ${inLower.after.lowerSpan.toFixed(2)}, ` +
+        `price span held at ${inLower.after.priceSpan.toFixed(2)}, offsetX held`,
     );
-    // The boundary has to be right, not merely "mostly right" — if the rows were
-    // computed too generously the price pane would lose its last few rows.
+    // The divider belongs to no pane, so a drag starting there does nothing at all. This
+    // is the boundary the routing rule has to get exactly right, and it is invisible in a
+    // screenshot because a pixel-wide band that does nothing looks identical to one that
+    // is not there.
     record(
-        'the last row above the divider still scales, so the boundary is exact',
-        moved(onLastRow, 'priceSpan') && held(onLastRow, 'offsetX'),
+        'a drag on the divider between two panes is inert',
+        held(onSeparator, 'priceSpan') && held(onSeparator, 'lowerSpan') && held(onSeparator, 'offsetX'),
+        `separator at y=${paneGeom.separatorTop}: price, lower pane and offsetX all unchanged`,
+    );
+    // Both edges of the boundary, because an off-by-one here is a whole row stolen from
+    // one pane and given to the other.
+    record(
+        'the rows either side of the divider belong to the right pane',
+        moved(onLastRow, 'priceSpan') && held(onLastRow, 'lowerSpan'),
         `y=${paneGeom.priceBottom - 3} scaled the price span to ` +
-        `${onLastRow.after.priceSpan.toFixed(2)}; the divider starts at y=${paneGeom.separatorTop}`,
+        `${onLastRow.after.priceSpan.toFixed(2)} and left the lower pane alone`,
     );
     record(
         'no page error escaped a pane handler',

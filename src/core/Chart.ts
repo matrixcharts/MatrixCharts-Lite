@@ -171,6 +171,7 @@ export class Chart {
      * mid-drag must not retroactively rescale a gesture already under way.
      */
     private priceAxisDrag: {
+        pane: number;
         pressY: number;
         paneHeight: number;
         baseLow: number;
@@ -194,8 +195,23 @@ export class Chart {
     private priceLines: ResolvedPriceLine[] = [];
     private markers: ResolvedMarker[] = [];
     private zones: PlacedZone[] = [];
-    /** Set by setPriceRange; null while the pane is free to fit the data. */
-    private lockedPriceRange: [number, number] | null = null;
+    /**
+     * The range each pane has been locked to, by pane index. Absent means that pane
+     * fits its own data.
+     *
+     * A map rather than an array because the pane count is not fixed: it changes with
+     * `panes.weights`, and an index-keyed array would need resizing on every such
+     * change. Entries for indices that no longer exist are pruned when the count drops,
+     * so shrinking the layout does not leave a range waiting to reappear if it is grown
+     * again.
+     *
+     * Pane 0's entry is what `setPriceRange` writes and what `autoScaleY` re-applies;
+     * every other entry is honoured where that pane's transform is built. The two are
+     * the same kind of state in two places only because pane 0's transform lives on the
+     * viewport — which the read API and the crosshair already use — while a lower pane's
+     * exists only in the pane table.
+     */
+    private lockedPaneRanges: Map<number, [number, number]> = new Map();
     /**
      * Reused each frame, so a log chart converts prices in place rather than
      * reallocating a full candle buffer on every animation frame.
@@ -451,8 +467,9 @@ export class Chart {
             // screen, which is what treating the whole gutter as the price axis did.
             if (this.isInPriceAxisGutter(event.clientX)) {
                 this.priceAxisDrag = null;
-                if (this.isWithinPricePaneRows(event.clientY)) {
-                    this.beginPriceAxisDrag(event.clientY);
+                const pane: number | null = this.paneAtClientY(event.clientY);
+                if (pane !== null) {
+                    this.beginPaneAxisDrag(pane, event.clientY);
                 } else {
                     this.isDragging = false;
                 }
@@ -502,55 +519,81 @@ export class Chart {
      * A drag that began on the divider is therefore inert, which is the only safe
      * answer for a band that is not part of any pane.
      */
-    private isWithinPricePaneRows(clientY: number): boolean {
-        const pane: PlotRect = this.pricePaneRect();
-        if (pane.height <= 0) return false;
+    /**
+     * The pane whose rows contain this client y, or `null` when the press is on a
+     * divider or outside every pane.
+     *
+     * Half-open per pane, `[pane.y, pane.y + pane.height)`, so a press on the pixel
+     * below a pane's last row is already outside it. That matters because `paneRects`
+     * leaves the `separatorHeight` band between two panes belonging to *neither* — the
+     * boundaries are snapped to whole pixels precisely so two panes cannot both claim a
+     * separator. A drag that begins on the divider is therefore inert, which is the only
+     * safe answer for a band that is not part of any pane.
+     *
+     * This is the routing rule: the gutter is shared by every pane, and the row under the
+     * pointer decides which one a vertical drag belongs to. A drag beside a MACD pane
+     * scales the MACD pane, and a price pane a hundred rows higher is not involved.
+     */
+    private paneAtClientY(clientY: number): number | null {
         const rect: DOMRect = this.canvasWrapper.getBoundingClientRect();
         const y: number = clientY - rect.top;
-        return y >= pane.y && y < pane.y + pane.height;
+        const rects: PlotRect[] = this.paneRects;
+        for (let index = 0; index < rects.length; index++) {
+            const pane: PlotRect = rects[index];
+            if (!(pane.height > 0)) continue;
+            if (y >= pane.y && y < pane.y + pane.height) return index;
+        }
+        return null;
     }
 
     /**
-     * Begins a price-axis drag, capturing the baseline it will be measured against.
+     * Begins a vertical drag of one pane's axis, capturing the baseline it is measured
+     * against.
      *
-     * The baseline is the pane's current range in scale space. A press is recorded
-     * even when the pane has no usable height or the chart has no vertical transform
-     * yet; in that case `beginPriceAxisDrag` leaves the drag null and the press falls
-     * through as an ordinary one, so a degenerate chart is inert rather than throwing
-     * on a pointer event.
+     * The baseline is that pane's current range in *scale* space — prices through the
+     * price scale for pane 0, the indicator's own values for anything else. Capturing it
+     * per pane rather than assuming pane 0 is what lets the same arithmetic serve both,
+     * since a linear pane's scale space is its value space and a log pane's is not.
+     *
+     * A press on a pane with no usable height or no transform yet leaves the drag null,
+     * so a degenerate chart is inert rather than throwing on a pointer event.
      */
-    private beginPriceAxisDrag(clientY: number): void {
+    private beginPaneAxisDrag(pane: number, clientY: number): void {
         this.priceAxisDrag = null;
         this.isDragging = false;
-        const pane: PlotRect = this.pricePaneRect();
-        if (!(pane.height > 0) || this.scaleY === 0) return;
-        const transform: VerticalTransform = { scaleY: this.scaleY, offsetY: this.offsetY };
-        const atTop: number = paneValueAt(transform, pane.y);
-        const atBottom: number = paneValueAt(transform, pane.y + pane.height);
+        const rect: PlotRect | undefined = this.paneRects[pane];
+        const transform: VerticalTransform | null = this.paneTransform(pane);
+        if (rect === undefined || !(rect.height > 0) || transform === null) return;
+        if (transform.scaleY === 0) return;
+        const atTop: number = paneValueAt(transform, rect.y);
+        const atBottom: number = paneValueAt(transform, rect.y + rect.height);
         this.priceAxisDrag = {
+            pane,
             pressY: clientY,
-            paneHeight: pane.height,
+            paneHeight: rect.height,
             baseLow: Math.min(atTop, atBottom),
             baseHigh: Math.max(atTop, atBottom),
         };
     }
 
     /**
-     * Maps the pointer's vertical travel onto a new price span and locks it.
+     * Maps the pointer's vertical travel onto a new span for the dragged pane, and locks
+     * that pane to it.
      *
      * Dragging *down* expands and dragging *up* compresses, one pane height of travel
-     * for a factor of two, measured from the press so the gesture is a function of
-     * its endpoints rather than of how many events it took to get there. The scale is
-     * applied about the centre of the range, which is the one point the gesture leaves
-     * alone — a drag is about the span, and hinging at the centre keeps that true
-     * wherever on the axis it was grabbed.
+     * for a factor of two, measured from the press so the gesture is a function of its
+     * endpoints rather than of how many events it took to get there. The scale is applied
+     * about the centre of the range, which is the one point the gesture leaves alone — a
+     * drag is about the span, and hinging at the centre keeps that true wherever on the
+     * axis it was grabbed.
      *
-     * The arithmetic is in scale space, so a log axis compresses by a ratio of log
-     * rather than by a difference of price. That is the same reason `autoScaleY`
+     * The arithmetic is in scale space, so pane 0's log axis compresses by a ratio of
+     * log rather than by a difference of price. That is the same reason `autoScaleY`
      * applies its padding there: ten percent of the visible span has to mean the same
-     * thing on either axis, or a log pane's headroom would be in currency units.
+     * thing on either axis, or a log pane's headroom would be in currency units. An
+     * indicator pane is linear and comes through `paneValueToScale` unchanged.
      */
-    private updatePriceAxisDrag(clientY: number): void {
+    private updatePaneAxisDrag(clientY: number): void {
         const drag = this.priceAxisDrag;
         if (drag === null) return;
         // Nothing happens until the press has actually travelled. Without this a
@@ -564,17 +607,17 @@ export class Chart {
         const factor: number = Math.min(AXIS_DRAG_MAX_FACTOR, Math.max(AXIS_DRAG_MIN_FACTOR, travel));
         const centre: number = (drag.baseLow + drag.baseHigh) / 2;
         const span: number = (drag.baseHigh - drag.baseLow) * factor;
-        const scale: PriceScale = this.priceScale();
-        const low: number = fromScaleSpace(centre - span / 2, scale);
-        const high: number = fromScaleSpace(centre + span / 2, scale);
+        const pane: number = drag.pane;
+        const low: number = this.paneScaleToValue(pane, centre - span / 2);
+        const high: number = this.paneScaleToValue(pane, centre + span / 2);
         // The clamp above is on the multiplier, so this can still be reached from a
         // range that was already very wide or very narrow. A drag ignores a result it
         // cannot draw rather than throwing: the same contract `setPriceRange` enforces,
         // reached by returning instead, because a pointer move has no caller to report
         // to and throwing here would take the whole gesture down mid-drag.
         if (!Number.isFinite(low) || !Number.isFinite(high) || high <= low) return;
-        if (scale === 'log' && low <= 0) return;
-        this.adoptLockedPriceRange([low, high]);
+        if (pane === PRICE_PANE && this.priceScale() === 'log' && low <= 0) return;
+        this.adoptLockedPaneRange(pane, [low, high]);
     }
 
     /**
@@ -617,7 +660,7 @@ export class Chart {
         // After the pinch branch, so two pointers always mean pinch. A press on the
         // axis is a single-pointer gesture and the second finger already dropped it.
         if (this.priceAxisDrag !== null) {
-            this.updatePriceAxisDrag(event.clientY);
+            this.updatePaneAxisDrag(event.clientY);
             return;
         }
         if (!this.isDragging) return;
@@ -742,6 +785,15 @@ export class Chart {
         this.resolvedOptions = nextResolved;
         this.candleColors = nextColors;
         if (nextOverlays !== null) this.overlays = nextOverlays;
+        // A pane that no longer exists cannot hold a range, and a lock left behind for
+        // one would silently come back if the layout were grown again. Dropped with the
+        // pane rather than kept, so what is locked is always what is on screen.
+        const nextPaneCount: number = nextResolved.panes.weights.length;
+        if (nextPaneCount !== previous.panes.weights.length) {
+            for (const index of Array.from(this.lockedPaneRanges.keys())) {
+                if (index >= nextPaneCount) this.lockedPaneRanges.delete(index);
+            }
+        }
 
         // Switching a gap off, or between collapsed and proportional, changes every
         // slot after the first break, so the table is rebuilt here. Not per frame and
@@ -1396,37 +1448,91 @@ export class Chart {
         if (scale === 'log' && minimum <= 0) {
             throw new Error(`MatrixCharts: a log price scale cannot show a range starting at ${minimum}.`);
         }
-        this.adoptLockedPriceRange([minimum, maximum]);
+        this.adoptLockedPaneRange(PRICE_PANE, [minimum, maximum]);
     }
 
     /**
-     * Takes ownership of the price pane's vertical scale at a given range.
+     * Sets the range a pane shows, and locks that pane to it.
      *
-     * The one place a price range becomes the locked one, so a caller's
-     * `setPriceRange` and a drag of the price axis cannot disagree about what
-     * "locked" means — in particular about `autoScale`, which has to go false in
-     * *both* option objects. Writing only the resolved copy would let the next
-     * unrelated `applyOptions` rebuild the resolved snapshot from the explicit pair
-     * and hand the pane back to the auto-scaler, which is the same half-sync that
-     * made `options().timeScale.barSpacing` disagree with the bars.
+     * The general form of `setPriceRange`, and the one the price axis drag uses for
+     * whichever pane the pointer was over. Pane 0's values are prices and go through the
+     * price scale, so a log chart rejects a non-positive low; every other pane's values
+     * are indicator readings and are taken as they are, because that pane is drawn
+     * linear whatever the price pane is set to.
+     */
+    public setPaneRange(pane: number, range: readonly [number, number]): void {
+        this.assertAlive();
+        const index: number = this.requirePaneIndex(pane, 'setPaneRange');
+        if (!Array.isArray(range) || range.length !== 2) {
+            throw new Error('MatrixCharts: setPaneRange expects [minimum, maximum].');
+        }
+        const minimum: number = range[0];
+        const maximum: number = range[1];
+        if (!Number.isFinite(minimum) || !Number.isFinite(maximum)) {
+            throw new Error('MatrixCharts: setPaneRange expects two finite values.');
+        }
+        if (maximum <= minimum) {
+            throw new Error(`MatrixCharts: setPaneRange expects a maximum above its minimum, got [${minimum}, ${maximum}].`);
+        }
+        if (index === PRICE_PANE && this.priceScale() === 'log' && minimum <= 0) {
+            throw new Error(`MatrixCharts: a log price scale cannot show a range starting at ${minimum}.`);
+        }
+        this.adoptLockedPaneRange(index, [minimum, maximum]);
+    }
+
+    /** A pane index that exists, or the documented error naming the call that asked. */
+    private requirePaneIndex(pane: number, caller: string): number {
+        if (!Number.isInteger(pane) || pane < 0 || pane >= this.paneLayout.rects.length) {
+            throw new Error(
+                `MatrixCharts: ${caller} was given pane ${pane}; this chart has `
+                + `${this.paneLayout.rects.length} pane${this.paneLayout.rects.length === 1 ? '' : 's'}.`,
+            );
+        }
+        return pane;
+    }
+
+    /**
+     * Takes ownership of one pane's vertical scale at a given range.
+     *
+     * The one place a range becomes a locked one, so a caller's `setPriceRange`, a
+     * caller's `setPaneRange` and a drag of the axis cannot disagree about what "locked"
+     * means — in particular about `autoScale`, which has to go false in *both* option
+     * objects. Writing only the resolved copy would let the next unrelated
+     * `applyOptions` rebuild the resolved snapshot from the explicit pair and hand the
+     * pane back to the auto-scaler, which is the same half-sync that made
+     * `options().timeScale.barSpacing` disagree with the bars.
      *
      * It applies the range and broadcasts the frame rather than going through
      * `updateViewport`, because a vertical change moves no bar: the full path would
      * re-slice the visible candles and re-upload them for a change that touches
      * neither, and this runs on every pointermove of a drag. What it must not skip is
      * the broadcast — see `emitViewportFrame`. The lock is still the single source of
-     * truth either way, since `autoScaleY` re-applies this same range on every later
-     * frame; this is the fast path into the state that path reads, not a second source
-     * of truth beside it.
+     * truth either way, since the fit re-applies this same range on every later frame;
+     * this is the fast path into the state that path reads, not a second source of
+     * truth beside it.
      */
-    private adoptLockedPriceRange(range: readonly [number, number]): void {
-        this.lockedPriceRange = [range[0], range[1]];
-        this.resolvedOptions.priceScale.autoScale = false;
-        this.explicitOptions.priceScale = {
-            ...(this.explicitOptions.priceScale ?? {}),
-            autoScale: false,
-        };
-        this.applyPriceRange(range);
+    private adoptLockedPaneRange(pane: number, range: readonly [number, number]): void {
+        this.lockedPaneRanges.set(pane, [range[0], range[1]]);
+        // Only pane 0's lock touches the options, and only pane 0's lock needs to.
+        //
+        // A lower pane's lives in the map, which `applyOptions` does not rebuild, so it
+        // survives a theme change for free. Pane 0's has to go false in *both* option
+        // objects, because `applyOptions` rebuilds the resolved snapshot from the
+        // explicit pair — writing only the resolved copy would let the next unrelated
+        // `applyOptions` hand the price pane back to the auto-scaler, which is the same
+        // half-sync that made `options().timeScale.barSpacing` disagree with the bars.
+        if (pane === PRICE_PANE) {
+            this.resolvedOptions.priceScale.autoScale = false;
+            this.explicitOptions.priceScale = {
+                ...(this.explicitOptions.priceScale ?? {}),
+                autoScale: false,
+            };
+            // Pane 0's transform is the viewport's, so it has to be moved here. A lower
+            // pane's is built in `computePaneLayout` from the lock, which
+            // `emitViewportFrame` is about to call — so for those the lock alone is the
+            // whole update.
+            this.applyPriceRange(range);
+        }
         this.emitViewportFrame();
         // The last-price tag and the price lines are positioned from the pane layout,
         // so they move with the broadcast above and are re-emitted for the same reason
@@ -1444,12 +1550,30 @@ export class Chart {
      */
     public fitPriceRange(): void {
         this.assertAlive();
-        this.lockedPriceRange = null;
-        this.resolvedOptions.priceScale.autoScale = true;
-        this.explicitOptions.priceScale = {
-            ...(this.explicitOptions.priceScale ?? {}),
-            autoScale: true,
-        };
+        this.fitPaneRange(PRICE_PANE);
+    }
+
+    /**
+     * Unlocks one pane and lets it fit its own values again.
+     *
+     * The counterpart to `setPaneRange`, and the only way back from a drag. A pane
+     * nobody can un-drag is a pane a single historical spike can flatten for good, which
+     * is the reason the gesture exists in the first place.
+     */
+    public fitPaneRange(pane: number): void {
+        this.assertAlive();
+        const index: number = this.requirePaneIndex(pane, 'fitPaneRange');
+        this.lockedPaneRanges.delete(index);
+        // Only pane 0's release touches the options, for the same reason its lock did.
+        // Releasing a MACD pane leaves the price pane's auto-scale exactly as it was,
+        // which is the whole point of the locks being per pane.
+        if (index === PRICE_PANE) {
+            this.resolvedOptions.priceScale.autoScale = true;
+            this.explicitOptions.priceScale = {
+                ...(this.explicitOptions.priceScale ?? {}),
+                autoScale: true,
+            };
+        }
         this.updateViewport();
     }
 
@@ -1576,8 +1700,16 @@ export class Chart {
         if (this.paneLayout.rects[index].height <= 0) return null;
         const transform: VerticalTransform = this.paneLayout.transforms[index];
         const rect: PlotRect = this.paneLayout.rects[index];
-        const top: number = paneValueAt(transform, rect.y);
-        const bottom: number = paneValueAt(transform, rect.y + rect.height);
+        // Through the pane's own conversion. Pane 0 is drawn on the price scale, so on a
+        // log chart its scale-space values are logs and reading them out raw reported
+        // `log(100)` where a caller asked for `100` — the same class of mistake as
+        // `getPriceRange` made, one level along, and it survived because the pane case was
+        // only ever exercised on a linear chart.
+        const top: number = this.paneScaleToValue(index, paneValueAt(transform, rect.y));
+        const bottom: number = this.paneScaleToValue(
+            index,
+            paneValueAt(transform, rect.y + rect.height),
+        );
         return [Math.min(top, bottom), Math.max(top, bottom)];
     }
 
@@ -2067,12 +2199,18 @@ export class Chart {
     }
 
     private autoScaleY(): void {
-        // Locked panes keep whatever range they were given. This is the condition the
-        // option exists to introduce, and it is why the fit is a method rather than
+        // A locked price pane keeps whatever range it was given. This is the condition
+        // the option exists to introduce, and it is why the fit is a method rather than
         // inlined into the viewport update: a fit that runs unconditionally every
         // frame cannot be skipped, and therefore cannot be locked.
-        if (!this.resolvedOptions.priceScale.autoScale && this.lockedPriceRange !== null) {
-            this.applyPriceRange(this.lockedPriceRange);
+        //
+        // Pane 0 only. A lower pane's transform is built in `computePaneLayout`, which
+        // applies that pane's own lock — the state is per pane, but it is read in two
+        // places because pane 0's transform lives on the viewport and a lower pane's
+        // does not.
+        const locked: [number, number] | undefined = this.lockedPaneRanges.get(PRICE_PANE);
+        if (this.paneLockHonoured(PRICE_PANE) && locked !== undefined) {
+            this.applyPriceRange(locked);
             return;
         }
         if (this.displayedCandles.length === 0) return;
@@ -2156,6 +2294,52 @@ export class Chart {
     }
 
     /**
+     * A pane's value to the number its affine transform actually operates on.
+     *
+     * Pane 0 measures price, so it goes through the price scale and a log chart gets a
+     * log. Every other pane measures something that is not a price — an RSI, a MACD
+     * histogram, volume — and stays linear whatever the price pane is set to, because a
+     * bounded oscillator has no reading on a log axis and a tradable increment means
+     * nothing on one. That asymmetry is the reason this is a function of the pane index
+     * and not a single global conversion: applying the price scale to an indicator pane
+     * would be the same category of mistake as fitting an RSI against the price range,
+     * which is the thing panes exist to prevent.
+     */
+    private paneValueToScale(pane: number, value: number): number {
+        return pane === PRICE_PANE ? toScaleSpace(value, this.priceScale()) : value;
+    }
+
+    /** The inverse of `paneValueToScale`, for reading a range back out. */
+    private paneScaleToValue(pane: number, scaled: number): number {
+        return pane === PRICE_PANE ? fromScaleSpace(scaled, this.priceScale()) : scaled;
+    }
+
+    /**
+     * Whether a pane's locked range should be applied rather than a fit.
+     *
+     * The lock map is authoritative for every pane. `priceScale.autoScale` is an
+     * *additional* gate on pane 0 alone, because it is the price scale's option and the
+     * price scale is pane 0 — gating a MACD pane on it would mean that stretching a
+     * volume pane read as "stop auto-fitting the price chart", which is a different
+     * statement from the one the caller made.
+     *
+     * The gate keeps what it already did for the price pane: a pane with no lock still
+     * fits even while `autoScale` is false, so the option is not a way to freeze a pane
+     * at a range nobody chose.
+     */
+    private paneLockHonoured(pane: number): boolean {
+        if (!this.lockedPaneRanges.has(pane)) return false;
+        return pane !== PRICE_PANE || !this.resolvedOptions.priceScale.autoScale;
+    }
+
+    /** The transform a pane is currently drawn with, whichever of the two tables holds it. */
+    private paneTransform(pane: number): VerticalTransform | null {
+        if (pane === PRICE_PANE) return { scaleY: this.scaleY, offsetY: this.offsetY };
+        const transform: VerticalTransform | undefined = this.paneLayout.transforms[pane];
+        return transform ?? null;
+    }
+
+    /**
      * The layout for the current frame: one rect per declared pane, and a
      * vertical transform for each.
      *
@@ -2180,6 +2364,26 @@ export class Chart {
                 // The price scale lives on the viewport, which the read API and the
                 // crosshair already use; the panes table only has to agree with it.
                 transforms.push({ scaleY: this.scaleY, offsetY: this.offsetY });
+                empty.push(false);
+                continue;
+            }
+            // A locked pane is drawn at the range its owner chose, not at a fit. This is
+            // the whole point of letting a lower pane be dragged: one historical spike in
+            // a volume or MACD pane would otherwise flatten the recent bars permanently,
+            // and there is no other way back from that.
+            //
+            // Padding is zero, not the fit's ten percent. A fit may add headroom because
+            // nobody chose those bounds; a locked range is a statement about exactly
+            // which values the pane should show, and quietly widening it by a tenth on
+            // each side would make the drag's own arithmetic disagree with the result.
+            const locked: [number, number] | undefined = this.lockedPaneRanges.get(index);
+            if (this.paneLockHonoured(index) && locked !== undefined) {
+                transforms.push(fitPaneTransform(
+                    rects[index],
+                    this.paneValueToScale(index, locked[0]),
+                    this.paneValueToScale(index, locked[1]),
+                    0,
+                ));
                 empty.push(false);
                 continue;
             }
