@@ -6,7 +6,35 @@ records what moved and why, per release.
 
 ## Unreleased
 
-Nothing yet.
+### Fixed
+
+**A live feed that crosses a session break kept up with it.** The slot table is the one
+place that knows where the whitespace is, and it was rebuilt on `setData`, on
+`applyOptions` and on the replace path — but not when bars were appended. So on a feed the
+table went on describing the series as it was at the first snapshot, and everything that
+reads it clamps to its length:
+
+- the visible-window cull stopped at the last bar the table knew about, so `getVisibleLogicalRange()`
+  reported `48..120 of 124` while the array went on growing;
+- the axis ticks stopped one bar *later* rather than one bar earlier, because
+  `barsBeforeSlot` answers "one past the last bar whose left edge is before this slot" and
+  a slot past the end of a stale table lands it one bar too far — the surplus ticks then
+  bunched against the right-hand edge;
+- with no breaks in the series at all, the table was `null` rather than stale, so the
+  chart silently fell out of slot space and drew in ordinals, putting the new bars off
+  the right side of the plot.
+
+The shift that follows the live edge was also measured in bars, which is the same number
+only while bars are adjacent. A chart following the feed drifted by the whole of each
+break, and a panned chart saw the bar under the crosshair slide out from under the
+pointer, by half a session for every close it lived through. Both are now in slots, and
+the follow case recomputes the live edge from the rebuilt table rather than shifting by
+the width that was added, so it self-corrects after a resize instead of compounding.
+
+The rebuild runs only when bars were appended, never for a bare `updateLast`. The table is
+O(n) in the length of the series and a live feed calls `updateLast` on every tick, so
+rebuilding a million-bar table at ten hertz to accommodate a price change that moved no
+timestamp would have been a far worse defect than the one being fixed.
 
 ## v1.0.1
 

@@ -2225,6 +2225,15 @@ export class Chart {
         }
 
         const firstNewIndex: number = this.candlePyramid.candleCount;
+        // The anchor bar's slot under the table as it stands *now*, captured before the
+        // append. Afterwards the same ordinal names a different place, because the table
+        // has been rebuilt to describe a longer series — so "where was this bar" has to be
+        // asked of the old table with the old ordinal, and the answer is what tells us how
+        // far the view has to move to keep that bar still.
+        const anchorIndex: number = firstNewIndex - 1;
+        const anchorSlotBefore: number = anchorIndex >= 0
+            ? slotAtIndex(this.slotOffsets, anchorIndex)
+            : 0;
         for (let index: number = 0; index < appends.length; index++) {
             const candle: CandleData = appends[index];
             this.candlePyramid.append(
@@ -2243,29 +2252,46 @@ export class Chart {
         if (overflow > 0) {
             this.candlePyramid.trimStart(overflow);
             this.candleTimes.splice(0, overflow);
-            if (!shouldFollow) {
-                this.offsetX = Math.min(this.offsetX + this.scaleX * overflow, 0);
-            }
         }
-        if (shouldFollow && appends.length > 0) {
-            if (overflow > 0) {
+
+        // The slot table is rebuilt here, and this line is the whole of a shipped defect.
+        // It ran on `setData`, on `applyOptions` and on the replace branch, and not here,
+        // so on a live feed the table went on describing the series as it was *before* the
+        // append. Three things read it and all three clamp to its length: the live-edge
+        // shift, the visible-window cull, and the axis ticks. A feed that appended its
+        // first session break therefore drew the new bars in ordinal space, reported a
+        // visible range that stopped short of them, and bunched its last axis label
+        // against the edge, with the data sitting in the array the whole time.
+        //
+        // Two details are load-bearing. It runs *after* the append and the trim, because
+        // it reads `candleTimes`. And it runs only when bars were appended, never for a
+        // bare `updateLast`: the table is O(n) in the length of the series, and a live
+        // feed calls `updateLast` on every tick, so rebuilding a million-bar table at ten
+        // hertz to accommodate a price change that moved no timestamp would be a far worse
+        // defect than the one being fixed.
+        if (appends.length > 0) this.rebuildSlots();
+
+        if (appends.length > 0) {
+            if (shouldFollow) {
+                // Park the newest bar at the live edge. Recomputed from the table rather
+                // than shifted by the width that was added, because the two are only
+                // equivalent while the view was already at the edge, and this is the same
+                // expression that self-corrects after a resize instead of compounding.
                 this.offsetX = liveEdgeOffsetX(
                     plotRight(this.viewport),
                     this.slotOffsets,
                     this.candlePyramid.candleCount,
                     this.scaleX,
                 );
-            } else {
-                // Shifted in slots, not in bars. The first bar of a new session sits
-                // more than one slot after its predecessor, so shifting by the bar
-                // count leaves the pinned bar half a slot short of where it was - a
-                // slow drift, one half-slot per session, that only shows up in a feed
-                // left running across a close. — a slow drift,
-            // one half-slot per session, that only shows up in a feed left running
-            // across a close.
+            } else if (anchorIndex >= 0) {
+                // A panned chart keeps the bar it is looking at where it is, which is the
+                // anchor's slot before and after. Measured in bars this is the same number
+                // only while bars are adjacent; crossing a break it comes up short by the
+                // whole of the gap, so a panned chart saw the bar under the crosshair slide
+                // out from under the pointer, by half a session for every close it lived
+                // through.
                 this.offsetX -= this.scaleX * (
-                    slotAtIndex(this.slotOffsets, this.candleTimes.length - 1)
-                    - slotAtIndex(this.slotOffsets, firstNewIndex - 1)
+                    slotAtIndex(this.slotOffsets, anchorIndex - overflow) - anchorSlotBefore
                 );
             }
         }

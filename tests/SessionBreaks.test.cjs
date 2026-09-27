@@ -14,6 +14,7 @@ const assert = require('node:assert/strict');
 const { test } = require('node:test');
 
 const { createHeadlessChart } = require('./support/headlessChart.cjs');
+const { ChartFeedController } = require('../.test-build/feed/ChartFeedController.js');
 const {
     computeSlotOffsets,
     resolveSessionBreaks,
@@ -41,8 +42,16 @@ function sessionCandles(sessions = 3, perSession = 50) {
     return out;
 }
 
-/** The slot table `Chart.rebuildSlots` builds, mirrored option for option. */
-function slotTable(candles, { mode = 'proportional', enabled = true } = {}) {
+/**
+ * The slot table `Chart.rebuildSlots` builds, mirrored option for option.
+ *
+ * The mode is passed explicitly at every call site rather than defaulted here, because the
+ * chart's own default is `collapsed` and a helper that quietly disagrees with it produces
+ * a wrong expectation that looks like a right answer: the failure is then an offset of
+ * exactly the difference between the two modes, which reads as a rendering bug in the code
+ * under test rather than as a fixture mistake. That cost two debugging detours.
+ */
+function slotTable(candles, { mode, enabled = true } = {}) {
     const times = candles.map((candle) => candle.time);
     if (!enabled) return null;
     const resolved = resolveSessionBreaks(times, { mode });
@@ -70,7 +79,7 @@ test('fitContent shows every bar, gaps included', () => {
     // wider than the plot and the overflow hangs off the left. The result is not a chart
     // the caller can scroll to: a fifth of the data is simply not there.
     const candles = sessionCandles();
-    const slots = slotTable(candles);
+    const slots = slotTable(candles, { mode: 'proportional' });
     const harness = chartWith(candles, { timeScale: { sessionBreaks: { mode: 'proportional' } } });
     try {
         harness.chart.fitContent();
@@ -123,7 +132,7 @@ test('the cull keeps the bar at the left edge of the plot', () => {
     // which is why the aggregated levels are covered by the two tests below instead.
     for (const [sessions, perSession] of [[2, 50], [2, 100], [3, 50]]) {
         const candles = sessionCandles(sessions, perSession);
-        const slots = slotTable(candles);
+        const slots = slotTable(candles, { mode: 'proportional' });
         const harness = chartWith(candles, { timeScale: { sessionBreaks: { mode: 'proportional' } } });
         try {
             harness.chart.fitContent();
@@ -158,7 +167,7 @@ test('candles are drawn at their own slot, not at an ordinal wearing a slot labe
     // were a slot. Each candle drifted left by the sum of the breaks before it, so the
     // error grows the further right you look and is worst exactly where the gaps are.
     const candles = sessionCandles();
-    const slots = slotTable(candles);
+    const slots = slotTable(candles, { mode: 'proportional' });
     const harness = chartWith(candles, { timeScale: { sessionBreaks: { mode: 'proportional' } } });
     try {
         harness.chart.fitContent();
@@ -195,7 +204,7 @@ test('candles are drawn at their own slot, not at an ordinal wearing a slot labe
 
 test('an overlay lands on the candle it annotates, at the aggregated level', () => {
     const candles = sessionCandles();
-    const slots = slotTable(candles);
+    const slots = slotTable(candles, { mode: 'proportional' });
     // Overlays are registered by method rather than by option, so this is the call a
     // caller makes rather than one the constructor accepts.
     const harness = createHeadlessChart({ timeScale: { sessionBreaks: { mode: 'proportional' } } });
@@ -254,6 +263,332 @@ test('a series with breaks disabled takes the index path end to end', () => {
     }
 });
 
+test('appending across a session break draws the new bars and keeps following', () => {
+    // A live feed is the one path that mutates an existing series rather than replacing
+    // it, and it is the one path that never rebuilt the slot table: `rebuildSlots` ran on
+    // `setData`, on `applyOptions` and on the *replace* branch, and not on append. So the
+    // table went on describing the series as it was before the append, and three things
+    // read it — the live-edge shift, the visible-window cull, and the axis ticks. All
+    // three clamp to the table's length, so all three quietly stopped at the last bar
+    // that existed when the data was last replaced: the new bars were in the array and
+    // off the screen, the cull reported a visible range that stopped short of them, and
+    // the axis drew its last label one bar early and bunched it against the edge.
+    //
+    // Reproduced with a proportional break so the gap is wide enough that a slot-space
+    // answer and an index-space one cannot be confused for each other.
+    const first = sessionCandles(1, 50);
+    const gapHours = 17;
+    const resumeAt = first[first.length - 1].time + gapHours * 60 * MINUTE;
+    const second = [];
+    for (let i = 0; i < 50; i++) {
+        const close = 100 + Math.sin(i / 5) * 3;
+        second.push({
+            time: resumeAt + i * MINUTE, open: close, high: close + 0.5, low: close - 0.5, close, volume: 10,
+        });
+    }
+    const all = first.concat(second);
+    const slots = slotTable(all, { mode: 'proportional' });
+    const lastBar = all.length - 1;
+
+    const harness = createHeadlessChart({ timeScale: { sessionBreaks: { mode: 'proportional' } } });
+    try {
+        harness.chart.setData(first);
+        harness.flush();
+        harness.chart.appendBatch(second);
+        harness.flush();
+
+        assert.equal(harness.chart.getCandleCount(), all.length, 'the bars did not arrive');
+
+        // 1. The cull must see the new bars. It asks the table, so a stale table stops it
+        //    short of them however many the array holds.
+        const range = harness.chart.getVisibleLogicalRange();
+        assert.ok(
+            range.to > first.length,
+            `the visible range stops at ${range.to}, before the appended bars at ${first.length}..${lastBar}`,
+        );
+
+        // 2. And they must actually be drawn, at their own slots.
+        const xs = drawnX(harness.dataRenderer);
+        const lastSlot = slotAtIndex(slots, lastBar);
+        assert.ok(
+            Math.abs(xs[xs.length - 1] - lastSlot) < 1e-6,
+            `the last candle is at slot ${xs[xs.length - 1]}, its bar is at ${lastSlot}`,
+        );
+        // The break must be a gap and not a tear: the drawn x's have to clear the whole of
+        // it, which they cannot if the appended bars are placed in index space.
+        const lastOfFirst = slotAtIndex(slots, first.length - 1);
+        const firstOfSecond = slotAtIndex(slots, first.length);
+        assert.ok(
+            xs[xs.length - 1] >= firstOfSecond,
+            'the appended bars were drawn left of the break they follow',
+        );
+        assert.ok(firstOfSecond - lastOfFirst > 1, 'the fixture has no gap to cross');
+
+        // 3. The chart was following the live edge before the append, so it must still be
+        //    parked at it — half a bar inside the plot's right edge, not where the stale
+        //    table said the old last bar was.
+        const spacing = harness.chart.getBarSpacing();
+        const lastX = harness.chart.indexToCoordinate(lastBar);
+        const plotRight = 1200;
+        assert.ok(
+            Math.abs(lastX - (plotRight - 0.5 * spacing)) < 1e-6,
+            `the live edge is at ${lastX}, expected ${plotRight - 0.5 * spacing}`,
+        );
+        assert.equal(harness.chart.isAtRealtime(), true, 'the chart stopped following the live edge');
+    } finally {
+        harness.dispose();
+    }
+});
+
+test('a panned chart holds its bars still when a session break is appended', () => {
+    // The other half of the same branch. A chart that has been panned off the live edge
+    // keeps the bars it is looking at where they are, and the shift that does that was
+    // measured in bars while the axis is in slots — so a pinned bar moves by half a gap
+    // every time a session closes underneath a feed left running.
+    const first = sessionCandles(1, 50);
+    const resumeAt = first[first.length - 1].time + 17 * 60 * MINUTE;
+    const second = [];
+    for (let i = 0; i < 50; i++) {
+        const close = 100 + Math.sin(i / 5) * 3;
+        second.push({
+            time: resumeAt + i * MINUTE, open: close, high: close + 0.5, low: close - 0.5, close, volume: 10,
+        });
+    }
+    const all = first.concat(second);
+    const slots = slotTable(all, { mode: 'proportional' });
+
+    const harness = createHeadlessChart({ timeScale: { sessionBreaks: { mode: 'proportional' } } });
+    try {
+        harness.chart.setData(first);
+        harness.flush();
+        // Pan so the live edge latch is off. Dragging left moves the view towards older
+        // bars, which is the direction that leaves the newest bar off the right edge.
+        harness.drag(600, 300, 300, 300);
+        harness.flush();
+        assert.equal(harness.chart.isAtRealtime(), false, 'the pan did not take, so this proves nothing');
+        const before = harness.chart.indexToCoordinate(20);
+
+        harness.chart.appendBatch(second);
+        harness.flush();
+
+        const after = harness.chart.indexToCoordinate(20);
+        assert.ok(
+            Math.abs(after - before) < 1e-6,
+            `bar 20 moved from x ${before} to ${after} when a session break was appended`,
+        );
+        // And the break is still honoured for the bar that now precedes it.
+        assert.ok(slotAtIndex(slots, first.length) - slotAtIndex(slots, first.length - 1) > 1);
+    } finally {
+        harness.dispose();
+    }
+});
+
+/**
+ * A feed source whose every message is asked for, so a session break lands on a bar the
+ * test chose rather than on whichever one a timer happened to reach.
+ *
+ * A real `MockCandleSource` is the wrong tool here for the same reason a wall clock is:
+ * the interesting event is a single bar crossing a 17-hour gap, and a timer makes that a
+ * race. `MockCandleSource` has its own tests; what is untested here is whether the chart
+ * keeps up with what a feed hands it.
+ */
+class ScriptedSource {
+    constructor(barTimes) {
+        this.times = barTimes;
+        this.listeners = new Set();
+        this.sequence = 0;
+        this.started = false;
+    }
+
+    get state() {
+        return this.started ? 'connected' : 'idle';
+    }
+
+    subscribe(onMessage) {
+        this.listeners.add(onMessage);
+        return () => this.listeners.delete(onMessage);
+    }
+
+    start() {
+        this.started = true;
+    }
+
+    stop() {
+        this.started = false;
+    }
+
+    emit(message) {
+        this.sequence += 1;
+        for (const listener of this.listeners) listener({ ...message, sequence: this.sequence });
+    }
+
+    /** The opening snapshot: every bar up to and including `count`. */
+    snapshot(count) {
+        this.emit({ type: 'snapshot', candles: this.times.slice(0, count).map(candleAt) });
+    }
+
+    /** One append of the bars from `from` to `to`, exclusive. */
+    append(from, to) {
+        this.emit({ type: 'append', candles: this.times.slice(from, to).map(candleAt) });
+    }
+}
+
+const candleAt = (time) => {
+    const close = 100 + Math.sin(time / 3.6e6) * 3;
+    return { time, open: close, high: close + 0.5, low: close - 0.5, close, volume: 10 };
+};
+
+test('a feed that crosses a session break on its own keeps the chart with it', () => {
+    // The reported symptom, on the real feed wiring: a tape running across a close, the
+    // data array growing, the newest bars on no screen. The two tests above drive
+    // `appendBatch` directly, which is the same chart path but leaves the controller and
+    // the message shapes untested — and the controller is what a caller runs.
+    //
+    // The break is on bar 12, so the snapshot ends four bars short of it and the first
+    // append is what introduces it. That ordering is the whole defect: the series that
+    // existed when the table was last built contained no break at all, so the table was
+    // null, and nothing rebuilt it when the first one appeared.
+    const times = [];
+    let cursor = SESSION_OPEN;
+    for (let bar = 0; bar < 40; bar++) {
+        if (bar === 12 || bar === 26) cursor += 17 * 60 * MINUTE;
+        times.push(cursor);
+        cursor += MINUTE;
+    }
+
+    const harness = createHeadlessChart({ timeScale: { sessionBreaks: { mode: 'proportional' } } });
+    const source = new ScriptedSource(times);
+    const controller = new ChartFeedController(harness.chart, source);
+    try {
+        source.snapshot(8);
+        harness.flush();
+        assert.equal(harness.chart.getCandleCount(), 8, 'the snapshot did not land');
+
+        // Bar 8..12 is still the first session; bar 12 opens the second.
+        source.append(8, 12);
+        harness.flush();
+        assert.equal(harness.chart.getCandleCount(), 12);
+        assert.ok(harness.chart.isAtRealtime(), 'the chart stopped following before the break');
+
+        source.append(12, 30);
+        harness.flush();
+
+        const count = harness.chart.getCandleCount();
+        assert.equal(count, 30, 'the bars did not arrive');
+        // Candles, not timestamps: the helper reads `candle.time`, and handing it a list
+        // of numbers yields a table of NaNs, which resolves to the identity rather than
+        // failing — a wrong expectation that looks like a right answer.
+        const slots = slotTable(times.slice(0, count).map(candleAt), { mode: 'proportional' });
+        assert.ok(slots !== null, 'the series now has breaks');
+
+        // The live edge is on the newest bar, not on the last bar the table knew about.
+        const range = harness.chart.getVisibleLogicalRange();
+        assert.ok(range.to > count - 3, `the visible range stops at ${range.to} of ${count} bars`);
+        assert.equal(harness.chart.isAtRealtime(), true, 'the chart stopped following');
+
+        // And the newest bar is drawn at its own slot, not at its ordinal — the two differ
+        // by the whole of every break before it, which is why ordinals looked like the
+        // candles had been thrown off the right-hand edge.
+        const xs = drawnX(harness.dataRenderer);
+        const lastSlot = slotAtIndex(slots, count - 1);
+        assert.ok(
+            Math.abs(xs[xs.length - 1] - lastSlot) < 1e-6,
+            `the newest candle is at slot ${xs[xs.length - 1]}, its bar is at ${lastSlot}`,
+        );
+        assert.ok(
+            lastSlot - (count - 1) > 1,
+            'the drawing is not offset, so this fixture is not exercising the break',
+        );
+        for (let i = 1; i < xs.length; i++) {
+            assert.ok(xs[i] > xs[i - 1], `x went backwards at ${i}`);
+        }
+    } finally {
+        controller.dispose();
+        harness.dispose();
+    }
+});
+
+test("the demo's own shape: a stale table, not a missing one", () => {
+    // The configuration that was reported, and it is a different failure from the test
+    // above. Here the snapshot is 120 bars with a session break every 30, so the table is
+    // *not* null when the feed starts — it is merely 120 entries long and describes the
+    // series as it was at the first snapshot. That distinction decides the symptom:
+    //
+    // - Every read of the table clamps to its length, so the visible-window cull stopped
+    //   at exactly bar 120 and reported `visible 48..120 of 124` however many bars the
+    //   array went on to hold.
+    // - The axis ticks stopped one bar later rather than one bar earlier, because
+    //   `barsBeforeSlot` answers "one past the last bar whose left edge is before this
+    //   slot", and a slot past the end of a stale table lands it one bar too far. Those
+    //   surplus ticks then had nowhere to go but the right-hand edge, which is where the
+    //   bunched labels came from.
+    //
+    // With a null table instead, everything falls back to ordinals and the candles simply
+    // appear off the right side. Two different-looking symptoms, one missing line.
+    const times = [];
+    let cursor = SESSION_OPEN;
+    for (let bar = 0; bar < 200; bar++) {
+        if (bar > 0 && bar % 30 === 0) cursor += 17 * 60 * MINUTE;
+        times.push(cursor);
+        cursor += MINUTE;
+    }
+
+    const harness = createHeadlessChart({ timeScale: { sessionBreaks: { mode: 'collapsed' } } });
+    const source = new ScriptedSource(times);
+    const controller = new ChartFeedController(harness.chart, source);
+    try {
+        source.snapshot(120);
+        harness.flush();
+        assert.equal(harness.chart.getCandleCount(), 120);
+        // The snapshot's own breaks are present, so the table exists and is the right one.
+        const snapshotSlots = slotTable(times.slice(0, 120).map(candleAt), { mode: 'collapsed' });
+        assert.ok(snapshotSlots !== null, 'the snapshot should already contain breaks');
+
+        // The feed crosses the break at bar 120 and runs on past it.
+        source.append(120, 150);
+        harness.flush();
+        source.append(150, 175);
+        harness.flush();
+
+        const count = harness.chart.getCandleCount();
+        assert.equal(count, 175, 'the bars did not arrive');
+
+        // The cull must reach the newest bar rather than stopping at the snapshot's end.
+        const range = harness.chart.getVisibleLogicalRange();
+        assert.ok(
+            range.to > 120,
+            `the visible range stops at ${range.to}, which is where the snapshot ended`,
+        );
+        assert.equal(harness.chart.isAtRealtime(), true);
+
+        // The newest bar's own coordinate must name it, which it cannot do if the
+        // coordinate-to-index conversion is clamping against a table of 120.
+        assert.equal(
+            harness.chart.coordinateToIndex(harness.chart.indexToCoordinate(count - 1)),
+            count - 1,
+            'a bar cannot be placed at its own coordinate',
+        );
+
+        // And the ticks reach into the appended bars, so nothing is left bunched at the
+        // right-hand edge.
+        const xs = drawnX(harness.dataRenderer);
+        const slots = slotTable(times.slice(0, count).map(candleAt), { mode: 'collapsed' });
+        const lastSlot = slotAtIndex(slots, count - 1);
+        assert.ok(
+            Math.abs(xs[xs.length - 1] - lastSlot) < 1e-6,
+            `the newest candle is at slot ${xs[xs.length - 1]}, its bar is at ${lastSlot}`,
+        );
+        assert.equal(
+            harness.chart.getVisibleTimeRange().to,
+            times[count - 1],
+            'the reported time range does not reach the newest bar',
+        );
+    } finally {
+        controller.dispose();
+        harness.dispose();
+    }
+});
+
 test('coordinateToSlot is the sub-bar precision coordinateToIndex rounds away', () => {
     // The reason the method exists. `coordinateToIndex` answers "which candle", which is
     // a whole number by definition; a hit-test needs "where in that candle", and a
@@ -292,7 +627,7 @@ test('a bar and its slot are the same place, on both sides of a break', () => {
     // candle is. Bar 49 is the last of its session, so it is the bar the old midpoint
     // got wrong, and the test says so by naming it.
     const candles = sessionCandles();
-    const slots = slotTable(candles);
+    const slots = slotTable(candles, { mode: 'proportional' });
     const harness = chartWith(candles, { timeScale: { sessionBreaks: { mode: 'proportional' } } });
     try {
         harness.chart.fitContent();
