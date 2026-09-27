@@ -316,16 +316,55 @@ export function barsBeforeSlot(offsets: Float64Array | null, slot: number): numb
 /**
  * Slot position of a bar's centre.
  *
- * Centres rather than left edges, because a bar's visual extent is its body and
- * body and wick are drawn from its centre, so a coordinate taken from a left edge
- * would be half a bar off everything drawn.
+ * Half a slot past the bar's own left edge — and *only* half a slot, which is the whole
+ * content of this function. A bar is one slot wide whatever follows it, so its centre is
+ * `offsets[i] + 0.5` and nothing else.
+ *
+ * The obvious-looking alternative, the midpoint between this bar's left edge and the
+ * next one's, is wrong exactly when a break follows. That midpoint is a bar plus half
+ * the break, so the last bar of a session is drawn half a gap into the whitespace rather
+ * than at the end of its own session, and it is wrong by a different amount for every
+ * bar in the series depending on what comes next. On an unbroken series the two agree,
+ * which is why it survived: it was correct for every chart anyone could see.
  */
 export function slotAtIndex(offsets: Float64Array | null, index: number): number {
     if (offsets === null) return index;
     if (offsets.length === 0) return 0;
     const clamped: number = Math.max(0, Math.min(offsets.length - 1, Math.trunc(index)));
-    const next: number = clamped + 1 < offsets.length ? offsets[clamped + 1] : offsets[clamped] + 1;
-    return (offsets[clamped] + next) / 2;
+    return offsets[clamped] + 0.5;
+}
+
+/**
+ * Slot position of an aggregation bucket's centre.
+ *
+ * The pyramid aggregates in **ordinal** space — the only space a bucket has meaning in,
+ * because a bucket is a run of bars rather than a run of pixels — and this is where a
+ * run of bars becomes a position. It is the single conversion, shared by the candles
+ * and the overlays, because the two are read against each other: an overlay is
+ * understood as annotating the candle beneath it, and two conversions of the same
+ * question is how a moving average ends up half a bar from the price it annotates.
+ *
+ * The centre is the mean of the bucket's **first and last bar centres**, not the centre
+ * of the bar at the bucket's middle ordinal. Those differ whenever a session break falls
+ * inside the bucket, and they differ by roughly the width of the break: a bucket
+ * straddling an overnight would be drawn at the last bar before the gap, which is to say
+ * drawn somewhere the data is not. Averaging the endpoints puts a bucket that spans a
+ * break in the middle of what it spans, which is the honest place for it.
+ *
+ * A bucket of one is that bar, and a series with no breaks makes this the identity, so
+ * neither of those cases changes.
+ */
+export function bucketCentreSlot(
+    offsets: Float64Array | null,
+    bucketIndex: number,
+    factor: number,
+    sourceCount: number,
+): number {
+    if (!(factor > 1)) return slotAtIndex(offsets, bucketIndex);
+    const first: number = Math.max(0, Math.trunc(bucketIndex) * factor);
+    const last: number = Math.min(first + factor, sourceCount) - 1;
+    if (last <= first) return slotAtIndex(offsets, first);
+    return (slotAtIndex(offsets, first) + slotAtIndex(offsets, last)) / 2;
 }
 
 /**

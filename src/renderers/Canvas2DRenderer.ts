@@ -17,7 +17,8 @@ import {
 } from '../core/coordinates.js';
 import { paneValueAt, type PaneLayout } from '../core/panes.js';
 import { fromScaleSpace, priceTicks, toScaleSpace, type PriceScale, type Tick } from '../core/priceScale.js';
-import { contiguousRuns, indexAtSlot } from '../core/sessionScale.js';
+import { contiguousRuns } from '../core/sessionScale.js';
+import { timeAxisTicks, type TimeAxisTick } from '../core/timeAxis.js';
 import {
     LABEL_PRIORITY,
     layoutLabels,
@@ -92,10 +93,9 @@ export class Canvas2DRenderer implements IRenderer {
     /**
      * Slot offset of every bar, or null when the series has no breaks.
      *
-     * Read only through the helpers in `coordinates`, which take a null table as the
-     * identity. The one place this renderer has to think in slots itself is the
-     * time-axis tick loop, and that is the reason it is here rather than derived:
-     * a step of N indices is not a step of N bars' width once a gap sits between them.
+     * Read only through the helpers in `coordinates` and `timeAxis`, which take a null
+     * table as the identity. It is a field rather than something derived from the
+     * options because it is rebuilt when the data changes, not when the view does.
      */
     private slotOffsets: Float64Array | null = null;
     /** Region series occupy. Equals the canvas until the axes claim space. */
@@ -291,17 +291,18 @@ public init(canvas: HTMLCanvasElement, emitter: EventEmitter<ChartEvents>): void
 
         this.ctx.beginPath();
 
-        // The step is in *slots*, and that is why this loop cannot be a plain
-        // for over indices. A step of N indices is N bars only while bars are evenly
-        // spaced; with a break in the series the same step covers a different number
-        // of pixels on each side of it, so labels crowd against one edge of an
-        // overnight gap and spread out through the session beside it. A step of N slots
-        // is N bar widths everywhere, and the slots that land inside a break resolve
-        // to no bar, which is what leaves a gap visibly empty rather than labelled.
-        const timeTickStep: number = Math.max(1, Math.round(this.niceStep(96 / this.scaleX)));
-        const firstTimeTick: number = Math.ceil(
-            coordinateToSlot(viewport, plot.x) / timeTickStep,
-        ) * timeTickStep;
+        // Which bars the axis labels, decided once and shared with the label pass below.
+        // They share it because they have to agree exactly: a grid line with no label,
+        // or a label with no line, is a defect that only shows up when the two are
+        // derived separately — which is how they were derived before, from a step each
+        // loop re-derived from a `niceStep` call of its own.
+        const ticks: TimeAxisTick[] = timeAxisTicks({
+            times: this.timeValues,
+            slots: this.slotOffsets,
+            fromSlot: coordinateToSlot(viewport, plot.x),
+            toSlot: coordinateToSlot(viewport, plotRight),
+            widthPx: plot.width,
+        });
 
         // Which axis labels are drawn is decided once, with the decorations, because
         // they share the gutter: a last-price tag sitting on a tick has to displace
@@ -326,16 +327,15 @@ public init(canvas: HTMLCanvasElement, emitter: EventEmitter<ChartEvents>): void
         }
 
         if (this.options.grid.vertLines) {
-            // Progress, not position, is the exit. Positions stop advancing once the
-            // step runs past the end of the series, because the slot lookup clamps
-            // rather than returning -1, so a test against plotRight alone is a loop
-            // that only terminates while there are no session breaks to clamp.
-            let previousX: number = Number.NEGATIVE_INFINITY;
-            for (let time: number = firstTimeTick; ; time += timeTickStep) {
-                const x: number = indexToCoordinate(viewport, indexAtSlot(this.slotOffsets, time));
-                if (x > plotRight || x <= previousX) break;
-                previousX = x;
-                if (x < plot.x) continue;
+            // No progress guard needed, and that is the point of the rewrite. The old
+            // loop stepped in slots, so a slot inside a break resolved to the bar before
+            // it, two of them resolved to the same x, and `x <= previousX` ended the
+            // loop at the *first* session break — taking every grid line to the right of
+            // it with it. The exit is now "past the last visible bar", which is a
+            // statement about bars and so cannot be tripped by geometry.
+            for (const tick of ticks) {
+                const x: number = indexToCoordinate(viewport, tick.index);
+                if (x < plot.x || x > plotRight) continue;
                 const crispX: number = Math.floor(x) + 0.5;
                 this.ctx.moveTo(crispX, plot.y);
                 this.ctx.lineTo(crispX, plotBottom);
@@ -343,7 +343,7 @@ public init(canvas: HTMLCanvasElement, emitter: EventEmitter<ChartEvents>): void
         }
 
         this.ctx.stroke();
-        this.renderAxes(viewport, timeTickStep, firstTimeTick, labels);
+        this.renderAxes(viewport, ticks, labels);
         this.renderDecorations(viewport, labels);
         this.ctx.restore();
     }
@@ -637,8 +637,7 @@ public init(canvas: HTMLCanvasElement, emitter: EventEmitter<ChartEvents>): void
      */
     private renderAxes(
         viewport: ChartViewport,
-        timeTickStep: number,
-        firstTimeTick: number,
+        ticks: readonly TimeAxisTick[],
         labels: DecorationLabels,
     ): void {
         const plot: PlotRect = viewport.plot;
@@ -675,20 +674,20 @@ public init(canvas: HTMLCanvasElement, emitter: EventEmitter<ChartEvents>): void
         // top of both panes rather than being interrupted by the label boxes.
         this.renderPaneSeparators();
 
-        // The same progress-based exit as the grid loop above, and for the same
-        // reason: this loop steps in slots, the slot lookup clamps past the end of the
-        // series, and so x stops advancing exactly where the other one does. Sharing
-        // the tick list with the grid would be tidier still, but these two already
-        // have to agree on the step and re-deriving it here is what made them able to
-        // disagree in the first place.
-        let previousX: number = Number.NEGATIVE_INFINITY;
-        for (let time: number = firstTimeTick; ; time += timeTickStep) {
-            const index: number = indexAtSlot(this.slotOffsets, time);
-            const x: number = indexToCoordinate(viewport, index);
-            if (x > plotRight || x <= previousX) break;
-            previousX = x;
-            if (x < plot.x) continue;
-            this.drawLabel(this.formatTimeAtIndex(index), x, plotBottom + TIME_LABEL_OFFSET_Y, 'center');
+        // The same list the grid lines came from, which is why the two cannot disagree
+        // about where a label belongs. Formatting reads the tick's own timestamp rather
+        // than looking the bar up again: a lookup by index is a second answer to a
+        // question the tick has already answered, and the label must name the candle the
+        // line is drawn on.
+        for (const tick of ticks) {
+            const x: number = indexToCoordinate(viewport, tick.index);
+            if (x < plot.x || x > plotRight) continue;
+            this.drawLabel(
+                this.formatTimeAtTimestamp(tick.time),
+                x,
+                plotBottom + TIME_LABEL_OFFSET_Y,
+                'center',
+            );
         }
 
         this.ctx.restore();
@@ -998,12 +997,6 @@ public init(canvas: HTMLCanvasElement, emitter: EventEmitter<ChartEvents>): void
         return this.priceFormatter.format(value);
     }
 
-    private formatTimeAtIndex(index: number): string {
-        if (this.timeValues.length === 0) return this.formatAxisValue(index);
-        const candleIndex: number = this.nearestCandleIndex(index);
-        return this.formatTimeAtTimestamp(this.timeValues[candleIndex]);
-    }
-
     /** Formats a real candle timestamp, choosing detail from the visible span. */
     private formatTimeAtTimestamp(timestamp: number): string {
         const date: Date = new Date(timestamp);
@@ -1038,13 +1031,5 @@ public init(canvas: HTMLCanvasElement, emitter: EventEmitter<ChartEvents>): void
 
     private nearestCandleIndex(index: number): number {
         return clampCandleIndex(index, this.timeValues.length);
-    }
-
-    private niceStep(targetStep: number): number {
-        if (!Number.isFinite(targetStep) || targetStep <= 0) return 1;
-        const magnitude: number = Math.pow(10, Math.floor(Math.log10(targetStep)));
-        const normalized: number = targetStep / magnitude;
-        const factor: number = normalized <= 1 ? 1 : normalized <= 2 ? 2 : normalized <= 5 ? 5 : 10;
-        return factor * magnitude;
     }
 }

@@ -300,6 +300,11 @@ function makeStubDataRenderer(log) {
         },
         drawCandlesticks(candles, spec) {
             this.calls.push(['drawCandlesticks', candles.length, spec.style]);
+            // The records, not just their count. Where each bar was placed is the whole
+            // assertion surface for anything horizontal, and a length says nothing about
+            // it. The renderer is handed a reused buffer, so a test reads this before the
+            // next frame rather than holding on to it.
+            this.lastCandles = candles;
         },
         clearCandlesticks() {
             this.calls.push(['clearCandlesticks']);
@@ -309,6 +314,10 @@ function makeStubDataRenderer(log) {
         },
         drawOverlay(id, points, stride, color, vertical, pane) {
             this.calls.push(['drawOverlay', id, points.length, stride, pane]);
+            // Same reasoning as `lastCandles`: an overlay is read against the candles
+            // beneath it, so a test comparing the two needs both sets of coordinates.
+            this.overlays = this.overlays ?? {};
+            this.overlays[id] = { points, stride };
             if (vertical) this.lastVertical = vertical;
         },
         drawLine(points) {

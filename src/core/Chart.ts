@@ -60,11 +60,13 @@ import {
     type PriceScale,
 } from './priceScale.js';
 import {
+    bucketCentreSlot,
     computeSlotOffsets,
     indexAtTime,
     resolveSessionBreaks,
     sizeSessionBreaks,
     slotAtIndex,
+    totalSlots,
 } from './sessionScale.js';
 import {
     bucketOverlay,
@@ -1696,8 +1698,12 @@ export class Chart {
         const out: Float32Array = new Float32Array(points.length);
         out.set(points);
         const scale: PriceScale = this.priceScale();
+        const factor: number = this.overlayAggregationFactor;
+        const sourceCount: number = this.candlePyramid.candleCount;
         for (let i = 0; i < points.length; i += stride) {
-            out[i] = this.slotX(points[i]);
+            // The same conversion the candles' x went through, from the same bucket
+            // index, so an overlay lands on the candle it annotates rather than near it.
+            out[i] = bucketCentreSlot(this.slotOffsets, points[i], factor, sourceCount);
             if (convertValue) out[i + 1] = toScaleSpace(points[i + 1], scale);
         }
         return out;
@@ -1730,8 +1736,17 @@ export class Chart {
         // Whatever the current bar spacing, the whole series has to land inside the
         // plot. `clampBarSpacing` applies the configured minimum and maximum, so a
         // series of two bars is not blown up past `maxBarSpacing`.
+        //
+        // Divided by the **slot** count, not the bar count. They are the same number
+        // until a break exists, and then the slots are strictly more, so dividing by the
+        // bar count asks for a spacing wide enough for the bars and forgets the gaps: the
+        // series then comes out wider than the plot and the overflow hangs off the left,
+        // which is not a scroll the caller can reach. Half a chart is a worse answer than
+        // a slightly cramped one, and the error grows with the data — 750 slots of 600
+        // bars loses a fifth of the series.
         const plot: PlotRect = this.viewport.plot;
-        const spacing: number = this.clampBarSpacing(plot.width / count);
+        const slots: number = this.slotOffsets === null ? count : totalSlots(this.slotOffsets);
+        const spacing: number = this.clampBarSpacing(plot.width / Math.max(slots, 1));
         this.setBarSpacingLive(spacing);
         this.offsetX = liveEdgeOffsetX(plotRight(this.viewport), this.slotOffsets, count, spacing);
         this.followsLiveEdge = true;
@@ -1820,6 +1835,34 @@ export class Chart {
     public coordinateToIndex(coordinateX: number): number {
         this.assertAlive();
         return coordinateToIndex(this.viewport, coordinateX);
+    }
+
+    /**
+     * Fractional slot position at a screen x. Not clamped.
+     *
+     * The sub-bar precision `coordinateToIndex` deliberately rounds away. A whole index is
+     * the right answer to "which candle is under the pointer" and the wrong one to "where
+     * in that candle", which is the question a hit-test asks: a trend line grabbed at the
+     * left edge of a bar and one grabbed at its right edge are the same point under
+     * `coordinateToIndex` and different points here.
+     *
+     * A **slot**, not a fractional index, and the two stop being interchangeable the moment
+     * a break is in the series: "index 20.4" names no position at all, because the distance
+     * from bar 20 to bar 21 is not a number of bars. Slot 20.4 is exactly where the pixel
+     * is, before or after a break.
+     *
+     * Not clamped, like `coordinateToIndex`: a caller deciding whether a pointer is inside
+     * the plot needs to be able to see that it is not, and a clamped answer cannot say so.
+     *
+     * There is deliberately no public inverse yet. A caller anchoring something to a bar
+     * has `indexToCoordinate`; a caller anchoring it *between* bars has to interpolate, and
+     * two `indexToCoordinate` calls either side is exact because the transform is affine in
+     * slots. Freezing the inverse is worth doing the first time something needs it, and not
+     * before.
+     */
+    public coordinateToSlot(coordinateX: number): number {
+        this.assertAlive();
+        return coordinateToSlot(this.viewport, coordinateX);
     }
 
     /** Index of the candle nearest a screen x, or -1 when the chart has no data. */
@@ -2116,11 +2159,12 @@ export class Chart {
         candle: CandleData,
     ): void {
         const offset: number = recordIndex * CANDLE_STRIDE;
-        // A slot rather than an ordinal. The shader transform is
-        // `x * scaleX + offsetX`, which is affine in whatever it is handed, so a
-        // slot makes the series respect the breaks with no new uniform, no second
-        // program and no branch. On an unbroken series a slot *is* the ordinal.
-        target[offset + CANDLE_X] = this.slotX(ordinalIndex);
+        // An **ordinal**, not a slot, and the pyramid is index-space end to end so this
+        // stays true at every aggregation level. Levels above this one already hold
+        // ordinals, and `trimStart` re-bases them by subtracting the trimmed count, which
+        // is only correct in index space. The draw path maps a bucket to a position
+        // through `bucketCentreSlot`, so exactly one layer knows about slots.
+        target[offset + CANDLE_X] = ordinalIndex;
         target[offset + CANDLE_OPEN] = candle.open;
         target[offset + CANDLE_HIGH] = candle.high;
         target[offset + CANDLE_LOW] = candle.low;
@@ -2716,10 +2760,17 @@ export class Chart {
      */
     private overlayAggregationFactor: number = 1;
 
+    /**
+     * First pyramid bucket in `displayedCandles`, so a record's slot position can be
+     * recovered from its position in the slice.
+     */
+    private displayedStartBucket: number = 0;
+
     private updateVisibleCandles(): void {
         const viewport: ChartViewport = this.viewport;
         if (this.candlePyramid.candleCount === 0) {
             this.displayedCandles = new Float32Array(0);
+            this.displayedStartBucket = 0;
         } else {
             let levelIndex: number = 0;
             while (
@@ -2733,6 +2784,13 @@ export class Chart {
             this.overlayAggregationFactor = aggregationFactor;
             const level: Float32Array = this.candlePyramid.getLevelData(levelIndex);
             const levelCount: number = this.candlePyramid.getLevelCount(levelIndex);
+            // The window is found in **bars**, not in the x the shader transforms.
+            // `coordinateToIndex` resolves a coordinate through the slot table, so the
+            // bar it names is the bar actually under that edge of the plot, and dividing
+            // by the factor turns it into the bucket that holds it. Reading the raw
+            // coordinate as an ordinal instead would name a bar further right than the
+            // one on screen for every bar a break stands to the left of the edge, and the
+            // slice would start after bars that are still visible.
             const visibleMinX: number = coordinateToIndex(viewport, viewport.plot.x);
             const visibleMaxX: number = coordinateToIndex(
                 viewport,
@@ -2743,11 +2801,49 @@ export class Chart {
                 levelCount,
                 Math.ceil(visibleMaxX / aggregationFactor) + 2,
             );
+            this.displayedStartBucket = startBucket;
             this.displayedCandles = endBucket > startBucket
-                ? level.slice(startBucket * CANDLE_STRIDE, endBucket * CANDLE_STRIDE)
+                ? this.sliceInSlotSpace(level, startBucket, endBucket, aggregationFactor)
                 : new Float32Array(0);
         }
 
+    }
+
+    /**
+     * The visible buckets, with each record's x moved from ordinal space into slot space.
+     *
+     * The pyramid hands over a run of bars; the renderer needs a position for each. The
+     * conversion is per record rather than per pixel because the slot table is a prefix
+     * sum that changes only when the data does, so this is O(buckets on screen) and never
+     * runs per bar of the series.
+     *
+     * On a series with no breaks the two spaces are the same number, so the slice is
+     * returned as it came out — which is also the only case in which no copy is needed,
+     * and it is the case every chart without session gaps is in.
+     */
+    private sliceInSlotSpace(
+        level: Float32Array,
+        startBucket: number,
+        endBucket: number,
+        factor: number,
+    ): Float32Array {
+        if (this.slotOffsets === null) {
+            return level.slice(startBucket * CANDLE_STRIDE, endBucket * CANDLE_STRIDE);
+        }
+        const from: number = startBucket * CANDLE_STRIDE;
+        const to: number = endBucket * CANDLE_STRIDE;
+        const out: Float32Array = new Float32Array(to - from);
+        out.set(level.subarray(from, to));
+        const sourceCount: number = this.candlePyramid.candleCount;
+        for (let offset = 0; offset < out.length; offset += CANDLE_STRIDE) {
+            out[offset + CANDLE_X] = bucketCentreSlot(
+                this.slotOffsets,
+                startBucket + offset / CANDLE_STRIDE,
+                factor,
+                sourceCount,
+            );
+        }
+        return out;
     }
 
     /**

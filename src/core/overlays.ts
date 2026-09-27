@@ -267,6 +267,10 @@ export function bucketOverlay(
 
     const stride: 2 | 6 = pointColors === null ? 2 : 6;
     const out: number[] = [];
+    // `x` is the *bucket index*, not a position. Bucketing is index arithmetic and
+    // stays that way: converting to a position is the renderer's job, via
+    // `bucketCentreSlot`, because a bucket has no position until it is drawn and
+    // deciding one here would put the conversion in two places.
     const emit = (x: number, ordinal: number): void => {
         out.push(x, values[ordinal]);
         if (pointColors === null) return;
@@ -288,8 +292,9 @@ export function bucketOverlay(
             const first = bucket * factor;
             const last = Math.min(first + factor, sourceCount) - 1;
             if (last < firstIndex || first > lastIndex) continue;
-            // Matches the pyramid's x for the same group, so the two align exactly.
-            emit((first + last) / 2, last);
+            // The bucket's index, which the candles' own slice is keyed by, so the two
+            // reduce to the same buckets and land on the same x by construction.
+            emit(bucket, last);
         }
     }
     return { points: Float32Array.from(out), stride };

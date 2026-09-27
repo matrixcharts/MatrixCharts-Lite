@@ -145,6 +145,14 @@ Three properties are worth stating because they are the ones a caller is likely 
 
 The cap is on the total rather than per break, because the failure mode is cumulative: thirty individually reasonable breaks are still a chart of nothing. It is expressed in slots rather than pixels so it survives a resize instead of quietly changing meaning when the window does.
 
+**Time-axis labels are chosen in bar-index space, never in slot space.** A slot is a position and a label is a candle, and a slot inside a break belongs to neither: the only way to turn one into a coordinate is to snap it to the bar on one side, which puts two labels on one bar. The step is therefore a whole number of bars, sized from the plot width and rounded to a rung of a time ladder (a second, a minute, an hour, a day) so labels read as 10:00 rather than 10:07, and the ladder rung sets the bar step rather than only a phase — one rung, one step, every label on a boundary. Where a break sits, the *time* between two labels jumps; the number of bars between them does not. Nothing about this is observable through the API beyond the labels themselves, and `coordinateToTime` is unaffected: a label is always on a real candle, never on an instant the market was shut.
+
+**A bar is one slot wide, and the break belongs to the bar after it.** A bar's centre is half a slot past its own left edge, whatever follows it. This is worth stating because the natural-looking alternative — the midpoint between this bar's left edge and the next one's — is a bar plus half the break, and it puts the last candle of a session half a gap into the whitespace. It agrees with the correct answer on any series with no breaks, which is why it is easy to write and hard to see. It affects `indexToCoordinate`, `timeToCoordinate` and the crosshair for the bar before a break, and it is a correction to what those methods already promised: the x of a candle, not the x of the gap after it.
+
+**Four places turn a bar into a pixel, and all four go through the slot table.** The bar centre, the aggregation bucket, the visible-window cull and the fit. A break that only three of them respect is a chart that draws its candles, its overlays, its axis and its own reported range in four slightly different places — which is the failure mode this feature is prone to, and the reason each is named here. In particular: the pyramid aggregates in **ordinal** space and the draw path maps a bucket to a position once, through one function, so an overlay and the candle it annotates cannot come apart; and `fitContent()` fits the **slot** count, because a spacing chosen for the bars alone leaves the gaps with nowhere to go and pushes part of the series off the left edge, where no caller can scroll to it.
+
+`getBarSpacing()` is CSS px per **slot**, which equals px per candle index only while bars are adjacent. It is still the right divisor for a zoom step and the wrong one for a width: on a series with breaks, `barSpacing * candleCount` overstates the width of the series by the whole of its whitespace. Use `indexToCoordinate` on the first and last index for that.
+
 `priceScale` is a separate axis and shares only the tick generator.
 
 ## Reading the viewport
@@ -160,7 +168,8 @@ Every method below is synchronous, works in CSS pixels relative to the container
 | `getCandleAt(index)` | `CandleData \| null`; `null` for a non-integer or out-of-range index. |
 | `getLastCandle()` | `CandleData \| null`; `null` when there is no data. |
 | `indexToCoordinate(index)` | Screen x of a candle index. |
-| `coordinateToIndex(x)` | Fractional candle index at a screen x. Not clamped. |
+| `coordinateToIndex(x)` | Whole candle index at a screen x. Not clamped. |
+| `coordinateToSlot(x)` | Fractional **slot** at a screen x. Not clamped. Additive in 1.x. |
 | `coordinateToNearestIndex(x)` | Nearest whole candle index, or `-1` when empty. |
 | `coordinateToTime(x)` | Timestamp of the nearest candle, or `null` when empty. |
 | `timeToCoordinate(time)` | Screen x of the candle nearest a timestamp, or `null` when empty. |
@@ -169,6 +178,8 @@ Every method below is synchronous, works in CSS pixels relative to the container
 | `getPaneAtCoordinate(x, y)` | Index of the pane at a point, or `null` on a pane divider or outside the chart. |
 
 The index range is half-open because it names a set of bars. The time range is inclusive on both ends because it names two real candles, and a closed session has no end instant to report. The two are related by `getVisibleTimeRange().from === getCandleAt(range.from).time` and `.to === getCandleAt(range.to - 1).time`.
+
+**`coordinateToSlot(x)` is the sub-bar precision `coordinateToIndex(x)` rounds away.** A whole index answers "which candle is under the pointer", which is what a tooltip wants; a hit-test wants "where in that candle", and a trend line grabbed at a bar's left edge and one grabbed at its right edge are the same point to `coordinateToIndex` and different points here. It returns a **slot** rather than a fractional index, and the two stop being interchangeable the moment a break is in the series: "index 20.4" names no position at all, because the distance from bar 20 to bar 21 is not a number of bars. Slot 20.4 is exactly where the pixel is, before or after a break. It is not clamped, like `coordinateToIndex`, because a caller deciding whether a pointer is inside the plot has to be able to see that it is not. There is deliberately no public inverse yet: a caller anchoring to a bar has `indexToCoordinate`, and a caller anchoring between bars interpolates, which is exact because the transform is affine in slots. The inverse is worth freezing the first time something needs it, and not before.
 
 **`getPaneAtCoordinate` answers the same question the axis drag asks internally**, from the same row lookup, so a caller's own gesture cannot be routed to a different pane than the chart's would be. The gutter and the plot are treated alike, because they share rows: asking from `x = 4` gives the same answer as from `x = 400`. `null` means a pane divider, the time-axis strip, or a point off the side of the chart. It exists so a double-click on an oscillator's axis can reach `fitPaneRange(n)` without the caller reimplementing `paneRects` — and its rounding rules, which is precisely how two copies of a layout calculation drift apart.
 

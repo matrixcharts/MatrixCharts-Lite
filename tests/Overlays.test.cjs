@@ -5,10 +5,13 @@ const assert = require('node:assert/strict');
 const { test } = require('node:test');
 
 const { bucketOverlay, resolveOverlays } = require('../.test-build/core/overlays.js');
-const { OHLCPyramid } = require('../.test-build/math/OHLCPyramid.js');
-
-const CANDLE_STRIDE = 7;
-const CANDLE_X = 0;
+const {
+    bucketCentreSlot,
+    computeSlotOffsets,
+    resolveSessionBreaks,
+    sizeSessionBreaks,
+    slotAtIndex,
+} = require('../.test-build/core/sessionScale.js');
 
 const BASE = Date.UTC(2025, 0, 1);
 const times = Array.from({ length: 16 }, (_, i) => BASE + i * 60_000);
@@ -126,11 +129,12 @@ test('an indicator that starts late begins late, not from zero', () => {
 test('bucketing skips leading buckets until the indicator has a value', () => {
     const values = Float32Array.from({ length: 16 }, (_, i) => i);
     // Covered from ordinal 5 only. At factor 2 the first emitted bucket is the one
-    // whose last ordinal is 5, which is bucket 2 covering 4 and 5.
+    // whose last ordinal is 5, which is bucket 2 covering 4 and 5. The x is the
+    // bucket's index, which is what the candles' own slice is keyed by.
     const bucketed = bucketPoints(values, 2, 16, 5, 15);
     const xs = [];
     for (let i = 0; i < bucketed.length / 2; i++) xs.push(bucketed[i * 2]);
-    assert.deepEqual(xs, [4.5, 6.5, 8.5, 10.5, 12.5, 14.5]);
+    assert.deepEqual(xs, [2, 3, 4, 5, 6, 7]);
 });
 
 test('an overlay that covers nothing buckets to nothing', () => {
@@ -139,9 +143,13 @@ test('an overlay that covers nothing buckets to nothing', () => {
     assert.equal(bucketPoints(resolved[0].values, 1, times.length, -1, -1).length, 0);
 });
 
-test('bucketing lands on exactly the same x as the candle pyramid', () => {
-    // The pyramid's rule is x = (firstSourceIndex + lastSourceIndex) / 2 for a
-    // group of 2^k. Reproducing it here is what keeps an overlay from drifting.
+test('bucketing emits the bucket index, and the candles convert it the same way', () => {
+    // Bucketing is index arithmetic and stops there. What the renderer is handed is a
+    // bucket number, and the position comes from `bucketCentreSlot` — one conversion
+    // shared with the candles, so the two cannot land on different pixels. These
+    // expectations are the bucket numbers, not positions: with a null slot table the
+    // conversion is the identity and the two agree, which is the case that has to hold
+    // before the interesting one does.
     const values = Float32Array.from({ length: 16 }, (_, i) => i);
     const full = bucketPoints(values, 1, 16);
     assert.equal(full.length, 32);
@@ -152,22 +160,22 @@ test('bucketing lands on exactly the same x as the candle pyramid', () => {
 
     const half = bucketPoints(values, 2, 16);
     assert.equal(half.length / 2, 8);
-    assert.deepEqual(Array.from({ length: 8 }, (_, b) => half[b * 2]), [0.5, 2.5, 4.5, 6.5, 8.5, 10.5, 12.5, 14.5]);
+    assert.deepEqual(Array.from({ length: 8 }, (_, b) => half[b * 2]), [0, 1, 2, 3, 4, 5, 6, 7]);
     // A bucket takes the last value in its group.
     assert.deepEqual(Array.from({ length: 8 }, (_, b) => half[b * 2 + 1]), [1, 3, 5, 7, 9, 11, 13, 15]);
 
     const quarter = bucketPoints(values, 4, 16);
-    assert.deepEqual(Array.from({ length: 4 }, (_, b) => quarter[b * 2]), [1.5, 5.5, 9.5, 13.5]);
+    assert.deepEqual(Array.from({ length: 4 }, (_, b) => quarter[b * 2]), [0, 1, 2, 3]);
     assert.deepEqual(Array.from({ length: 4 }, (_, b) => quarter[b * 2 + 1]), [3, 7, 11, 15]);
 });
 
 test('bucketing handles a group size that does not divide the series', () => {
-    // 10 candles at factor 4 gives groups of 4, 4 and 2; the last x must still be
-    // the midpoint of its own partial group, not a padded one.
+    // 10 candles at factor 4 gives groups of 4, 4 and 2; the last bucket must still be
+    // keyed to itself rather than to a padded one.
     const values = Float32Array.from({ length: 10 }, (_, i) => i);
     const bucketed = bucketPoints(values, 4, 10);
     assert.equal(bucketed.length / 2, 3);
-    assert.deepEqual(Array.from({ length: 3 }, (_, b) => bucketed[b * 2]), [1.5, 5.5, 8.5]);
+    assert.deepEqual(Array.from({ length: 3 }, (_, b) => bucketed[b * 2]), [0, 1, 2]);
     assert.deepEqual(Array.from({ length: 3 }, (_, b) => bucketed[b * 2 + 1]), [3, 7, 9]);
 });
 
@@ -234,79 +242,94 @@ test('per-point colours ride the buckets, and widen the stride to 6', () => {
     const reduced = bucketOverlay(values, 2, 4, 0, 3, colors);
     assert.equal(reduced.stride, 6);
     assert.equal(reduced.points.length, 2 * 6);
-    assert.deepEqual(Array.from(reduced.points.slice(0, 2)), [0.5, 1]);
+    assert.deepEqual(Array.from(reduced.points.slice(0, 2)), [0, 1]);
     assert.deepEqual(Array.from(reduced.points.slice(2, 6)), [0, 1, 0, 1]);
 });
 
-test('overlay x equals candle x at every level of a real pyramid', () => {
-    // The property that matters is that an overlay and the candles it belongs to
-    // share a coordinate at every level, not merely that they are close. Checking
-    // it against the pyramid's own x values states that directly, and unlike a
-    // pixel sample it covers the aggregated levels too — where drift would
-    // actually appear — without depending on a zoom threshold.
+test('overlay and candles reduce to one bucket per bucket, at every level', () => {
+    // The pairing is the property: bucket N of the overlay is bucket N of the candle
+    // level, and both read their position from the same conversion. Checking the
+    // pairing rather than two independently-computed x values is the point — the bug
+    // this replaced was two formulas that agreed only while no session break existed,
+    // and any test comparing them to each other would have kept passing on the data
+    // that hides it.
     //
-    // Counts that are not a power of two are included on purpose: a trailing
-    // partial group is where the two x formulas most easily disagree.
+    // Counts that are not a power of two are included on purpose: a trailing partial
+    // group is where the two most easily disagree.
     for (const count of [16, 17, 33, 100, 257]) {
-        const candles = new Float32Array(count * CANDLE_STRIDE);
-        for (let index = 0; index < count; index++) {
-            const at = index * CANDLE_STRIDE;
-            candles[at + CANDLE_X] = index;
-            candles[at + 1] = 100;
-            candles[at + 4] = 101;
-        }
-        const pyramid = new OHLCPyramid();
-        pyramid.reset(candles);
-
         const values = Float32Array.from({ length: count }, (_, i) => 100 + i);
-        for (let levelIndex = 0; levelIndex < pyramid.levelCount; levelIndex++) {
-            const factor = Math.pow(2, levelIndex);
-            const level = pyramid.getLevelData(levelIndex);
-            const levelCount = level.length / CANDLE_STRIDE;
+        for (const factor of [1, 2, 4, 8, 16]) {
+            const bucketCount = Math.ceil(count / factor);
             const bucketed = bucketPoints(values, factor, count, 0, count - 1);
-            assert.equal(bucketed.length / 2, levelCount,
-                `count ${count} level ${levelIndex}: overlay and candles disagree on point count`);
-            for (let point = 0; point < levelCount; point++) {
-                assert.equal(bucketed[point * 2], level[point * CANDLE_STRIDE + CANDLE_X],
-                    `count ${count} level ${levelIndex} point ${point}: x drifted`);
+            assert.equal(bucketed.length / 2, bucketCount,
+                `count ${count} factor ${factor}: wrong point count`);
+            for (let bucket = 0; bucket < bucketCount; bucket++) {
+                assert.equal(bucketed[bucket * 2], bucket,
+                    `count ${count} factor ${factor} bucket ${bucket}: x is not the bucket index`);
+                // The value is the bucket's last ordinal, so the two reduce over the same
+                // bars even though neither holds the other's coordinates.
+                const last = Math.min(bucket * factor + factor, count) - 1;
+                assert.equal(bucketed[bucket * 2 + 1], 100 + last,
+                    `count ${count} factor ${factor} bucket ${bucket}: wrong value`);
             }
         }
     }
 });
 
-test('overlay x still matches after a partial level at a covered suffix', () => {
-    // A warm-up means the leading buckets are dropped, so the overlay is offset
-    // from the level's start. The surviving points must still sit exactly on the
-    // candles they share buckets with.
-    const count = 100;
-    const warmup = 37;
-    const candles = new Float32Array(count * CANDLE_STRIDE);
-    for (let index = 0; index < count; index++) {
-        candles[index * CANDLE_STRIDE + CANDLE_X] = index;
-        candles[index * CANDLE_STRIDE + 1] = 100;
-        candles[index * CANDLE_STRIDE + 4] = 101;
+test('an overlay and a bucket of candles get the same slot, breaks and all', () => {
+    // The invariant the shipped bug violated, stated where it is now decided. Both sides
+    // call `bucketCentreSlot` with the same bucket index, so this is close to a
+    // tautology — which is the intended shape. A bucket that straddles a break is the
+    // case that earns it: its position is the middle of what it spans, not the bar at
+    // its middle ordinal, and the two differ by most of the width of the gap.
+    //
+    // Fifty bars to a session, not forty, because a power-of-two session length puts
+    // every break exactly on a bucket boundary at these factors and the interesting
+    // bucket never exists.
+    const times = [];
+    let cursor = Date.UTC(2025, 0, 6, 14, 30);
+    for (let session = 0; session < 3; session++) {
+        for (let i = 0; i < 50; i++) times.push(cursor + i * 60_000);
+        cursor += 50 * 60_000 + 17 * 60 * 60_000;
     }
-    const pyramid = new OHLCPyramid();
-    pyramid.reset(candles);
+    const resolved = resolveSessionBreaks(times, { mode: 'proportional' });
+    const slots = computeSlotOffsets(times, sizeSessionBreaks(times, resolved));
+    const count = times.length;
     const values = Float32Array.from({ length: count }, (_, i) => 100 + i);
+    const breakAt = times.findIndex((time, i) => i > 0 && time - times[i - 1] > 3 * 60_000);
 
-    for (let levelIndex = 0; levelIndex < pyramid.levelCount; levelIndex++) {
-        const factor = Math.pow(2, levelIndex);
-        const level = pyramid.getLevelData(levelIndex);
-        const levelCount = level.length / CANDLE_STRIDE;
-        const bucketed = bucketPoints(values, factor, count, warmup, count - 1);
-        // Every emitted overlay point must match the candle at that same x.
-        for (let point = 0; point < bucketed.length / 2; point++) {
-            const x = bucketed[point * 2];
-            let matched = false;
-            for (let candle = 0; candle < levelCount; candle++) {
-                if (level[candle * CANDLE_STRIDE + CANDLE_X] !== x) continue;
-                matched = true;
-                break;
-            }
-            assert.ok(matched, `level ${levelIndex}: overlay x ${x} matches no candle at that level`);
+    for (const factor of [1, 2, 4, 8]) {
+        const bucketed = bucketPoints(values, factor, count, 0, count - 1);
+        for (let bucket = 0; bucket < bucketed.length / 2; bucket++) {
+            assert.equal(
+                bucketCentreSlot(slots, bucketed[bucket * 2], factor, count),
+                bucketCentreSlot(slots, bucket, factor, count),
+                `factor ${factor} bucket ${bucket}: overlay and candle disagree`,
+            );
         }
-        // The first emitted point is the first bucket whose last ordinal is covered.
-        assert.ok(bucketed.length / 2 > 0, `level ${levelIndex}: nothing emitted`);
+    }
+
+    // The centre is the middle of the bars the bucket spans, which is only different
+    // from the middle *ordinal* when a break falls inside the bucket. Find that bucket
+    // rather than trusting a hand-picked one, so the fixture cannot quietly stop
+    // containing it.
+    const straddling = [];
+    for (const factor of [2, 4, 8]) {
+        for (let bucket = 0; bucket * factor < count; bucket++) {
+            const first = bucket * factor;
+            if (breakAt > first && breakAt <= first + factor - 1) straddling.push({ bucket, factor });
+        }
+    }
+    assert.ok(straddling.length > 0, 'the fixture has no bucket spanning a break, so this proves nothing');
+    for (const { bucket, factor } of straddling) {
+        const first = bucket * factor;
+        const last = Math.min(first + factor, count) - 1;
+        const centre = bucketCentreSlot(slots, bucket, factor, count);
+        assert.equal(centre, (slotAtIndex(slots, first) + slotAtIndex(slots, last)) / 2,
+            `factor ${factor} bucket ${bucket}: not the middle of what it spans`);
+        assert.ok(
+            Math.abs(centre - slotAtIndex(slots, (first + last) / 2)) > 1,
+            `factor ${factor} bucket ${bucket}: the middle ordinal would have been good enough`,
+        );
     }
 });

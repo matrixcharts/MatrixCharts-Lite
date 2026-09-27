@@ -192,14 +192,29 @@ test('a slot resolves to the bar containing it, and clamps past either end', () 
     assert.equal(indexAtSlot(offsets, 999), 4, 'a slot after the series clamps to the last bar');
 });
 
-test('a bar centre is the middle of its own extent, so a break widens it', () => {
+test('a bar is one slot wide, so a break does not widen the bar before it', () => {
+    // Five bars, with a three-slot break before bar 3. The model is one slot per bar
+    // plus extra slots *after* a break, so bar 2 occupies [2, 3) and the whitespace is
+    // [3, 5). Its centre is 2.5.
+    //
+    // The midpoint between this bar's left edge and the next one's — 3.5 here — is the
+    // alternative that reads as natural and is wrong: it puts the last candle of a
+    // session half a gap into the whitespace, and it makes bar 2 two slots from bar 1
+    // while every other bar in the series is one slot from its neighbour. It agreed with
+    // this answer on any series with no breaks, which is why it shipped.
     const offsets = Float64Array.from([0, 1, 2, 5, 6]);
     assert.equal(slotAtIndex(offsets, 0), 0.5);
-    assert.equal(slotAtIndex(offsets, 2), (2 + 5) / 2, 'the bar before a break is wider than one slot');
+    assert.equal(slotAtIndex(offsets, 2), 2.5, 'the bar before a break is still one slot wide');
     assert.equal(slotAtIndex(offsets, 3), 5.5);
     // Out-of-range indices clamp rather than reading past the array.
     assert.equal(slotAtIndex(offsets, -5), 0.5);
     assert.equal(slotAtIndex(offsets, 99), 6.5);
+    // And the centre never leaves the bar's own slot, which is the whole claim.
+    for (let index = 0; index < offsets.length; index++) {
+        const centre = slotAtIndex(offsets, index);
+        assert.ok(centre >= offsets[index] && centre < offsets[index] + 1,
+            `bar ${index} has its centre at ${centre}, outside its own slot`);
+    }
 });
 
 test('slot lookup and index lookup agree on every bar of a uniform series', () => {
