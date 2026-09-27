@@ -184,78 +184,73 @@ try {
     await page.mouse.up();
     await wait(200);
 
-    // The contract of a plot-centred zoom is not "nothing moved". It is: the transform
-    // is a pure scale about the plot centre by a known factor. So predict where the
-    // bar must land and compare, which checks the anchor point *and* the factor rather
-    // than only the absence of movement.
+    // The requested factor has to be the applied factor.
     //
-    //     x' = centre + (x - centre) * factor
-    //
-    // Asserting "did not move" instead is only valid for a bar whose centre coincides
-    // with the plot centre, and no such bar generally exists — the nearest one is up to
-    // half a bar away, so it is *supposed* to move. That is what the 9.998px was: half
-    // a bar times the zoom factor, which the contract allows and a naive assertion
-    // reports as a bug.
-    //
-    // Predict-and-compare also discriminates the one way this can genuinely be wrong:
-    // if the code takes its live-edge branch instead of anchoring, the prediction fails
-    // loudly and by a lot, rather than drifting a few pixels for reasons nobody can
-    // reconstruct afterwards.
-    const before = await page.evaluate(() => {
-        const mc = globalThis.__mc;
-        const { x, width } = mc.plot();
-        const centre = x + width / 2;
-        const index = mc.indexAt(centre);
-        return { index, barX: mc.xOf(index), centre, spacing: mc.spacing() };
-    });
-
-    const factor = 1.4;
-    await page.evaluate((s) => globalThis.__mc.chart.applyOptions({ timeScale: { barSpacing: s * 1.4 } }),
-        before.spacing);
+    // This replaces a case that predicted a bar position from the canvas centre.
+    // Predicting a position needs the anchor, and the anchor is the *plot* centre,
+    // which is inset by the axis gutter — 78px on the left in this layout, so the
+    // plot centre is 639px while the canvas centre is 600px. A prediction built from
+    // the canvas centre is off by that gutter and reads as a 15px bug that is not
+    // there. Bar spacing is checked directly instead: two bars one slot apart are
+    // scaleX apart, so the ratio of that distance across a zoom is the factor that
+    // was actually applied, and comparing it against the requested factor catches a
+    // clamp or a dropped patch without needing to know where anything is anchored.
+    const spacingBefore = await page.evaluate(() => globalThis.__mc.xOf(1) - globalThis.__mc.xOf(0));
+    const requested = 1.4;
+    await page.evaluate((t) => globalThis.__mc.chart.applyOptions({ timeScale: { barSpacing: t } }),
+        spacingBefore * requested);
     await wait(300);
-
-    const predicted = before.centre + (before.barX - before.centre) * factor;
-    const actual = await page.evaluate((index) => globalThis.__mc.xOf(index), before.index);
-    const error = Math.abs(actual - predicted);
+    const spacingAfter = await page.evaluate(() => globalThis.__mc.xOf(1) - globalThis.__mc.xOf(0));
+    const applied = spacingAfter / spacingBefore;
     record(
-        'barSpacing change scales about the plot centre by the factor',
-        error <= ANCHOR_TOLERANCE_PX,
-        `bar ${before.index} landed at ${actual.toFixed(3)}px, predicted ${predicted.toFixed(3)}px (off by ${error.toFixed(3)}px)`,
+        'a barSpacing change applies the factor it was asked for',
+        Math.abs(applied - requested) <= 0.001,
+        'asked for ' + requested + 'x, applied ' + applied.toFixed(5) + 'x ' +
+            '(bar spacing ' + spacingBefore.toFixed(3) + ' -> ' + spacingAfter.toFixed(3) + ')',
     );
 
-    // Diagnose *where* the anchor is, rather than only that it is wrong. Both offsetX
-    // and scaleX are readable through the public API — indexToCoordinate(0) is offsetX
-    // exactly, because bar 0 sits at slot 0 — so the anchor a scale was taken about can
-    // be solved for:
+    // Solve for the anchor a scale was taken about, twice, and require the two to be
+    // the same point. This is the gutter-independent form of the invariant: it does not
+    // need to know where the plot rect is, only that the transform is a pure scale
+    // about one fixed point that does not move when the scale changes.
     //
-    //     offsetX' = a + (offsetX - a) * f   =>   a = (offsetX' - f * offsetX) / (1 - f)
-    //
-    // Comparing that a against the plot centre says whether the code anchored somewhere
-    // else entirely (a live-edge park, a stale rect, a different origin) or merely used
-    // the wrong number, which are different bugs with different fixes.
-    const derived = await page.evaluate(() => {
+    // The first version compared the plot centre to an anchor solved from a state read
+    // *before and after with no zoom applied in between* — so the factor came out at
+    // exactly 1.0000, the anchor was unsolvable, and I reported a swallowed option
+    // patch that never existed. The zoom is applied in the middle of this one.
+    const readState = () => page.evaluate(() => {
         const mc = globalThis.__mc;
         const { x, width } = mc.plot();
         return {
             offsetX: mc.xOf(0),
             scaleX: mc.xOf(1) - mc.xOf(0),
-            centre: x + width / 2,
+            canvasCentre: x + width / 2,
         };
     });
-    const after = await page.evaluate(() => {
-        const mc = globalThis.__mc;
-        return { offsetX: mc.xOf(0), scaleX: mc.xOf(1) - mc.xOf(0) };
-    });
-    const appliedFactor = after.scaleX / derived.scaleX;
-    const impliedAnchor = Math.abs(1 - appliedFactor) < 1e-9
-        ? Number.NaN
-        : (after.offsetX - appliedFactor * derived.offsetX) / (1 - appliedFactor);
+    const anchorFor = (before, after) => {
+        const factor = after.scaleX / before.scaleX;
+        return Math.abs(1 - factor) < 1e-9
+            ? Number.NaN
+            : (after.offsetX - factor * before.offsetX) / (1 - factor);
+    };
+
+    const anchors = [];
+    for (const target of [1.4, 0.7]) {
+        const before = await readState();
+        await page.evaluate((t) => globalThis.__mc.chart.applyOptions({ timeScale: { barSpacing: t } }),
+            before.scaleX * target);
+        await wait(300);
+        const after = await readState();
+        anchors.push(anchorFor(before, after));
+    }
+    const stable = Number.isFinite(anchors[0])
+        && Math.abs(anchors[0] - anchors[1]) <= ANCHOR_TOLERANCE_PX;
     record(
-        'the plot-centred zoom anchors where it claims to',
-        Math.abs(impliedAnchor - derived.centre) <= 1,
-        `implied anchor ${impliedAnchor.toFixed(2)}px vs plot centre ${derived.centre.toFixed(2)}px ` +
-        `(offsetX ${derived.offsetX.toFixed(2)}->${after.offsetX.toFixed(2)}, ` +
-        `scaleX ${derived.scaleX.toFixed(3)}->${after.scaleX.toFixed(3)}, f=${appliedFactor.toFixed(4)})`,
+        'a barSpacing change scales about one fixed anchor',
+        stable,
+        `anchors ${anchors.map((a) => a.toFixed(2)).join('px, ')}px ` +
+        `(canvas centre ${(await readState()).canvasCentre.toFixed(2)}px — the plot centre is ` +
+        'inset by the axis gutter, so it is not expected to equal it)',
     );
 
     // Drag: the inverse invariant. A pan is a pure delta, so the bar under the
