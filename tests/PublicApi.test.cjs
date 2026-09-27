@@ -20,6 +20,7 @@ test('package entry exports only the v1 public surface', () => {
 test('internal renderers, math, and test hooks stay unexported', () => {
     for (const internal of [
         'IRenderer',
+        'IDataRenderer',
         'WebGL2Renderer',
         'Canvas2DRenderer',
         'OHLCPyramid',
@@ -32,6 +33,22 @@ test('internal renderers, math, and test hooks stay unexported', () => {
     }
     for (const hook of ['testDrawWebGLData', 'testDrawWebGLCandlesticks']) {
         assert.equal(typeof publicApi.Chart.prototype[hook], 'undefined');
+    }
+});
+
+test('the renderer-injection seam stays internal', () => {
+    // The seam exists so a headless test can stand a recorder in for the GPU. It is
+    // reachable from the compiled output, so what keeps it out of an integrator's hands is
+    // that the barrel is an explicit allow-list — so the names themselves have to stay
+    // off it, and `setRendererFactory` in particular must not become a supported way to
+    // replace a layer. A published seam is not a seam, it is a second public contract
+    // nobody specified.
+    for (const internal of [
+        'createRenderer',
+        'setRendererFactory',
+        'defaultFactory',
+    ]) {
+        assert.equal(internal in publicApi, false, `${internal} must not be exported`);
     }
 });
 

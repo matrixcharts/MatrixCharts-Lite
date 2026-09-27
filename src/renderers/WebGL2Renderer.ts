@@ -1,6 +1,7 @@
 // src/renderers/WebGL2Renderer.ts
 import type { CandleStyle, ResolvedCandleColors, ResolvedVolumeColors } from '../core/options.js';
 import type { IRenderer } from '../core/IRenderer.js';
+import type { IDataRenderer } from '../core/IDataRenderer.js';
 import type { EventEmitter, ChartEvents } from '../core/EventEmitter.js';
 import type { PlotRect } from '../core/coordinates.js';
 import { candlestickBodyEdgesData } from '../math/candlestickBodyWidth.js';
@@ -23,7 +24,7 @@ import {
 } from '../math/candleLayout.js';
 
 /** Normalised RGBA, matching the shape the option resolver produces. */
-type Rgba = [number, number, number, number];
+export type Rgba = [number, number, number, number];
 
 /**
  * Everything the OHLC renderer needs beyond the candle buffer. Passed as one
@@ -42,7 +43,7 @@ export interface CandleRenderSpec {
 /** A fully transparent body, used by the hollow style. */
 const TRANSPARENT: Rgba = [0, 0, 0, 0];
 
-export class WebGL2Renderer implements IRenderer {
+export class WebGL2Renderer implements IDataRenderer {
     private gl: WebGL2RenderingContext | null = null;
     private emitter!: EventEmitter<ChartEvents>;
     private canvas: HTMLCanvasElement | null = null;

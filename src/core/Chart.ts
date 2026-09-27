@@ -1,7 +1,8 @@
 // src/core/Chart.ts
 import type { IRenderer } from './IRenderer.js';
-import { WebGL2Renderer } from '../renderers/WebGL2Renderer.js';
-import { Canvas2DRenderer } from '../renderers/Canvas2DRenderer.js';
+// The concrete renderers are reached through `rendererFactory`, not imported here: the
+// factory is the single place that decides what a layer is, which is what lets a headless
+// test stand one in without this file knowing.
 import { OHLCPyramid } from '../math/OHLCPyramid.js';
 import { DEFAULT_CANDLE_SPACING_PX } from '../math/candlestickBodyWidth.js';
 import {
@@ -26,6 +27,8 @@ import type {
     Rgba,
 } from './options.js';
 import { mergeOptionPartials, parseCssColor, resolveCandleColors, resolveOptions } from './options.js';
+import { createRenderer } from './rendererFactory.js';
+import type { IDataRenderer } from './IDataRenderer.js';
 import { resolveChartContainer } from './resolveChartContainer.js';
 import {
     fitPaneTransform,
@@ -144,7 +147,12 @@ export class Chart {
     // Store your active renderers
     private renderers: IRenderer[] = [];
     /** Held directly rather than by position, since init order is not paint order. */
-    private dataRenderer!: WebGL2Renderer;
+    /**
+     * The layer that draws the series, held as the contract Chart actually holds with it
+     * rather than as the concrete renderer. See `IDataRenderer` for why the ten GPU draw
+     * calls need a name of their own.
+     */
+    private dataRenderer!: IDataRenderer;
     private isDragging: boolean = false;
     private lastPointerX: number = 0;
     private activePointers: Map<number, { x: number; y: number }> = new Map();
@@ -295,18 +303,24 @@ export class Chart {
             // Layer 1: GPU Data. Initialised first because WebGL2 is the hard
             // requirement, so the unsupported case costs one context attempt and
             // no Canvas2D work. Paint order still comes from the z-index.
-            const dataRenderer = new WebGL2Renderer();
+            //
+            // Built through the factory so a headless test can supply a recorder in
+            // place of the GPU without Chart knowing, and so this stays the only place
+            // that decides what a layer is. The factory constructs; the `init` calls
+            // below are Chart's, because handing over the canvas and the emitter is
+            // lifecycle and lifecycle is not the factory's to own.
+            const dataRenderer = createRenderer('data');
             dataRenderer.init(dataCanvas, this.emitter);
             this.dataRenderer = dataRenderer;
             this.renderers.push(dataRenderer);
 
             // Layer 0: Background Grid
-            const gridRenderer = new Canvas2DRenderer(true);
+            const gridRenderer = createRenderer('grid');
             gridRenderer.init(gridCanvas, this.emitter);
             this.renderers.push(gridRenderer);
 
             // Layer 2: UI Overlay
-            const uiRenderer = new Canvas2DRenderer(false);
+            const uiRenderer = createRenderer('ui');
             uiRenderer.init(uiCanvas, this.emitter);
             this.renderers.push(uiRenderer);
         } catch (error) {
