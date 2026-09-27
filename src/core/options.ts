@@ -634,9 +634,24 @@ export function themeDefaults(theme: ChartTheme): ResolvedChartOptions {
         grid: { ...preset.grid },
         // A pane division reads as part of the grid, so it defaults to the grid
         // colour rather than inventing a colour of its own.
-        panes: { ...BASE_DEFAULTS.panes, separatorColor: preset.grid.color },
+        // `sessionBreaks` is copied, not shared. `applyOptions` merges it field by field
+        // *in place* — it is a patch, so it writes into whatever object it is handed — and
+        // a shallow spread here handed it `BASE_DEFAULTS`' own nested object. One chart
+        // configuring its gaps therefore rewrote the defaults for every chart created
+        // after it, in the same process: two charts on a page where the first disabled
+        // session breaks silently disabled them for the second, and for a third that never
+        // mentioned them. `panes.weights` is copied for the same reason — it is currently
+        // replaced rather than mutated, which is one `push` away from the identical bug.
+        timeScale: {
+            ...BASE_DEFAULTS.timeScale,
+            sessionBreaks: { ...BASE_DEFAULTS.timeScale.sessionBreaks },
+        },
+        panes: {
+            ...BASE_DEFAULTS.panes,
+            weights: [...BASE_DEFAULTS.panes.weights],
+            separatorColor: preset.grid.color,
+        },
         crosshair: { ...preset.crosshair },
-        timeScale: { ...BASE_DEFAULTS.timeScale },
         candlestick: {
             ...preset.candlestick,
             style: DEFAULT_CANDLE_STYLE,

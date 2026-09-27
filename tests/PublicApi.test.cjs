@@ -53,6 +53,7 @@ test('the public read and write API is present, and nothing internal leaked besi
         'fitPriceRange',
         'getPriceRange',
         'subscribePaneRangeChange',
+        'coordinateToSlot',
     ]) {
         assert.equal(typeof publicApi.Chart.prototype[method], 'function', `${method} must be public`);
     }

@@ -13,6 +13,41 @@ const {
     themeDefaults,
 } = require('../.test-build/core/options.js');
 
+test('one chart\'s options never become the next chart\'s defaults', () => {
+    // A shipped defect, and the reason this file's tests all construct their own options
+    // rather than sharing a fixture: `themeDefaults` built its result with a shallow
+    // spread of the time scale, so every resolved options object shared *one* nested
+    // `sessionBreaks` with the module-level defaults — and `applyOptions` merges that
+    // block field by field in place, because it is a patch. Configuring the gaps on one
+    // chart therefore rewrote the defaults for every chart created afterwards, in the same
+    // process: two charts on a page where the first turned session breaks off silently
+    // turned them off for the second, and for a third that never mentioned them.
+    //
+    // It is invisible to a single-chart test and to a suite where every chart asks for
+    // the same thing, which is all of them until one test happens to disable them.
+    const themed = themeDefaults('dark');
+    const configured = resolveOptions({ timeScale: { sessionBreaks: { enabled: false, mode: 'proportional' } } });
+    assert.equal(configured.timeScale.sessionBreaks.enabled, false);
+    assert.equal(configured.timeScale.sessionBreaks.mode, 'proportional');
+
+    // A fresh resolve must see the shipped defaults, not the previous call's patch.
+    const afterwards = resolveOptions({});
+    assert.equal(afterwards.timeScale.sessionBreaks.enabled, true, 'enabled leaked between resolves');
+    assert.equal(afterwards.timeScale.sessionBreaks.mode, 'collapsed', 'mode leaked between resolves');
+    assert.equal(
+        themed.timeScale.sessionBreaks.enabled,
+        true,
+        'a theme snapshot is mutated by a later resolve',
+    );
+
+    // The same shape of hazard one level over: `panes.weights` is an array, and a shared
+    // reference is one `push` away from the identical bug even though it is currently
+    // replaced rather than mutated.
+    const resolved = resolveOptions({ panes: { weights: [2, 1] } });
+    resolved.panes.weights.push(99);
+    assert.deepEqual(resolveOptions({}).panes.weights, [1], 'pane weights leaked between resolves');
+});
+
 const round = (rgba) => rgba.map((channel) => Math.round(channel * 255));
 const throws = (fn, pattern, message) => {
     assert.throws(fn, pattern, message);
