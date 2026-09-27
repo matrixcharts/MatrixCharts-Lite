@@ -1028,11 +1028,14 @@ export class Chart {
     }
 
     private dispatchCrosshair(): void {
+        const scope: { pane: number | null; value: number | null } = this.crosshairPaneScope();
         const payload: ChartEvents['crosshair'] = {
             x: this.crosshairX,
             y: this.crosshairY,
             time: this.crosshairCandle ? this.crosshairCandle.time : null,
             candle: this.crosshairCandle,
+            pane: scope.pane,
+            value: scope.value,
         };
         this.emitter.emit('crosshair', payload);
         if (this.crosshairHandlers.size === 0) return;
@@ -2410,6 +2413,31 @@ export class Chart {
         if (pane === PRICE_PANE) return { scaleY: this.scaleY, offsetY: this.offsetY };
         const transform: VerticalTransform | undefined = this.paneLayout.transforms[pane];
         return transform ?? null;
+    }
+
+    /**
+     * Which pane the crosshair is over, and what it reads there.
+     *
+     * Both halves are the renderer's to draw and neither is the renderer's to decide.
+     * The pane comes from the same `paneAtRow` the axis drag and
+     * `getPaneAtCoordinate` use, and the value goes through that pane's own conversion —
+     * a price under pane 0, an oscillator reading everywhere else. Resolving it here
+     * rather than downstream is what stops a price appearing on an RSI axis, which is
+     * what happened for as long as the readout asked the price pane's transform for a
+     * y that lay inside somebody else's pane.
+     *
+     * `pane` and `value` are `null` together: on a divider there is no pane to read, and
+     * a horizontal rule drawn at a y belonging to no pane would be a rule annotating
+     * nothing.
+     */
+    private crosshairPaneScope(): { pane: number | null; value: number | null } {
+        const y: number | null = this.crosshairY;
+        if (y === null) return { pane: null, value: null };
+        const pane: number | null = this.paneAtRow(y);
+        if (pane === null) return { pane: null, value: null };
+        const transform: VerticalTransform | null = this.paneTransform(pane);
+        if (transform === null || transform.scaleY === 0) return { pane, value: null };
+        return { pane, value: this.paneScaleToValue(pane, paneValueAt(transform, y)) };
     }
 
     /**

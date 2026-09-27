@@ -232,7 +232,19 @@ function makeStubRenderer(name, log) {
         name,
         init(canvas, emitter) {
             log.push([name, 'init', { canvas: canvas.tagName, emitter: typeof emitter }]);
+            // The grid layer is what draws the crosshair, so the stub stands in for it
+            // here. Recording the payload is how a test can assert what the crosshair
+            // *reads* — `pane` and `value` are the only channel the renderer has, and
+            // reading pixels back out of a canvas in node is not an option.
+            if (name === 'grid') {
+                emitter.on('crosshair', (payload) => {
+                    this.crosshair.push({
+                        x: payload.x, y: payload.y, pane: payload.pane, value: payload.value,
+                    });
+                });
+            }
         },
+        crosshair: [],
         resize(width, height, dpr) {
             log.push([name, 'resize', { width, height, dpr }]);
         },
@@ -333,9 +345,11 @@ function createHeadlessChart(options = {}) {
     const dom = installDom(options.dom);
     const rendererLog = [];
     const dataRenderer = makeStubDataRenderer(rendererLog);
+    // The grid stub is kept so a test can read what the crosshair was told.
+    const gridRenderer = makeStubRenderer('grid', rendererLog);
     const restoreFactory = setRendererFactory({
         data: () => dataRenderer,
-        grid: () => makeStubRenderer('grid', rendererLog),
+        grid: () => gridRenderer,
         ui: () => makeStubRenderer('ui', rendererLog),
     });
     let chart = null;
@@ -352,6 +366,7 @@ function createHeadlessChart(options = {}) {
         chart,
         dom,
         dataRenderer,
+        gridRenderer,
         rendererLog,
         /** The chart's own wrapper element — the single input surface. */
         wrapper: dom.container.children[0],

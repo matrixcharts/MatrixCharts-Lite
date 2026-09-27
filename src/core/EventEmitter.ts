@@ -74,6 +74,26 @@ export interface ChartEvents {
         y: number | null;
         time: number | null;
         candle: CandleData | null;
+        /**
+         * The pane the pointer is over, or `null` on a divider or outside every pane.
+         *
+         * Resolved by Chart rather than by the renderer, so the crosshair, the axis drag
+         * and `getPaneAtCoordinate` all answer "which pane is this y" from one row
+         * lookup. Two copies of that answer is how a divider ends up belonging to
+         * different panes in different parts of the same frame.
+         */
+        pane: number | null;
+        /**
+         * The value at `y` in the hovered pane's own units — an RSI reading under an RSI,
+         * a price under the price pane. `null` whenever `pane` is.
+         *
+         * Carried rather than derived downstream because the conversion is not the
+         * renderer's to know: pane 0 is a price and goes through the price scale, every
+         * other pane is linear. A renderer that worked it out for itself would need to
+         * re-decide which pane is the price one, and would put a price on an oscillator
+         * axis — which is exactly what it did.
+         */
+        value: number | null;
     };
 }
 

@@ -13,7 +13,6 @@ import {
     clampCandleIndex,
     coordinateToIndex,
     coordinateToSlot,
-    coordinateToPrice,
     indexToCoordinate,
 } from '../core/coordinates.js';
 import { paneValueAt, type PaneLayout } from '../core/panes.js';
@@ -106,6 +105,9 @@ export class Canvas2DRenderer implements IRenderer {
     private crosshairY: number | null = null;
     private crosshairTime: number | null = null;
     private crosshairCandle: CandleData | null = null;
+    /** The pane the pointer is over, and the value there. Both null on a divider. */
+    private crosshairPane: number | null = null;
+    private crosshairValue: number | null = null;
     private timeValues: readonly number[] = [];
     private options: ResolvedChartOptions = themeDefaults('dark');
     // Parsed once per apply, not per label or per frame.
@@ -211,6 +213,8 @@ public init(canvas: HTMLCanvasElement, emitter: EventEmitter<ChartEvents>): void
         this.crosshairY = payload.y;
         this.crosshairTime = payload.time;
         this.crosshairCandle = payload.candle;
+        this.crosshairPane = payload.pane;
+        this.crosshairValue = payload.value;
         if (!this.isGridLayer) {
             this.clear();
             this.render();
@@ -518,13 +522,35 @@ public init(canvas: HTMLCanvasElement, emitter: EventEmitter<ChartEvents>): void
         this.ctx.lineWidth = 1;
         this.ctx.setLineDash([4, 4]);
         this.ctx.beginPath();
+        // The vertical rule spans every pane, on purpose: a volume or momentum spike in
+        // a lower pane has to line up with the exact candle it belongs to, and a rule
+        // that stopped at the divider would break exactly that alignment.
         this.ctx.moveTo(this.crosshairX + 0.5, plot.y);
         this.ctx.lineTo(this.crosshairX + 0.5, plot.y + plot.height);
-        this.ctx.moveTo(plot.x, this.crosshairY + 0.5);
-        this.ctx.lineTo(plot.x + plot.width, this.crosshairY + 0.5);
+        // The horizontal rule spans the hovered pane only. Running it across the whole
+        // plot drew a level through panes the pointer was nowhere near, which read as
+        // those panes being at that value.
+        const hovered: PlotRect | null = this.hoveredPaneRect();
+        if (hovered !== null) {
+            this.ctx.moveTo(plot.x, this.crosshairY + 0.5);
+            this.ctx.lineTo(plot.x + plot.width, this.crosshairY + 0.5);
+        }
         this.ctx.stroke();
         this.ctx.restore();
         this.renderCrosshairReadout(viewport);
+    }
+
+    /**
+     * The rect of the pane the crosshair is over, or `null` on a divider.
+     *
+     * The pane itself is Chart's answer, carried on the event, so the drag's routing and
+     * this agree about which pane a y is in rather than each deciding.
+     */
+    private hoveredPaneRect(): PlotRect | null {
+        const panes: PaneLayout | null = this.panes;
+        if (panes === null || this.crosshairPane === null) return null;
+        const rect: PlotRect | undefined = panes.rects[this.crosshairPane];
+        return rect ?? null;
     }
 
     /**
@@ -575,15 +601,22 @@ public init(canvas: HTMLCanvasElement, emitter: EventEmitter<ChartEvents>): void
         }
 
         // Both tags annotate a rule that is drawn across the plot, so they belong
-        // in the gutter beside that rule: the price tag in the price gutter, the
+        // in the gutter beside that rule: the value tag in the left gutter, the
         // time tag in the time gutter.
-        const currentPrice: number = coordinateToPrice(viewport, this.crosshairY);
-        this.drawLabel(
-            this.formatAxisValue(currentPrice),
-            plot.x - 6,
-            this.crosshairY,
-            'right',
-        );
+        //
+        // The value tag reads the *hovered pane's* value, in that pane's units, from the
+        // value Chart resolved. It used to ask the price pane's transform for whatever y
+        // the pointer was at, so hovering an RSI pane put a price — 102.24 on a pane
+        // showing 30 to 86 — on an oscillator's axis. On a divider there is no pane, so
+        // the tag is suppressed rather than guessed at.
+        if (this.crosshairValue !== null) {
+            this.drawLabel(
+                this.formatAxisValue(this.crosshairValue),
+                plot.x - 6,
+                this.crosshairY as number,
+                'right',
+            );
+        }
         const timeTag: string = this.crosshairTime === null
             ? this.formatAxisValue(this.crosshairX)
             : this.formatTimeAtTimestamp(this.crosshairTime);

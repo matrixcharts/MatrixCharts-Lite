@@ -217,6 +217,10 @@ Each returns an `Unsubscribe` (`() => void`). Calling it more than once is harml
 
 `x` is snapped to the bar centre so a tooltip can be positioned at the crosshair, while `y` keeps following the pointer so the price readout tracks the cursor. The drawn crosshair and the reported event always agree: Chart owns the hit-test and the UI layer only draws what Chart resolved. The reported `candle` is the exact retained candle, not an aggregate bucket, so it is correct at any zoom level.
 
+**The drawn crosshair is scoped to the pane under the pointer, and `event.price` is not.** The vertical rule spans every pane, so a volume or momentum spike in a lower pane lines up with the exact candle it belongs to. The horizontal rule spans only the hovered pane, and the value tag in the left gutter reads that pane's value *in that pane's units* — an RSI reading under an RSI, a price under the price pane. On a pane divider neither is drawn, because a band that belongs to no pane has no value to report.
+
+`event.price` remains the **price pane's** price at `y`, whatever pane the pointer is over. That is a frozen field and it means what it says; a component displaying an oscillator's reading should use `getPaneValueRange(pane)` with the pane from `getPaneAtCoordinate`, not `event.price`.
+
 `VisibleRangeEvent` carries `logical`, `time`, and `barSpacing` from the read API above. It is silent when the visible bars and bar spacing are unchanged, so a drag that stays between bar boundaries produces no events and float drift from wheel or pinch arithmetic does not re-notify.
 
 **`PaneRangeEvent` carries `{ pane, range }`** — one pane's vertical bounds, low first, in that pane's own units: prices for pane 0, indicator values for the rest. It is its own event rather than a field on `VisibleRangeEvent`, and it is deduplicated *per pane* and coalesced to one per animation frame.

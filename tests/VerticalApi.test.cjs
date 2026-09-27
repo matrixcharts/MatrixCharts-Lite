@@ -597,6 +597,88 @@ test('the range event follows the auto-fit, not only deliberate locks', () => {
     }
 });
 
+test('the crosshair reads the hovered pane in that pane\'s own units', () => {
+    // What the crosshair *draws* comes entirely from this payload, so asserting the
+    // payload asserts the drawing. Reading pixels back out of a canvas in node is not
+    // possible, and a clipped screenshot of the WebGL layer comes back blank in this
+    // environment — which is how a wrong number on an oscillator axis stayed invisible
+    // for as long as it did.
+    const { h, paneRows, separator } = twoPaneChart();
+    try {
+        const chart = h.chart;
+        const hover = (y) => {
+            h.gridRenderer.crosshair.length = 0;
+            h.pointer('pointermove', 600, y, { id: 99 });
+            const events = h.gridRenderer.crosshair.slice();
+            return events[events.length - 1] ?? null;
+        };
+
+        // The lower pane: the value must be the oscillator's, not a price.
+        const lower = hover(paneRows[1].top + Math.round((paneRows[1].bottom - paneRows[1].top) / 2));
+        assert.equal(lower.pane, 1, 'the lower pane was not identified');
+        const oscillator = chart.getPaneValueRange(1);
+        assert.ok(
+            lower.value >= oscillator[0] && lower.value <= oscillator[1],
+            `crosshair read ${lower.value}, outside the pane's own range [${oscillator}]`,
+        );
+        // The bug this pins: the old readout asked the price pane's transform for a y
+        // inside somebody else's pane, so an RSI axis showed a price. Assert the value
+        // is not a price at all, which is the specific thing that was wrong.
+        const priceRange = chart.getPriceRange();
+        assert.ok(
+            lower.value < priceRange[0] || lower.value > priceRange[1],
+            `crosshair read ${lower.value}, which is inside the price range [${priceRange}] — ` +
+            'that is a price on an oscillator axis',
+        );
+
+        // The price pane: still a price, and equal to the public reader.
+        const upper = hover(paneRows[0].top + 100);
+        assert.equal(upper.pane, 0, 'the price pane was not identified');
+        close(upper.value, chart.coordinateToPrice(upper.y), 1e-9, 'price pane value');
+
+        // A divider belongs to no pane, so there is nothing to read and nothing to draw:
+        // no horizontal rule and no axis tag. Guessing here is what put a number on a
+        // band that is not part of any scale. The band is `separator` pixels wide, and
+        // the loop stops there — checking one pixel further would be checking pane 1's
+        // own first row, which is supposed to answer.
+        for (let offset = 0; offset < separator; offset++) {
+            const onDivider = hover(paneRows[0].bottom + offset);
+            assert.equal(onDivider.pane, null, `divider pixel ${offset} named a pane`);
+            assert.equal(onDivider.value, null, `divider pixel ${offset} produced a value`);
+        }
+        // And the first row of the pane below it is live, so the boundary is exact.
+        assert.equal(
+            hover(paneRows[1].top).pane,
+            1,
+            "pane 1's own first row should be inside pane 1",
+        );
+    } finally {
+        h.dispose();
+    }
+});
+
+test('the crosshair reads an oscillator even when the price axis is a log scale', () => {
+    // The two conversions differ, so this is where a shared assumption would show: pane 0
+    // goes through the price scale and a lower pane does not.
+    const { h, paneRows } = twoPaneChart({ priceScale: { mode: 'log' } });
+    try {
+        const chart = h.chart;
+        chart.setPriceRange([50, 200]);
+        h.gridRenderer.crosshair.length = 0;
+        h.pointer('pointermove', 600, paneRows[1].top + 40, { id: 99 });
+        const events = h.gridRenderer.crosshair;
+        const last = events[events.length - 1];
+        assert.equal(last.pane, 1);
+        const oscillator = chart.getPaneValueRange(1);
+        assert.ok(
+            last.value >= oscillator[0] && last.value <= oscillator[1],
+            `read ${last.value} against [${oscillator}]`,
+        );
+    } finally {
+        h.dispose();
+    }
+});
+
 test('a drag of the plot still pans, and leaves a locked price range alone', () => {    const h = withData();
     try {
         const chart = h.chart;
