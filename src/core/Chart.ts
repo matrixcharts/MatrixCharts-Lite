@@ -82,6 +82,7 @@ import {
     type TimeRange,
     type VisibleRangeSnapshot,
     coordinateToIndex,
+    coordinateToSlot,
     coordinateToPrice,
     indexToCoordinate,
     isAtLiveEdgeOffset,
@@ -612,10 +613,21 @@ export class Chart {
 
         // Zoom about the middle of the plot, not of the canvas, so the bar under
         // the pointer stays put once the axes claim space at the edges.
+        //
+        // The anchor is a *slot*, not an index. This used to be exact by accident:
+        // `coordinateToIndex` returned `(x - offsetX) / scaleX`, a fraction, so this
+        // line was the algebraic inverse of `indexToCoordinate`. Once that lookup
+        // started returning a whole bar index the identity broke in two ways at once —
+        // the index is not a slot position, and a bar is positioned by its *centre*,
+        // not its left edge. The result was every non-live-edge zoom sliding the
+        // series sideways by half a bar plus every break before the centre, which on a
+        // chart zoomed out over a week of sessions is most of a screen. `coordinateToSlot`
+        // is exact with or without a table, so this is now correct by construction
+        // rather than by coincidence.
         const centreX: number = plotCentreX(this.viewport);
-        const centreIndex: number = coordinateToIndex(this.viewport, centreX);
+        const centreSlot: number = coordinateToSlot(this.viewport, centreX);
         this.scaleX = clamped;
-        this.offsetX = centreX - centreIndex * clamped;
+        this.offsetX = centreX - centreSlot * clamped;
         this.followsLiveEdge = this.isAtLiveEdge();
     }
 
@@ -1718,7 +1730,17 @@ export class Chart {
                     this.scaleX,
                 );
             } else {
-                this.offsetX -= this.scaleX * appends.length;
+                // Shifted in slots, not in bars. The first bar of a new session sits
+                // more than one slot after its predecessor, so shifting by the bar
+                // count leaves the pinned bar half a slot short of where it was - a
+                // slow drift, one half-slot per session, that only shows up in a feed
+                // left running across a close. — a slow drift,
+            // one half-slot per session, that only shows up in a feed left running
+            // across a close.
+                this.offsetX -= this.scaleX * (
+                    slotAtIndex(this.slotOffsets, this.candleTimes.length - 1)
+                    - slotAtIndex(this.slotOffsets, firstNewIndex - 1)
+                );
             }
         }
     }
