@@ -3,3 +3,4 @@ dist/
 .test-build/
 .tmp/
 .DS_Store
+*.tgz
