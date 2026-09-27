@@ -166,8 +166,11 @@ Every method below is synchronous, works in CSS pixels relative to the container
 | `timeToCoordinate(time)` | Screen x of the candle nearest a timestamp, or `null` when empty. |
 | `priceToCoordinate(price)` | Screen y of a price. |
 | `coordinateToPrice(y)` | Price at a screen y, on the current auto-fitted vertical scale. |
+| `getPaneAtCoordinate(x, y)` | Index of the pane at a point, or `null` on a pane divider or outside the chart. |
 
 The index range is half-open because it names a set of bars. The time range is inclusive on both ends because it names two real candles, and a closed session has no end instant to report. The two are related by `getVisibleTimeRange().from === getCandleAt(range.from).time` and `.to === getCandleAt(range.to - 1).time`.
+
+**`getPaneAtCoordinate` answers the same question the axis drag asks internally**, from the same row lookup, so a caller's own gesture cannot be routed to a different pane than the chart's would be. The gutter and the plot are treated alike, because they share rows: asking from `x = 4` gives the same answer as from `x = 400`. `null` means a pane divider, the time-axis strip, or a point off the side of the chart. It exists so a double-click on an oscillator's axis can reach `fitPaneRange(n)` without the caller reimplementing `paneRects` — and its rounding rules, which is precisely how two copies of a layout calculation drift apart.
 
 `getCandleAt` and `getLastCandle` read the same float32 store the renderer draws from, so prices come back at float32 precision and may differ in the last bits from the doubles that were passed to `setData`. `time` is exact.
 
@@ -192,6 +195,7 @@ Subscribe to the chart; do not attach listeners to the canvases. The chart wrapp
 | `subscribeCrosshairMove(handler)` | As the pointer moves over the chart, and once when it leaves. |
 | `subscribeClick(handler)` | On a press and release that did not become a pan or pinch. |
 | `subscribeVisibleRangeChange(handler)` | When the visible bars or bar spacing change, at most once per animation frame. |
+| `subscribePaneRangeChange(handler)` | When a pane's vertical range changes, at most once per animation frame. |
 
 Each returns an `Unsubscribe` (`() => void`). Calling it more than once is harmless. `destroy()` drops every handler, so a destroyed chart never calls back into application code.
 
@@ -214,6 +218,12 @@ Each returns an `Unsubscribe` (`() => void`). Calling it more than once is harml
 `x` is snapped to the bar centre so a tooltip can be positioned at the crosshair, while `y` keeps following the pointer so the price readout tracks the cursor. The drawn crosshair and the reported event always agree: Chart owns the hit-test and the UI layer only draws what Chart resolved. The reported `candle` is the exact retained candle, not an aggregate bucket, so it is correct at any zoom level.
 
 `VisibleRangeEvent` carries `logical`, `time`, and `barSpacing` from the read API above. It is silent when the visible bars and bar spacing are unchanged, so a drag that stays between bar boundaries produces no events and float drift from wheel or pinch arithmetic does not re-notify.
+
+**`PaneRangeEvent` carries `{ pane, range }`** — one pane's vertical bounds, low first, in that pane's own units: prices for pane 0, indicator values for the rest. It is its own event rather than a field on `VisibleRangeEvent`, and it is deduplicated *per pane* and coalesced to one per animation frame.
+
+It covers every path that moves a pane, not only the deliberate ones: a drag of the axis gutter, `setPriceRange`, `setPaneRange`, `fitPaneRange`, and the auto-fit when a candle prints outside the range. That last one matters as much as the first — a readout that only heard about deliberate changes would be stale from the first new high, which is the same permanent lie as a zoom readout reporting a stale value. Per-pane dedup is what lets a component watch one oscillator's bounds without being woken every time the price pane's fit wobbles, and subscribing delivers the current state on the next frame so a readout mounted after the chart is already drawn is not blank.
+
+A vertical change is not folded into the internal viewport broadcast, which is not public: that payload carries `slots` and every pane's affine transform, and a contract should hand integrators the values they act on rather than the arithmetic that positions pixels.
 
 A press that travels more than a few CSS pixels is a pan, not a click, and reports no `click`. Touch and pen contacts clear the crosshair on release because they have no hover state.
 

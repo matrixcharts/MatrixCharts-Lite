@@ -40,18 +40,24 @@ test('the public read and write API is present, and nothing internal leaked besi
     // The per-pane vertical surface: `setPaneRange`/`fitPaneRange` are what a drag of a
     // lower pane's gutter uses, and the only way for a caller to undo one. Without them a
     // pane a single spike had flattened could not be released from code at all.
+    //
+    // `getPaneAtCoordinate` is here for the same reason: a caller's own double-click has
+    // to reach `fitPaneRange(n)`, and without the pane index at a point the only route is
+    // to reimplement `paneRects` — and its rounding rules — in application code.
     for (const method of [
         'setPaneRange',
         'fitPaneRange',
         'getPaneValueRange',
+        'getPaneAtCoordinate',
         'setPriceRange',
         'fitPriceRange',
         'getPriceRange',
+        'subscribePaneRangeChange',
     ]) {
         assert.equal(typeof publicApi.Chart.prototype[method], 'function', `${method} must be public`);
     }
     // And they are not the seam: a factory that replaces a layer is not public API.
-    for (const internal of ['createRenderer', 'setRendererFactory', 'paneAtClientY']) {
+    for (const internal of ['createRenderer', 'setRendererFactory', 'paneAtClientY', 'paneAtRow']) {
         assert.equal(internal in publicApi, false, `${internal} must not be exported`);
     }
 });

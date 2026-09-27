@@ -77,6 +77,7 @@ import type {
     CrosshairMoveEvent,
     Unsubscribe,
     VisibleRangeEvent,
+    PaneRangeEvent,
 } from './ChartEvents.js';
 import {
     type ChartViewport,
@@ -258,6 +259,9 @@ export class Chart {
     private crosshairHandlers: Set<(event: CrosshairMoveEvent) => void> = new Set();
     private clickHandlers: Set<(event: ChartClickEvent) => void> = new Set();
     private visibleRangeHandlers: Set<(event: VisibleRangeEvent) => void> = new Set();
+    private paneRangeHandlers: Set<(event: PaneRangeEvent) => void> = new Set();
+    /** What each pane was last reported as showing, so the event is silent when it did not move. */
+    private lastReportedPaneRanges: Map<number, [number, number]> = new Map();
 
     // Distinguishes a click from the end of a pan or pinch.
     private pressX: number = 0;
@@ -270,6 +274,7 @@ export class Chart {
 
     private lastReportedRange: VisibleRangeSnapshot | null = null;
     private scheduledRangeFrame: number | null = null;
+    private scheduledPaneRangeFrame: number | null = null;
     /**
      * A destroyed chart is unusable. Every public method throws a single stable
      * error rather than some throwing internal messages and others quietly
@@ -280,6 +285,7 @@ export class Chart {
     /** Guards against a handler re-entering its own event and looping forever. */
     private emittingCrosshair: boolean = false;
     private emittingVisibleRange: boolean = false;
+    private emittingPaneRange: boolean = false;
 
     /**
      * Mounts a chart into an existing element, or into `document.getElementById(container)`.
@@ -536,7 +542,26 @@ export class Chart {
      */
     private paneAtClientY(clientY: number): number | null {
         const rect: DOMRect = this.canvasWrapper.getBoundingClientRect();
-        const y: number = clientY - rect.top;
+        return this.paneAtRow(clientY - rect.top);
+    }
+
+    /**
+     * The pane whose rows contain this y, or `null` for a divider or outside every pane.
+     *
+     * Half-open per pane, `[pane.y, pane.y + pane.height)`, so a press on the pixel
+     * below a pane's last row is already outside it. That matters because `paneRects`
+     * leaves the `separatorHeight` band between two panes belonging to *neither* — the
+     * boundaries are snapped to whole pixels precisely so two panes cannot both claim a
+     * separator. A drag that begins on the divider is therefore inert, which is the only
+     * safe answer for a band that is not part of any pane.
+     *
+     * The row lookup itself, shared by the drag's routing and by
+     * `getPaneAtCoordinate`. Two copies of "which pane is this" is the arrangement that
+     * produced every divider bug worth having: the drag would own one rounding rule and
+     * the caller's double-click another, and the two would disagree on exactly the
+     * pixels nobody tested.
+     */
+    private paneAtRow(y: number): number | null {
         const rects: PlotRect[] = this.paneRects;
         for (let index = 0; index < rects.length; index++) {
             const pane: PlotRect = rects[index];
@@ -544,6 +569,35 @@ export class Chart {
             if (y >= pane.y && y < pane.y + pane.height) return index;
         }
         return null;
+    }
+
+    /**
+     * The pane at a point, or `null` when the point is on a divider or outside the plot.
+     *
+     * CSS pixels relative to the container's top-left, like every other coordinate in
+     * the read API. `x` is checked against the plot's width so a point off the side of
+     * the chart is `null` rather than quietly answered from its y alone, but the gutter
+     * and the plot are deliberately treated alike: they share rows, and that is why a
+     * drag in the gutter scales the same pane a click in the plot belongs to.
+     *
+     * This exists so a caller can route a gesture of its own to the right pane. A
+     * double-click on an oscillator's axis that means "fit this pane" needs the pane
+     * index, and the only way to get one without this is to reimplement `paneRects` in
+     * application code — including its `Math.round(weight / total * available)` and its
+     * last-pane-takes-the-remainder rule. Those are exactly the details that produce an
+     * off-by-one, and freezing them into an integrator's source is how the chart's own
+     * routing and the caller's quietly stop agreeing.
+     *
+     * The x bound is the canvas width, not the plot's: the gutter and the plot are one
+     * surface with rows either side, and a caller asking "which pane is this axis in"
+     * must get the same answer from x = 4 as from x = 400. That is also what makes the
+     * time-axis strip the one region that answers `null` by y alone.
+     */
+    public getPaneAtCoordinate(x: number, y: number): number | null {
+        this.assertAlive();
+        const plot: PlotRect = this.viewport.plot;
+        if (x < 0 || x > plot.x + plot.width) return null;
+        return this.paneAtRow(y);
     }
 
     /**
@@ -937,6 +991,28 @@ export class Chart {
         this.assertAlive();
         this.visibleRangeHandlers.add(handler);
         return () => { this.visibleRangeHandlers.delete(handler); };
+    }
+
+    /**
+     * Fires when a pane's vertical range changes, at most once per animation frame and
+     * not at all for a pane whose range did not change.
+     *
+     * Covers every path that moves a pane: a drag of the axis gutter, `setPriceRange`,
+     * `setPaneRange`, `fitPaneRange`, and the auto-fit itself when a new candle falls
+     * outside the range. The last of those matters as much as the first — a readout that
+     * only heard about deliberate changes would be wrong the moment a bar printed
+     * outside them, and would be wrong in exactly the way this engine has twice been
+     * wrong already: a number on screen that the chart is not using.
+     */
+    public subscribePaneRangeChange(handler: (event: PaneRangeEvent) => void): Unsubscribe {
+        this.assertAlive();
+        this.paneRangeHandlers.add(handler);
+        // Deliver the current state on the next frame, so a readout mounted after the
+        // chart is already drawn starts from the truth rather than blank. A component
+        // that subscribed and then waited would otherwise show nothing until the first
+        // append, which on a quiet instrument is a long time.
+        this.schedulePaneRangeChange();
+        return () => { this.paneRangeHandlers.delete(handler); };
     }
 
     private emitCrosshair(): void {
@@ -1398,30 +1474,24 @@ export class Chart {
     public getPriceRange(): [number, number] {
         this.assertAlive();
         const rect: PlotRect = this.pricePaneRect();
-        if (rect.height <= 0 || this.scaleY === 0) {
-            const last: CandleData | null = this.getLastCandle();
-            const price: number = last === null ? 0 : last.close;
-            return [price, price];
-        }
-        // Both ends of the pane, converted back out of scale space.
+        // Both ends of the pane, converted back out of scale space, through
+        // `getPaneValueRange` — the one reader behind every pane's range, including the
+        // range event.
         //
-        // Through `paneValueAt`, like `getPaneValueRange` and the axis renderer, rather
-        // than through `offsetY` directly. This used to read `fromScaleSpace(offsetY)`
-        // and `fromScaleSpace(offsetY + height * scaleY)`, which treats `offsetY` as a
-        // scale-space value — but `offsetY` is the *pixel* at which scale-space zero
-        // sits, and the transform is `y = offsetY + v * scaleY`. The two readings differ
-        // by a factor of `scaleY` in the span and disagree outright on the position, so
-        // a pane showing 106.6 to 111.6 reported -56732 to 13568, and a range set with
-        // `setPriceRange([100, 200])` read back as -2184 to 1156. Nothing caught it
-        // because no test called this: the vertical public API had none at all, while
-        // the horizontal one it mirrors has had coverage for several phases.
-        const transform: VerticalTransform = { scaleY: this.scaleY, offsetY: this.offsetY };
-        const atTop: number = fromScaleSpace(paneValueAt(transform, rect.y), this.priceScale());
-        const atBottom: number = fromScaleSpace(
-            paneValueAt(transform, rect.y + rect.height),
-            this.priceScale(),
-        );
-        return [Math.min(atTop, atBottom), Math.max(atTop, atBottom)];
+        // It used to be spelled out here, and this method used `offsetY` where the
+        // transform is `y = offsetY + v * scaleY`, so it read scale-space zero's *pixel*
+        // as if it were a scale-space value: a pane showing 106.6 to 111.6 reported
+        // -56732 to 13568, and `setPriceRange([100, 200])` read back as -2184 to 1156.
+        // A second copy of "what does the price pane show" is how that happened, and the
+        // third reader is now the same function rather than another spelling of it.
+        const range: [number, number] | null = (rect.height > 0 && this.scaleY !== 0)
+            ? this.getPaneValueRange(PRICE_PANE)
+            : null;
+        if (range !== null) return range;
+        // No usable pane: a collapsed plot, or a pane table that has not been built yet.
+        const last: CandleData | null = this.getLastCandle();
+        const price: number = last === null ? 0 : last.close;
+        return [price, price];
     }
 
     /**
@@ -1540,6 +1610,9 @@ export class Chart {
         this.emitDecorations(false);
         this.refreshCrosshairAfterViewportChange();
         this.redraw();
+        // Scheduled rather than emitted, because this runs on every pointer move of a
+        // drag and `updateViewport` is deliberately not on that path.
+        this.schedulePaneRangeChange();
     }
 
     /**
@@ -2471,8 +2544,13 @@ export class Chart {
         this.refreshCrosshairAfterViewportChange();
         this.redraw();
         this.scheduleVisibleRangeChange();
+        // The auto-fit is a vertical change like any other, and on a live feed it is the
+        // common one: a candle printing outside the range moves every fitted pane. A
+        // readout that only heard about deliberate drags would be stale from the first
+        // new high, which is the same permanent lie as a barSpacing readout that reports
+        // the construction value.
+        this.schedulePaneRangeChange();
     }
-
     private refreshCrosshairAfterViewportChange(): void {
         if (this.crosshairCandle === null) return;
         if (this.isInteracting()) return;
@@ -2483,8 +2561,7 @@ export class Chart {
      * Coalesces range notifications to one per frame. updateViewport runs from
      * pointer handlers that can fire faster than the display, and from a rAF
      * callback during feed flushes; both collapse to a single event.
-     */
-    private scheduleVisibleRangeChange(): void {
+     */    private scheduleVisibleRangeChange(): void {
         if (this.visibleRangeHandlers.size === 0) return;
         if (this.scheduledRangeFrame !== null) return;
         // A range change caused from inside a range handler is not re-notified.
@@ -2521,6 +2598,87 @@ export class Chart {
         } finally {
             this.emittingVisibleRange = false;
         }
+    }
+
+    /**
+     * Queues a vertical-range notification, coalesced to one per animation frame.
+     *
+     * A drag of the axis fires this on every pointer move, and an append fires it on
+     * every flush, so without the frame it would be a stream rather than a signal.
+     */
+    private schedulePaneRangeChange(): void {
+        if (this.paneRangeHandlers.size === 0) return;
+        if (this.scheduledPaneRangeFrame !== null) return;
+        // A change caused from inside a handler is not re-notified, for the same reason
+        // the visible-range event has that guard: a handler that restyles the chart on
+        // every notification would otherwise schedule a frame forever.
+        if (this.emittingPaneRange) return;
+        this.scheduledPaneRangeFrame = requestAnimationFrame(() => {
+            this.scheduledPaneRangeFrame = null;
+            this.emitPaneRangeChange();
+        });
+    }
+
+    private cancelScheduledPaneRangeChange(): void {
+        if (this.scheduledPaneRangeFrame === null) return;
+        cancelAnimationFrame(this.scheduledPaneRangeFrame);
+        this.scheduledPaneRangeFrame = null;
+    }
+
+    /**
+     * Emits one event per pane whose range differs from what was last reported.
+     *
+     * Deduplicated per pane rather than as a single before/after comparison, because a
+     * readout of one oscillator's bounds should not be woken by the price pane's fit
+     * moving. A pane that has never been reported is always reported, so the first
+     * subscription sees the current state instead of waiting for the next change.
+     */
+    private emitPaneRangeChange(): void {
+        if (this.paneRangeHandlers.size === 0) return;
+        if (this.emittingPaneRange) return;
+        const changed: PaneRangeEvent[] = [];
+        for (let index = 0; index < this.paneLayout.rects.length; index++) {
+            const range: [number, number] | null = this.paneRangeOf(index);
+            if (range === null) continue;
+            const previous: [number, number] | undefined = this.lastReportedPaneRanges.get(index);
+            if (previous !== undefined
+                && previous[0] === range[0]
+                && previous[1] === range[1]
+            ) {
+                continue;
+            }
+            this.lastReportedPaneRanges.set(index, [range[0], range[1]]);
+            changed.push({ pane: index, range: [range[0], range[1]] });
+        }
+        if (changed.length === 0) return;
+        this.emittingPaneRange = true;
+        try {
+            for (const handler of Array.from(this.paneRangeHandlers)) {
+                for (const event of changed) handler(event);
+            }
+        } finally {
+            this.emittingPaneRange = false;
+        }
+    }
+
+    /**
+     * One pane's current range in its own units, or `null` when it has none to report.
+     *
+     * The single reader behind `getPriceRange`, `getPaneValueRange` and the range
+     * event, so the three cannot disagree. It reports the *drawn* range rather than the
+     * locked one: a pane whose lock is not being honoured is fitting, and reporting the
+     * lock would put a number on screen that the chart is not using.
+     */
+    private paneRangeOf(pane: number): [number, number] | null {
+        if (pane === PRICE_PANE) {
+            if (this.pricePaneRect().height <= 0 || this.scaleY === 0) return null;
+        } else {
+            const rect: PlotRect | undefined = this.paneLayout.rects[pane];
+            const transform: VerticalTransform | undefined = this.paneLayout.transforms[pane];
+            if (rect === undefined || transform === undefined) return null;
+            if (!(rect.height > 0) || transform.scaleY === 0) return null;
+        }
+        return this.getPaneValueRange(pane);
     }
 
     /**
@@ -2790,6 +2948,7 @@ export class Chart {
         if (this.destroyed) return;
         this.cancelScheduledViewportUpdate();
         this.cancelScheduledVisibleRangeChange();
+        this.cancelScheduledPaneRangeChange();
         document.removeEventListener('visibilitychange', this.handleVisibilityChange);
         this.canvasWrapper.removeEventListener('pointerdown', this.handlePointerDown);
         this.canvasWrapper.removeEventListener('pointermove', this.handlePointerMove);

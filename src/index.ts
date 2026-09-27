@@ -26,6 +26,7 @@ export type {
     CrosshairCleared,
     CrosshairData,
     CrosshairMoveEvent,
+    PaneRangeEvent,
     Unsubscribe,
     VisibleRangeEvent,
 } from './core/ChartEvents.js';

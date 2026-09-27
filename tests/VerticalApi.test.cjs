@@ -476,8 +476,128 @@ test('a zero-width price axis disables the gesture on every pane', () => {
     }
 });
 
-test('a drag of the plot still pans, and leaves a locked price range alone', () => {
+test('getPaneAtCoordinate answers the same question the drag asks', () => {
+    // The reason this method exists: a caller's own double-click has to reach
+    // `fitPaneRange(n)`, and without it the only way to learn `n` is to reimplement
+    // `paneRects` in application code. So the assertion is not just that it returns
+    // something sensible — it is that it agrees with the drag at every pixel, because
+    // two copies of "which pane is this" is what produces a divider desync.
+    const { h, axisX, paneRows, separator } = twoPaneChart();
+    try {
+        const chart = h.chart;
+        // The x bound is the canvas width, not the plot's: the gutter and the plot are
+        // one surface with rows either side, and asking from the gutter must give the
+        // same answer as asking from the middle of the plot.
+        const canvasWidth = 1200;
+
+        for (let y = 0; y < 578; y++) {
+            const expected = (y >= paneRows[0].top && y < paneRows[0].bottom)
+                ? 0
+                : (y >= paneRows[1].top && y < paneRows[1].bottom ? 1 : null);
+            // The gutter and the plot must answer alike: they share rows.
+            assert.equal(chart.getPaneAtCoordinate(axisX, y), expected, `gutter at y=${y}`);
+            assert.equal(
+                chart.getPaneAtCoordinate(canvasWidth - 1, y),
+                expected,
+                `plot at y=${y}`,
+            );
+        }
+        // Every pixel of the divider is nobody's.
+        for (let offset = 0; offset < separator; offset++) {
+            assert.equal(
+                chart.getPaneAtCoordinate(axisX, paneRows[0].bottom + offset),
+                null,
+                `divider pixel ${offset}`,
+            );
+        }
+        // And off the side of the chart is null rather than answered from y alone.
+        assert.equal(chart.getPaneAtCoordinate(-1, 100), null, 'x left of the canvas');
+        assert.equal(chart.getPaneAtCoordinate(canvasWidth + 1, 100), null, 'x right of the canvas');
+        // Below the plot, in the time-axis strip.
+        assert.equal(chart.getPaneAtCoordinate(axisX, 590), null, 'the time axis strip');
+    } finally {
+        h.dispose();
+    }
+});
+
+test('a pane range change is reported once, and only when it moved', () => {
+    const { h, axisX, paneRows } = twoPaneChart();
+    try {
+        const chart = h.chart;
+        const events = [];
+        const unsubscribe = chart.subscribePaneRangeChange((e) => events.push(e));
+        h.flush();
+        // A first subscription reports the current state rather than waiting for the next
+        // change, so a readout mounted after the chart is already drawn is not blank.
+        assert.deepEqual(events.map((e) => e.pane), [0, 1], 'initial report');
+        const initialPrice = events.find((e) => e.pane === 0).range;
+        assert.deepEqual(initialPrice, chart.getPriceRange(), 'reported range must match the getter');
+
+        // A deliberate stretch of the lower pane: one event, for that pane only.
+        events.length = 0;
+        h.drag(axisX, paneRows[1].top + 1, axisX, paneRows[1].top + 161);
+        h.flush();
+        assert.deepEqual(events.map((e) => e.pane), [1], 'a lower-pane drag reported other panes');
+        assert.deepEqual(events[0].range, chart.getPaneValueRange(1), 'event range must match the getter');
+
+        // Doing nothing reports nothing. A pan is not a vertical change.
+        events.length = 0;
+        h.drag(400, 200, 300, 200);
+        h.flush();
+        assert.deepEqual(events, [], 'a pan reported a pane range change');
+
+        // Neither does a re-lock to the range it already holds.
+        events.length = 0;
+        chart.setPaneRange(1, chart.getPaneValueRange(1));
+        h.flush();
+        assert.deepEqual(events, [], 're-locking to the same range reported a change');
+
+        // And the price pane's fit wobbling must not wake a reader of pane 1.
+        events.length = 0;
+        const lowerBefore = chart.getPaneValueRange(1);
+        chart.setPriceRange([100, 200]);
+        h.flush();
+        assert.deepEqual(events.map((e) => e.pane), [0], 'a price change woke the lower pane');
+        assert.deepEqual(chart.getPaneValueRange(1), lowerBefore);
+
+        unsubscribe();
+        events.length = 0;
+        chart.setPriceRange([10, 20]);
+        h.flush();
+        assert.deepEqual(events, [], 'an unsubscribed handler was still called');
+    } finally {
+        h.dispose();
+    }
+});
+
+test('the range event follows the auto-fit, not only deliberate locks', () => {
+    // A readout that only heard about deliberate changes would be stale from the first
+    // new high — the same permanent lie as a barSpacing readout reporting its
+    // construction value, which is the defect this engine shipped twice.
     const h = withData();
+    try {
+        const chart = h.chart;
+        const events = [];
+        chart.subscribePaneRangeChange((e) => events.push(e));
+        h.flush();
+        events.length = 0;
+
+        // A candle far outside the fitted range must move the fit and be reported.
+        chart.appendData({
+            time: 1_700_000_000_000 + 60 * 60_000, open: 400, high: 500, low: 390, close: 450, volume: 1,
+        });
+        h.flush();
+        assert.ok(events.length > 0, 'a new high reported no range change');
+        const last = events[events.length - 1];
+        assert.equal(last.pane, 0);
+        assert.deepEqual(last.range, chart.getPriceRange(), 'reported range must match the getter');
+        assert.ok(last.range[1] > 400, `the fit should have moved up, reported ${last.range}`);
+    } finally {
+        h.dispose();
+    }
+});
+
+test('a drag of the plot still pans, and leaves a locked price range alone', () => {    const h = withData();
     try {
         const chart = h.chart;
         const { priceAxisWidth, timeAxisHeight } = chart.options().layout;
