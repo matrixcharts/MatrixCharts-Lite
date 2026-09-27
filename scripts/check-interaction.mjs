@@ -184,28 +184,78 @@ try {
     await page.mouse.up();
     await wait(200);
 
-    // The bar to hold is the one at the *plot centre*, because that is what this path
-    // promises. A wheel event anchors on the pointer because there is a pointer; a
-    // programmatic barSpacing change has none, and anchors on the middle of the plot.
-    // The two differ deliberately, so each is asserted against its own contract — the
-    // first version of this case measured a bar 40% across and read 41px of "drift"
-    // that was 120px times the zoom factor, which is the contract working.
-    const programmatic = await page.evaluate(() => {
+    // The contract of a plot-centred zoom is not "nothing moved". It is: the transform
+    // is a pure scale about the plot centre by a known factor. So predict where the
+    // bar must land and compare, which checks the anchor point *and* the factor rather
+    // than only the absence of movement.
+    //
+    //     x' = centre + (x - centre) * factor
+    //
+    // Asserting "did not move" instead is only valid for a bar whose centre coincides
+    // with the plot centre, and no such bar generally exists — the nearest one is up to
+    // half a bar away, so it is *supposed* to move. That is what the 9.998px was: half
+    // a bar times the zoom factor, which the contract allows and a naive assertion
+    // reports as a bug.
+    //
+    // Predict-and-compare also discriminates the one way this can genuinely be wrong:
+    // if the code takes its live-edge branch instead of anchoring, the prediction fails
+    // loudly and by a lot, rather than drifting a few pixels for reasons nobody can
+    // reconstruct afterwards.
+    const before = await page.evaluate(() => {
         const mc = globalThis.__mc;
         const { x, width } = mc.plot();
         const centre = x + width / 2;
         const index = mc.indexAt(centre);
-        return { index, x: mc.xOf(index), spacing: mc.spacing() };
+        return { index, barX: mc.xOf(index), centre, spacing: mc.spacing() };
     });
+
+    const factor = 1.4;
     await page.evaluate((s) => globalThis.__mc.chart.applyOptions({ timeScale: { barSpacing: s * 1.4 } }),
-        programmatic.spacing);
+        before.spacing);
     await wait(300);
-    const programmaticAfter = await page.evaluate((index) => globalThis.__mc.xOf(index), programmatic.index);
-    const programmaticDrift = Math.abs(programmaticAfter - programmatic.x);
+
+    const predicted = before.centre + (before.barX - before.centre) * factor;
+    const actual = await page.evaluate((index) => globalThis.__mc.xOf(index), before.index);
+    const error = Math.abs(actual - predicted);
     record(
-        'barSpacing change holds the bar at the plot centre',
-        programmaticDrift <= ANCHOR_TOLERANCE_PX,
-        `bar ${programmatic.index} moved ${programmaticDrift.toFixed(3)}px (limit ${ANCHOR_TOLERANCE_PX}px)`,
+        'barSpacing change scales about the plot centre by the factor',
+        error <= ANCHOR_TOLERANCE_PX,
+        `bar ${before.index} landed at ${actual.toFixed(3)}px, predicted ${predicted.toFixed(3)}px (off by ${error.toFixed(3)}px)`,
+    );
+
+    // Diagnose *where* the anchor is, rather than only that it is wrong. Both offsetX
+    // and scaleX are readable through the public API — indexToCoordinate(0) is offsetX
+    // exactly, because bar 0 sits at slot 0 — so the anchor a scale was taken about can
+    // be solved for:
+    //
+    //     offsetX' = a + (offsetX - a) * f   =>   a = (offsetX' - f * offsetX) / (1 - f)
+    //
+    // Comparing that a against the plot centre says whether the code anchored somewhere
+    // else entirely (a live-edge park, a stale rect, a different origin) or merely used
+    // the wrong number, which are different bugs with different fixes.
+    const derived = await page.evaluate(() => {
+        const mc = globalThis.__mc;
+        const { x, width } = mc.plot();
+        return {
+            offsetX: mc.xOf(0),
+            scaleX: mc.xOf(1) - mc.xOf(0),
+            centre: x + width / 2,
+        };
+    });
+    const after = await page.evaluate(() => {
+        const mc = globalThis.__mc;
+        return { offsetX: mc.xOf(0), scaleX: mc.xOf(1) - mc.xOf(0) };
+    });
+    const appliedFactor = after.scaleX / derived.scaleX;
+    const impliedAnchor = Math.abs(1 - appliedFactor) < 1e-9
+        ? Number.NaN
+        : (after.offsetX - appliedFactor * derived.offsetX) / (1 - appliedFactor);
+    record(
+        'the plot-centred zoom anchors where it claims to',
+        Math.abs(impliedAnchor - derived.centre) <= 1,
+        `implied anchor ${impliedAnchor.toFixed(2)}px vs plot centre ${derived.centre.toFixed(2)}px ` +
+        `(offsetX ${derived.offsetX.toFixed(2)}->${after.offsetX.toFixed(2)}, ` +
+        `scaleX ${derived.scaleX.toFixed(3)}->${after.scaleX.toFixed(3)}, f=${appliedFactor.toFixed(4)})`,
     );
 
     // Drag: the inverse invariant. A pan is a pure delta, so the bar under the
