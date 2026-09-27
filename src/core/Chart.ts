@@ -103,6 +103,22 @@ const FALLBACK_CSS_HEIGHT = 500;
 const CLICK_SLOP_PX = 4;
 
 /**
+ * Bounds on the span multiplier one price-axis drag may apply.
+ *
+ * A drag is unbounded input — the pointer can leave the window — so the factor is
+ * clamped rather than merely guarded. Clamping means the axis stops moving at the
+ * limit and the gesture stays reversible: dragging back from the limit retraces the
+ * range exactly, because every move is measured from the press baseline rather than
+ * from the last frame. Rejecting instead would leave the axis stuck at whatever the
+ * last accepted move produced, which is a worse thing to drag back out of.
+ *
+ * Ten-fold is generous for a single gesture and the bounds are not the interesting
+ * part: a trader who wants forty-fold zooms in twice.
+ */
+const AXIS_DRAG_MIN_FACTOR = 0.1;
+const AXIS_DRAG_MAX_FACTOR = 10;
+
+/**
  * Relative body width written into every source candle. The renderer treats it as
  * a weight that aggregation sums, never as pixels; actual body width comes from
  * `candlestickBodyWidthDevicePixels`, which reads the bar spacing instead.
@@ -134,6 +150,24 @@ export class Chart {
     private activePointers: Map<number, { x: number; y: number }> = new Map();
     private lastPinchDistance: number = 0;
     private lastPinchCenterX: number = 0;
+    /**
+     * A drag of the price axis, which is a single-pointer gesture distinct from both
+     * a pan and a pinch.
+     *
+     * The baseline is the pane's range in *scale* space at the moment of the press,
+     * not the previous frame's range. Every move is measured from the press, so the
+     * result is a function of where the drag started and where the pointer is now —
+     * a chain of per-frame multiplications would accumulate float error over a long
+     * drag and would make the gesture's result depend on the event rate. `paneHeight`
+     * is the height the press was measured against, held for the same reason: a resize
+     * mid-drag must not retroactively rescale a gesture already under way.
+     */
+    private priceAxisDrag: {
+        pressY: number;
+        paneHeight: number;
+        baseLow: number;
+        baseHigh: number;
+    } | null = null;
     private offsetX: number = 0;
     private scaleX: number = 1;
     private offsetY: number = 0;
@@ -385,14 +419,109 @@ export class Chart {
         this.capturePointer(event.pointerId);
 
         if (this.activePointers.size === 1) {
-            this.isDragging = true;
-            this.lastPointerX = event.clientX;
+            // A press on the price axis owns the vertical scale; anywhere else it is a
+            // pan. The two are mutually exclusive on purpose — a drag that started on
+            // the axis must not also slide the series sideways, because the caller
+            // asked for a price span and would silently get a moved one as well.
+            if (this.isOnPriceAxis(event.clientX)) {
+                this.beginPriceAxisDrag(event.clientY);
+            } else {
+                this.priceAxisDrag = null;
+                this.isDragging = true;
+                this.lastPointerX = event.clientX;
+            }
         } else if (this.activePointers.size === 2) {
+            // A second finger converts the gesture to a pinch, which is horizontal.
+            // The axis drag is dropped rather than resumed, so lifting one finger
+            // cannot re-apply a baseline captured before the pinch moved anything.
+            this.priceAxisDrag = null;
             this.isDragging = false;
             this.pressMoved = true;
             this.resetPinchBaseline();
         }
     };
+
+    /**
+     * Whether a press at this client x landed on the price axis rather than the plot.
+     *
+     * The price axis is the left gutter, `layout.priceAxisWidth` wide, exactly as
+     * `plotRect` reserves it. Read from the same option and the same rect, so the
+     * hit region and the drawn gutter cannot drift apart — a hit test measuring the
+     * canvas centre instead would claim the whole left half of the plot.
+     */
+    private isOnPriceAxis(clientX: number): boolean {
+        const width: number = this.resolvedOptions.layout.priceAxisWidth;
+        if (!(width > 0)) return false;
+        const rect: DOMRect = this.canvasWrapper.getBoundingClientRect();
+        return clientX - rect.left < width;
+    }
+
+    /**
+     * Begins a price-axis drag, capturing the baseline it will be measured against.
+     *
+     * The baseline is the pane's current range in scale space. A press is recorded
+     * even when the pane has no usable height or the chart has no vertical transform
+     * yet; in that case `beginPriceAxisDrag` leaves the drag null and the press falls
+     * through as an ordinary one, so a degenerate chart is inert rather than throwing
+     * on a pointer event.
+     */
+    private beginPriceAxisDrag(clientY: number): void {
+        this.priceAxisDrag = null;
+        this.isDragging = false;
+        const pane: PlotRect = this.pricePaneRect();
+        if (!(pane.height > 0) || this.scaleY === 0) return;
+        const transform: VerticalTransform = { scaleY: this.scaleY, offsetY: this.offsetY };
+        const atTop: number = paneValueAt(transform, pane.y);
+        const atBottom: number = paneValueAt(transform, pane.y + pane.height);
+        this.priceAxisDrag = {
+            pressY: clientY,
+            paneHeight: pane.height,
+            baseLow: Math.min(atTop, atBottom),
+            baseHigh: Math.max(atTop, atBottom),
+        };
+    }
+
+    /**
+     * Maps the pointer's vertical travel onto a new price span and locks it.
+     *
+     * Dragging *down* expands and dragging *up* compresses, one pane height of travel
+     * for a factor of two, measured from the press so the gesture is a function of
+     * its endpoints rather than of how many events it took to get there. The scale is
+     * applied about the centre of the range, which is the one point the gesture leaves
+     * alone — a drag is about the span, and hinging at the centre keeps that true
+     * wherever on the axis it was grabbed.
+     *
+     * The arithmetic is in scale space, so a log axis compresses by a ratio of log
+     * rather than by a difference of price. That is the same reason `autoScaleY`
+     * applies its padding there: ten percent of the visible span has to mean the same
+     * thing on either axis, or a log pane's headroom would be in currency units.
+     */
+    private updatePriceAxisDrag(clientY: number): void {
+        const drag = this.priceAxisDrag;
+        if (drag === null) return;
+        // Nothing happens until the press has actually travelled. Without this a
+        // one-pixel twitch while clicking the axis rescales the pane by a fraction of
+        // a percent *and locks it*, so brushing the axis would silently take the
+        // vertical scale away from the caller. The same slop that separates a pan
+        // from a click separates a drag from a click, for the same reason and with
+        // the same constant — the press has to mean it.
+        if (!this.pressMoved) return;
+        const travel: number = 1 + (clientY - drag.pressY) / drag.paneHeight;
+        const factor: number = Math.min(AXIS_DRAG_MAX_FACTOR, Math.max(AXIS_DRAG_MIN_FACTOR, travel));
+        const centre: number = (drag.baseLow + drag.baseHigh) / 2;
+        const span: number = (drag.baseHigh - drag.baseLow) * factor;
+        const scale: PriceScale = this.priceScale();
+        const low: number = fromScaleSpace(centre - span / 2, scale);
+        const high: number = fromScaleSpace(centre + span / 2, scale);
+        // The clamp above is on the multiplier, so this can still be reached from a
+        // range that was already very wide or very narrow. A drag ignores a result it
+        // cannot draw rather than throwing: the same contract `setPriceRange` enforces,
+        // reached by returning instead, because a pointer move has no caller to report
+        // to and throwing here would take the whole gesture down mid-drag.
+        if (!Number.isFinite(low) || !Number.isFinite(high) || high <= low) return;
+        if (scale === 'log' && low <= 0) return;
+        this.adoptLockedPriceRange([low, high]);
+    }
 
     /**
      * Pointer capture keeps a drag alive when the pointer leaves the chart. It
@@ -431,6 +560,12 @@ export class Chart {
             this.handlePinchMove();
             return;
         }
+        // After the pinch branch, so two pointers always mean pinch. A press on the
+        // axis is a single-pointer gesture and the second finger already dropped it.
+        if (this.priceAxisDrag !== null) {
+            this.updatePriceAxisDrag(event.clientY);
+            return;
+        }
         if (!this.isDragging) return;
 
         const deltaX: number = event.clientX - this.lastPointerX;
@@ -453,6 +588,10 @@ export class Chart {
         } else if (this.activePointers.size === 0) {
             this.isDragging = false;
             this.lastPinchDistance = 0;
+            // The axis drag ends with the gesture that started it. Dropping the
+            // baseline here is what stops a later press from measuring against a
+            // range captured several gestures ago.
+            this.priceAxisDrag = null;
             // A press that never travelled is a click; one that travelled was a pan.
             if (wasSinglePointer && !this.pressMoved) {
                 this.emitClick(event.clientX, event.clientY, this.pressButton);
@@ -478,7 +617,10 @@ export class Chart {
 
     /** A drag or pinch is under way, so pointer movement is not hover. */
     private isInteracting(): boolean {
-        return this.isDragging || this.activePointers.size >= 2;
+        // The axis drag counts even though it leaves `isDragging` false: it is a
+        // gesture in progress, and without this the crosshair would keep tracking
+        // the pointer as hover while the price range is being dragged underneath it.
+        return this.isDragging || this.activePointers.size >= 2 || this.priceAxisDrag !== null;
     }
 
     private handleWheel = (event: WheelEvent): void => {
@@ -1155,11 +1297,24 @@ export class Chart {
             const price: number = last === null ? 0 : last.close;
             return [price, price];
         }
-        // Both ends of the pane, converted back out of scale space. Read in that
-        // order and normalised afterwards, so an inverted pane reports low first
-        // like every other range in the API.
-        const atTop: number = fromScaleSpace(this.offsetY, this.priceScale());
-        const atBottom: number = fromScaleSpace(this.offsetY + rect.height * this.scaleY, this.priceScale());
+        // Both ends of the pane, converted back out of scale space.
+        //
+        // Through `paneValueAt`, like `getPaneValueRange` and the axis renderer, rather
+        // than through `offsetY` directly. This used to read `fromScaleSpace(offsetY)`
+        // and `fromScaleSpace(offsetY + height * scaleY)`, which treats `offsetY` as a
+        // scale-space value — but `offsetY` is the *pixel* at which scale-space zero
+        // sits, and the transform is `y = offsetY + v * scaleY`. The two readings differ
+        // by a factor of `scaleY` in the span and disagree outright on the position, so
+        // a pane showing 106.6 to 111.6 reported -56732 to 13568, and a range set with
+        // `setPriceRange([100, 200])` read back as -2184 to 1156. Nothing caught it
+        // because no test called this: the vertical public API had none at all, while
+        // the horizontal one it mirrors has had coverage for several phases.
+        const transform: VerticalTransform = { scaleY: this.scaleY, offsetY: this.offsetY };
+        const atTop: number = fromScaleSpace(paneValueAt(transform, rect.y), this.priceScale());
+        const atBottom: number = fromScaleSpace(
+            paneValueAt(transform, rect.y + rect.height),
+            this.priceScale(),
+        );
         return [Math.min(atTop, atBottom), Math.max(atTop, atBottom)];
     }
 
@@ -1187,13 +1342,35 @@ export class Chart {
         if (scale === 'log' && minimum <= 0) {
             throw new Error(`MatrixCharts: a log price scale cannot show a range starting at ${minimum}.`);
         }
-        this.lockedPriceRange = [minimum, maximum];
+        this.adoptLockedPriceRange([minimum, maximum]);
+    }
+
+    /**
+     * Takes ownership of the price pane's vertical scale at a given range.
+     *
+     * The one place a price range becomes the locked one, so a caller's
+     * `setPriceRange` and a drag of the price axis cannot disagree about what
+     * "locked" means — in particular about `autoScale`, which has to go false in
+     * *both* option objects. Writing only the resolved copy would let the next
+     * unrelated `applyOptions` rebuild the resolved snapshot from the explicit pair
+     * and hand the pane back to the auto-scaler, which is the same half-sync that
+     * made `options().timeScale.barSpacing` disagree with the bars.
+     *
+     * It applies the range directly rather than going through `updateViewport`,
+     * because a vertical change moves no bar: the viewport update would re-upload
+     * the visible candles and re-emit the decorations for a change that touches
+     * neither. The lock is still the single source of truth, because `autoScaleY`
+     * re-applies this same range on every later frame — this is the fast path into
+     * the state that path reads, not a second source of truth beside it.
+     */
+    private adoptLockedPriceRange(range: readonly [number, number]): void {
+        this.lockedPriceRange = [range[0], range[1]];
         this.resolvedOptions.priceScale.autoScale = false;
         this.explicitOptions.priceScale = {
             ...(this.explicitOptions.priceScale ?? {}),
             autoScale: false,
         };
-        this.applyPriceRange([minimum, maximum]);
+        this.applyPriceRange(range);
         this.refreshCrosshairAfterViewportChange();
         this.redraw();
     }

@@ -86,6 +86,47 @@ try {
     await page.waitForFunction(() => globalThis.__mcReady === true, { timeout: 20000 });
     await wait(500);
 
+    // The reported price range has to be the range the pane is actually showing.
+    //
+    // This is the vertical half of the bar-spacing check below, and it was wrong by
+    // three orders of magnitude. `getPriceRange` read `fromScaleSpace(offsetY)`, which
+    // treats `offsetY` as a scale-space value, but `offsetY` is the pixel at which
+    // scale-space zero sits, so a pane showing 106.6 to 111.6 reported -56732 to 13568,
+    // and a range set with `setPriceRange([100, 200])` read back as -2184 to 1156. Every
+    // other vertical reader goes through `paneValueAt` — the axis renderer and
+    // `getPaneValueRange` both did, which is what makes this one an outlier rather than
+    // a convention.
+    //
+    // Asserted against `coordinateToPrice` at the two pane edges rather than a
+    // hand-written number, so the claim is the one that matters and cannot rot when
+    // the auto-fit padding changes.
+    const priceRead = await page.evaluate(() => {
+        const mc = globalThis.__mc;
+        const timeAxisHeight = mc.chart.options().layout.timeAxisHeight;
+        const top = mc.plot().y;
+        const bottom = top + mc.plot().height - timeAxisHeight;
+        const reported = mc.chart.getPriceRange();
+        const atTop = mc.chart.coordinateToPrice(top);
+        const atBottom = mc.chart.coordinateToPrice(bottom);
+        return {
+            reportedLow: Math.min(reported[0], reported[1]),
+            reportedHigh: Math.max(reported[0], reported[1]),
+            drawnLow: Math.min(atTop, atBottom),
+            drawnHigh: Math.max(atTop, atBottom),
+        };
+    });
+    const priceReadOff = Math.max(
+        Math.abs(priceRead.reportedLow - priceRead.drawnLow),
+        Math.abs(priceRead.reportedHigh - priceRead.drawnHigh),
+    );
+    record(
+        'the reported price range is the one on screen',
+        priceReadOff <= 1e-6,
+        `options say [${priceRead.reportedLow.toFixed(4)}, ${priceRead.reportedHigh.toFixed(4)}], ` +
+        `the pane shows [${priceRead.drawnLow.toFixed(4)}, ${priceRead.drawnHigh.toFixed(4)}] ` +
+        `(off by ${priceReadOff.toExponential(2)})`,
+    );
+
     // The reported bar spacing has to be the one on screen, and it has to be so from
     // the first frame, not only after a zoom.
     //
@@ -397,6 +438,231 @@ try {
         'drag carries the series with the pointer',
         off <= 2,
         `bar ${panBefore.index} travelled ${travelled.toFixed(2)}px for a ${drag}px drag (off by ${off.toFixed(2)}px)`,
+    );
+
+    // --- Vertical: dragging the price axis -------------------------------------
+    //
+    // The gesture is a drag of the left gutter, and its whole job is to take the
+    // vertical scale away from the auto-scaler and hold a span the caller chose. It is
+    // deliberately *not* the pinch path: a pinch is a scaleY multiplier about a focal
+    // point on the plot, whereas this alters explicit [low, high] bounds and hands them
+    // to the lock, so the two would be fighting over the same value.
+    //
+    // Every assertion below is stated in *scale space*, which is the space the drag
+    // works in. That is what makes one set of cases cover both a linear and a log
+    // axis: on linear the scale-space span is a difference of prices, on log it is a
+    // difference of logs, and "the span grew by half, and the middle did not move" is
+    // the same statement either way. Asserting it in prices would have made the log
+    // case look like a different feature.
+    const axisGeom = await page.evaluate(() => {
+        const options = globalThis.__mc.chart.options();
+        return {
+            priceAxisWidth: options.layout.priceAxisWidth,
+            timeAxisHeight: options.layout.timeAxisHeight,
+            plotHeight: globalThis.__mc.plot().height,
+        };
+    });
+    const axisPaneHeight = axisGeom.plotHeight - axisGeom.timeAxisHeight;
+    // The middle of the reserved gutter, not the middle of the canvas: a press at the
+    // canvas centre is in the plot, and would pan instead.
+    const axisX = Math.round(axisGeom.priceAxisWidth / 2);
+    const axisStartY = Math.round(axisGeom.plotHeight / 2);
+
+    // Range in scale space, plus the horizontal state, in one read so every number
+    // below comes from the same instant.
+    const readVertical = () => page.evaluate(() => {
+        const mc = globalThis.__mc;
+        const [low, high] = mc.chart.getPriceRange();
+        return {
+            low,
+            high,
+            mode: mc.chart.options().priceScale.mode,
+            autoScale: mc.chart.options().priceScale.autoScale,
+            barSpacing: mc.chart.options().timeScale.barSpacing,
+            offsetX: mc.xOf(0),
+            atRealtime: mc.chart.isAtRealtime(),
+        };
+    });
+    // Scale space depends on the mode: on a linear axis it *is* the price, on log it
+    // is the log. That is the whole reason the drag does its arithmetic there, and it
+    // has to be honoured here too.
+    //
+    // The first version of this took a difference of logs unconditionally, which is
+    // only the scale space on a log axis. It read the linear drag as 1.585x — that is
+    // log(225)-log(75) over log(200)-log(100) — while leaving the log case exactly
+    // right, so the one axis it was wrong about was the one it was not checking. The
+    // drag was correct throughout; 100 -> 150 on a 100 span is 1.5x, and the middle
+    // did not move at all.
+    const toScale = (price, mode) => (mode === 'log' ? Math.log(price) : price);
+    const spanOf = (v) => toScale(v.high, v.mode) - toScale(v.low, v.mode);
+    const centreOf = (v) => (toScale(v.low, v.mode) + toScale(v.high, v.mode)) / 2;
+
+    // 1. A press on the axis that never travels is a click, not a drag.
+    //
+    // Without the slop gate a one-pixel twitch while clicking rescaled the pane by
+    // 0.17% *and* locked it, so brushing the axis silently took the vertical scale
+    // away from the caller. The gate is the same CLICK_SLOP_PX the pan uses to tell a
+    // click from a drag, for the same reason.
+    const clickBefore = await readVertical();
+    await page.mouse.move(axisX, axisStartY);
+    await page.mouse.down();
+    await page.mouse.move(axisX + 1, axisStartY + 1);
+    await page.mouse.up();
+    await wait(200);
+    const clickAfter = await readVertical();
+    record(
+        'a click on the price axis leaves the vertical scale alone',
+        Math.abs(spanOf(clickAfter) - spanOf(clickBefore)) <= 1e-9 && clickAfter.autoScale === clickBefore.autoScale,
+        `1px press moved the span by ${Math.abs(spanOf(clickAfter) - spanOf(clickBefore)).toExponential(2)}, ` +
+        `autoScale stayed ${clickAfter.autoScale}`,
+    );
+
+    // 2. A real drag scales the span by the distance travelled, about the middle.
+    //
+    // The range is locked first, and that is not incidental. The chart is autoscaling
+    // against a feed that is still appending, so between the chart's own pointerdown
+    // handler — which captures the drag's baseline — and any read taken afterwards, an
+    // append can re-fit the range under the measurement. Reading the baseline after
+    // mouse.down is not enough: the append lands *between* the handler and the read.
+    // It showed up as 1.50030x with the middle 3e-4 out, which is the feed arriving and
+    // not the gesture being wrong.
+    //
+    // So the quantitative claim is measured against a locked range, where nothing can
+    // move it, and the claim that the drag takes the scale off autoScale is made by
+    // the next case on a live autoscaling chart. Splitting them is also why this is
+    // two cases rather than one: each asserts one thing, and neither is at the mercy of
+    // the other's timing.
+    await page.evaluate(() => globalThis.__mc.chart.setPriceRange([100, 200]));
+    await wait(200);
+    const wantedFactor = 1.5;
+    const travel = Math.round(axisPaneHeight * (wantedFactor - 1));
+    const vBefore = await readVertical();
+    await page.mouse.move(axisX, axisStartY);
+    await page.mouse.down();
+    await page.mouse.move(axisX, axisStartY + travel, { steps: 10 });
+    await page.mouse.up();
+    await wait(250);
+    const vAfter = await readVertical();
+    const gotFactor = spanOf(vAfter) / spanOf(vBefore);
+    const centreHeld = Math.abs(centreOf(vAfter) - centreOf(vBefore));
+    record(
+        'a price-axis drag scales the span by the distance it travelled',
+        Math.abs(gotFactor - wantedFactor) <= 0.002 && centreHeld <= 1e-6,
+        `${travel}px of a ${axisPaneHeight}px pane asked for ${wantedFactor}x, applied ` +
+        `${gotFactor.toFixed(5)}x, middle held to ${centreHeld.toExponential(2)}`,
+    );
+
+    // 3. The vertical gesture must not touch the horizontal one.
+    //
+    // This is the decoupling stated as an invariant rather than left to inspection: a
+    // press on the axis that also slid the series, or that disturbed the live-edge
+    // latch, would be two gestures in one and the caller would have no way to ask for
+    // only one of them.
+    record(
+        'a price-axis drag leaves the horizontal axis and the live-edge latch alone',
+        Math.abs(vAfter.barSpacing - vBefore.barSpacing) <= 1e-9
+            && Math.abs(vAfter.offsetX - vBefore.offsetX) <= 1e-9
+            && vAfter.atRealtime === vBefore.atRealtime,
+        `bar spacing ${vBefore.barSpacing.toFixed(3)} -> ${vAfter.barSpacing.toFixed(3)}, ` +
+        `offsetX ${vBefore.offsetX.toFixed(2)} -> ${vAfter.offsetX.toFixed(2)}, ` +
+        `live-edge ${vBefore.atRealtime} -> ${vAfter.atRealtime}`,
+    );
+
+    // 4. On a live autoscaling chart, the drag takes the scale off autoScale, the lock
+    //    survives the feed, and fitPriceRange hands it back. The middle of that is the
+    //    point of routing the drag through the lock: a range the next append quietly
+    //    re-fits is not a range anybody chose.
+    //
+    //    It starts by handing the scale back, because the case above locked it. That is
+    //    the only reason this reads `fitPriceRange` twice — once to get a live chart to
+    //    drag on, once to prove the drag is reversible.
+    //
+    //    The fitted span is compared against the *dragged* span, not the autoscaled one
+    //    the drag started from. The fit is deterministic, so restoring it necessarily
+    //    lands back near where the fit already was; the first version of this asserted
+    //    the two differed and failed on exactly that, having read "the fit came back" as
+    //    "the fit is somewhere else".
+    await page.evaluate(() => globalThis.__mc.chart.fitPriceRange());
+    await wait(250);
+    const vAuto = await readVertical();
+    await page.mouse.move(axisX, axisStartY);
+    await page.mouse.down();
+    await page.mouse.move(axisX, axisStartY + travel, { steps: 10 });
+    await page.mouse.up();
+    await wait(250);
+    const vLocked = await readVertical();
+    await wait(600);
+    const vFed = await readVertical();
+    await page.evaluate(() => globalThis.__mc.chart.fitPriceRange());
+    await wait(300);
+    const vFitted = await readVertical();
+    record(
+        'the drag takes the scale off autoScale, the lock survives the feed, fit restores it',
+        vAuto.autoScale === true
+            && vLocked.autoScale === false
+            && vFed.autoScale === false
+            && Math.abs(spanOf(vFed) - spanOf(vLocked)) <= 1e-9
+            && vFitted.autoScale === true
+            && Math.abs(spanOf(vFitted) - spanOf(vLocked)) > 1e-6,
+        `autoScale ${vAuto.autoScale} -> ${vLocked.autoScale}, span held across the feed to ` +
+        `${Math.abs(spanOf(vFed) - spanOf(vLocked)).toExponential(2)}, fitPriceRange restored ` +
+        `autoScale=${vFitted.autoScale} and undid the drag (span ${spanOf(vFitted).toFixed(4)} ` +
+        `vs the dragged ${spanOf(vLocked).toFixed(4)})`,
+    );
+
+    // 5. The same gesture on a log axis.
+    //
+    // Switched here rather than at the top so the horizontal cases above run against
+    // the default linear pane, and locked for the same reason as case 2. The assertion
+    // is unchanged: the *scale-space* span grows by the same factor and the middle
+    // holds. On log that means the ratio high/low grows, not the difference — a log
+    // pane's headroom is a ratio of log, which is the same reason `autoScaleY` applies
+    // its padding in scale space. Asserting it in prices would make this look like a
+    // different feature rather than the same one on another axis.
+    await page.evaluate(() => {
+        globalThis.__mc.chart.applyOptions({ priceScale: { mode: 'log' } });
+        globalThis.__mc.chart.setPriceRange([50, 200]);
+    });
+    await wait(300);
+    const logBefore = await readVertical();
+    await page.mouse.move(axisX, axisStartY);
+    await page.mouse.down();
+    await page.mouse.move(axisX, axisStartY + travel, { steps: 10 });
+    await page.mouse.up();
+    await wait(250);
+    const logAfter = await readVertical();
+    const logFactor = spanOf(logAfter) / spanOf(logBefore);
+    const logCentreHeld = Math.abs(centreOf(logAfter) - centreOf(logBefore));
+    const ratioBefore = logBefore.high / logBefore.low;
+    const ratioAfter = logAfter.high / logAfter.low;
+    record(
+        'the same drag on a log axis scales the log span, not the price difference',
+        Math.abs(logFactor - wantedFactor) <= 0.002
+            && logCentreHeld <= 1e-6
+            && logAfter.high > logAfter.low,
+        `asked ${wantedFactor}x, applied ${logFactor.toFixed(5)}x on the log span; ` +
+        `high/low ${ratioBefore.toFixed(5)} -> ${ratioAfter.toFixed(5)}, ` +
+        `geometric middle held to ${logCentreHeld.toExponential(2)}`,
+    );
+    await page.evaluate(() => globalThis.__mc.chart.applyOptions({ priceScale: { mode: 'linear' } }));
+    await wait(200);
+
+    // 6. A drag inside the plot is still a pan and must not scale vertically.
+    const panGuard = await readVertical();
+    const insideX = axisGeom.priceAxisWidth + 60;
+    await page.mouse.move(insideX, axisStartY);
+    await page.mouse.down();
+    await page.mouse.move(insideX - 120, axisStartY, { steps: 10 });
+    await page.mouse.up();
+    await wait(250);
+    const panGuardAfter = await readVertical();
+    record(
+        'a drag inside the plot still pans and does not scale vertically',
+        Math.abs(panGuardAfter.offsetX - (panGuard.offsetX - 120)) <= 2
+            && Math.abs(spanOf(panGuardAfter) - spanOf(panGuard)) <= 1e-9,
+        `offsetX ${panGuard.offsetX.toFixed(2)} -> ${panGuardAfter.offsetX.toFixed(2)} ` +
+        `(wanted ${(panGuard.offsetX - 120).toFixed(2)}), scale-space span moved by ` +
+        `${Math.abs(spanOf(panGuardAfter) - spanOf(panGuard)).toExponential(2)}`,
     );
 
     record(
