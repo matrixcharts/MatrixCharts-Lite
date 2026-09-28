@@ -1046,7 +1046,8 @@ export class WebGL2Renderer implements IDataRenderer {
             // plot. The price pane uses the plot rect, which is the same box in the
             // single-pane case, so this only changes anything once panes exist.
             const paneRect: PlotRect | undefined = this.currentPanes[entry.pane];
-            if (entry.pane !== 0 && paneRect !== undefined) applyScissor(paneRect);
+            const targetPaneRect = (this.currentPanes.length > 0 && paneRect !== undefined) ? paneRect : plot;
+            applyScissor(targetPaneRect);
             entry.draw(
                 uniforms,
                 this.resolutionLocation!,
@@ -1055,7 +1056,6 @@ export class WebGL2Renderer implements IDataRenderer {
                 this.pixelRatioLocation!,
                 this.snapOffsetLocation!,
             );
-            if (entry.pane !== 0 && paneRect !== undefined) applyScissor(plot);
         }
 
         gl.bindVertexArray(null);

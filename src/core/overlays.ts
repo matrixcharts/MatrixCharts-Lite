@@ -406,8 +406,8 @@ export function bucketOverlay(
     // line whose first covered bar is left of the plot still contributes the buckets
     // that touch it, and a series that starts partway across the chart still begins
     // partway across rather than trailing in from the left edge.
-    const screenFrom: number = Math.max(firstIndex, visibleFrom - (factor > 1 ? factor : 1));
-    const screenTo: number = Math.min(lastIndex, visibleTo + (factor > 1 ? factor : 1));
+    const screenFrom: number = Math.floor(Math.max(firstIndex, visibleFrom - (factor > 1 ? factor : 1)));
+    const screenTo: number = Math.ceil(Math.min(lastIndex, visibleTo + (factor > 1 ? factor : 1)));
     if (screenFrom > screenTo) return { points: new Float32Array(0), stride: 2 };
 
     const stride: 2 | 6 = pointColors === null ? 2 : 6;

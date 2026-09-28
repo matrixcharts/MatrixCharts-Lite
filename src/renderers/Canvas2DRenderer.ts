@@ -968,7 +968,7 @@ public init(canvas: HTMLCanvasElement, emitter: EventEmitter<ChartEvents>): void
         const panes: PaneLayout | null = this.panes;
         if (panes === null || panes.rects.length < 2) return;
         const gap: number = this.options.panes.separatorHeight;
-        if (gap <= 0) return;
+        if (gap <= 0 || !this.options.panes.separatorColor) return;
 
         this.ctx.save();
         this.ctx.strokeStyle = this.options.panes.separatorColor;
@@ -979,12 +979,14 @@ public init(canvas: HTMLCanvasElement, emitter: EventEmitter<ChartEvents>): void
             const y: number = above.y + above.height;
             this.ctx.beginPath();
             this.ctx.moveTo(panes.rects[index].x, Math.floor(y) + 0.5);
-            this.ctx.lineTo(panes.rects[index].x + panes.rects[index].width, Math.floor(y) + 0.5);
+            const fullWidth: number = this.canvas ? this.canvas.width / this.devicePixelRatio : (panes.rects[index].x + panes.rects[index].width);
+            this.ctx.lineTo(fullWidth, Math.floor(y) + 0.5);
             this.ctx.stroke();
             // A gap wider than one pixel is filled rather than outlined, so the
             // whole reserved space is covered and not just its centre line.
             if (gap > 1) {
-                this.ctx.fillRect(panes.rects[index].x, y, panes.rects[index].width, gap - 1);
+                const fullWidth: number = this.canvas ? this.canvas.width / this.devicePixelRatio : (panes.rects[index].x + panes.rects[index].width);
+                this.ctx.fillRect(panes.rects[index].x, y, fullWidth, gap - 1);
             }
         }
         this.ctx.restore();

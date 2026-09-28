@@ -4234,7 +4234,7 @@ export class Chart {
             // reduction clamps its own range to the covered window, so passing a
             // deliberately generous range here cannot make it draw a bar it has no value
             // for.
-            this.visibleFirstOrdinal = Math.max(0, visibleMinX - 1);
+            this.visibleFirstOrdinal = Math.max(0, Math.floor(visibleMinX - 1));
             this.visibleLastOrdinal = Math.min(
                 this.candlePyramid.candleCount - 1,
                 visibleMaxX + 1,
