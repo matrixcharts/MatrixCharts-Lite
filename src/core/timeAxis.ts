@@ -242,6 +242,22 @@ export interface TimeAxisTicksInput {
     widthPx: number;
     /** Smallest CSS pixel gap between two labels. */
     minLabelPx?: number;
+    /**
+     * The modal bar interval in ms, if the caller already knows it.
+     *
+     * `timeAxisTicks` runs on every rendered frame, and it needs this to pick a
+     * step from the calendar ladder. Left to itself it derived the interval by
+     * building an `(n-1)`-element array of every gap in the retained series and
+     * sorting it — an O(n log n) sort of a million boxed doubles, on every pan,
+     * zoom, append, resize, and crosshair frame, at the default retention of
+     * 1,000,000 candles.
+     *
+     * The value only changes when the timestamps do, so a caller that owns the
+     * timestamps should own the interval too and pass it down. Omit it and the
+     * derivation still runs, which is correct and slow; that is the trade, and it
+     * is the right one for a pure function called from a test.
+     */
+    interval?: number;
 }
 
 /**
@@ -284,7 +300,13 @@ export function timeAxisTicks(input: TimeAxisTicksInput): TimeAxisTick[] {
     // bars it is showing rather than going blank.
     const budget: number = Math.max(1, Math.floor(widthPx / minLabelPx));
 
-    const interval: number = modalInterval(times);
+    // The caller's value when it has one. `?? ` rather than a truthiness test,
+    // because an interval of 0 is a real answer — a series whose bars all share a
+    // timestamp — and it has to suppress the ladder rather than fall through to a
+    // derivation that would produce the same 0 anyway.
+    const interval: number = input.interval !== undefined && Number.isFinite(input.interval)
+        ? input.interval
+        : modalInterval(times);
     // Without an interval there is no duration to align to, so the ladder cannot be
     // consulted and the step is whatever the pixel budget asks for. A one-bar or
     // all-identical-times series lands here.

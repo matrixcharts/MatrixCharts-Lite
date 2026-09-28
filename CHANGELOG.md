@@ -6,10 +6,56 @@ records what moved and why, per release.
 
 ## Unreleased
 
-Three defects on paths that had no test, three additions, and one behaviour change to an
-existing option. No export, option or event field was removed or repurposed.
+## v1.1.0
+
+Released: 2026-09-28
+
+A Canvas2D fallback, a public seam for content the engine does not own, an incremental
+indicator path, and two O(n) operations on the retention path taken to O(1). No export,
+option or event field was removed or repurposed.
 
 ### Added
+
+**`Chart.setOverlayPainter(painter)` — the engine's one drawing surface.** A charting
+engine draws candles, axes, grids and the decorations it is told about. It does not draw
+trend lines, Fibonacci levels, order blocks, or an application's own overlays, and there
+was no way for an application to draw them: the pieces a drawing layer needs all existed
+inside the engine and none of them were reachable together. The callback runs once per
+frame on the UI layer, which sits over the candles and under the crosshair, and receives
+a `PaintContext` carrying the layer's 2D context already scaled to CSS pixels, the plot
+rect, every pane's rect, and projections in both directions. The crosshair is drawn after
+the callback returns, so a crosshair stays legible over a filled rectangle without the
+painter knowing anything about it. A callback that throws is reported once per distinct
+error and the frame still completes; it is dropped on `destroy()`.
+
+**`Chart.drawingProjector(pane?)` and `Chart.drawingUnprojector(pane?)`.** The other half
+of that seam. A hit test or an editor outside the engine needs the same projection the
+painter draws with, and the model's geometry functions take their projections as
+arguments — but there was no way to obtain one, so the drawing model was unreachable from
+outside despite the pieces being public. Both are pane-aware, because a series anchored in
+a sub-pane is in that pane's units and not in prices.
+
+**`Chart.appendOverlayValue(id, time, value, color?)`, `updateOverlayValue(...)` and
+`appendOverlayValues(id, points, color?)`.** The O(1) path for feeding an indicator on a
+live feed. `setOverlays` re-validates every point of every overlay and reallocates a
+full-length buffer, so feeding it one value per tick is quadratic in the number of
+values: 27 ms for a thousand, 85 ms for two thousand, 391 ms for four thousand, and
+quadrupling with every doubling from there. `appendOverlayValue` is about 4 µs per value
+and flat. `updateOverlayValue` is the other half of a live feed, revising the value on a
+bar that is still forming, and is a separate method because a revision is expected to
+land on a bar the overlay already covers while an append is expected to extend the
+window. `appendOverlayValues` takes a catch-up batch with one viewport update rather
+than one per value. Timestamps must still be a real candle's: snapping would let a
+misaligned indicator look right, which is the rule `setOverlays` already enforces.
+
+**The drawing model is exported rather than only reachable internally** — `hitTestDrawings`,
+`getDrawingHandles`, `createDrawingFromGesture`, `createOrderFromDrawing`,
+`canTransitionOrder`, `validateDrawings` and `DRAWING_TYPES`, with `DrawingOrderHitResult`
+and `DrawPointProjector` as types. These are the renderer-agnostic half of a drawing
+layer: geometry, hit testing, validation and the order state machine. They take their
+projections as arguments and know nothing about this engine's internals. What is *not*
+exported is any drawing rendering; that is the paint seam above. `PanesOptions` and
+`VolumeOptions` are also exported now, having been reachable only structurally.
 
 **`Chart.getPlotRect()`**, and `PlotRect` as an exported type. The region the series is drawn
 into, in CSS px from the container's top-left — the canvas minus the price gutter and the
@@ -38,6 +84,65 @@ candles, which is the one thing that must not double as UI.
 
 
 ### Fixed
+
+**Overlay values were not shifted when history was trimmed, so every overlay on a chart
+that reached its retention cap was drawn on the wrong bars.** The candles moved left and
+the values did not, so an EMA lagged the price it annotates by exactly the trim count from
+the first frame. There is no other symptom: the values are valid numbers on valid
+ordinals, they are just the wrong ones, and the result reads as a stale indicator rather
+than as a defect. Nothing in the engine can catch it, because nothing else in the engine
+knows what a value is *for*. The values and their per-point colours now move with the
+candles, and an overlay whose whole window has been trimmed away reports nothing rather
+than leaving values behind to be drawn against bars they have nothing to do with.
+
+**Drawings were never rendered, and `hitTestDrawings` was imported and never called.**
+`emitDrawings` was a `redraw()`, so every call to a drawing method repainted three layers
+to produce a pixel-identical frame, and the engine could not hit-test a drawing at all.
+The store is now the engine's and painting is the caller's, through the paint seam above,
+so the same call is what gets a drawing onto the screen. The geometry functions were
+correct and are now reachable; five defects in them are fixed under *Changed* below.
+
+**`updateOrderStatus` ignored the order state machine.** `ORDER_TRANSITIONS` declares
+`filled`, `cancelled` and `rejected` terminal, and the chart validated only that the
+requested status was one of the four names — so a filled order could be handed back to
+`working`, and a cancelled one to `filled`. The machine existed, was tested, and was not
+consulted from here: the only place it ran was inside `transitionOrder`, which nothing in
+the class called. An illegal transition now leaves the order alone rather than throwing,
+because a caller observing a rejection usually has a stale view and a race is not a
+reason to crash a trading screen. Re-sending the status an order already has is a no-op.
+
+**`destroy()` left three of its six subscriber sets in place.** Order, drawing/order
+interaction and pane-range handlers survived, so a handler closure pinning a DOM node or a
+drawing stayed reachable from a destroyed chart — while the comment above them claimed
+every subscriber was dropped. The six drawing and order mutators also lacked the
+`assertAlive()` guard the rest of the API has, so a chart torn down mid-gesture still
+mutated state and still called live handlers. A gesture is asynchronous, so that is
+ordinary use rather than misuse.
+
+**`setDrawings` accepted anything.** It was the only bulk-ingest path in the library that
+did not validate: no duplicate-id check, no finiteness check on an anchor, no check that
+the point count suits the declared type, no bounds on `opacity` or `lineWidth`. A NaN
+anchor projects to NaN and so fails every bounds check and every hit test silently rather
+than visibly. `validateDrawings` refuses the whole set before anything is replaced, as
+`setOrders`, `resolveOverlays`, `resolveZones` and `resolvePriceLines` already did.
+
+**A drawing handed to a subscriber was the chart's live object.** `getDrawings()` cloned
+each drawing and its points; the create, select and deselect events passed the live
+instance out by reference. A subscriber could write `drawing.points[0].value` and move a
+drawing on screen with no `redraw()` and no notification. Cloned now, on both paths.
+
+**Session breaks in `proportional` mode compounded their own budget scale.** Each append
+recovered the widths of existing breaks from the table, which already held *capped*
+widths, and capped them again. Every append tightened the cap a little and shrank every
+earlier break by the same little, so the gaps under the crosshair decayed geometrically
+and a live proportional chart stopped showing session breaks a few minutes into a
+session. The scale now travels with the table.
+
+**A retention trim renumbered every session break in a retained series.** The incremental
+slot append took its length from a *post-trim* times array while the existing table was
+*pre-trim*, so pre-trim break indices were written into a post-trim table and every
+break in the series shifted left by the trim count on each append. The length is now
+derived from the table, so the two cannot disagree.
 
 **Vertical grid lines stopped at the newest candle, so grid cells never closed in empty
 space.** Reported as "the horizontal lines can be seen but the vertical lines don't form and
@@ -91,6 +196,61 @@ applied first, so a live feed does not build a backlog behind a collapsed panel.
 
 ### Changed
 
+**`modalInterval` is no longer derived on the render path.** It collects every gap in the
+retained series and sorts it to find the median, and the time axis needs it on every frame
+to pick a step from the calendar ladder. At the default 1,000,000-candle retention that is
+a 32 ms sort per frame — twice the 60 Hz budget spent before any rendering happened, on
+every pan, zoom, append, resize and crosshair frame. It is now derived once per data change
+and handed to the axis, which invalidates it from all four paths that write timestamps.
+`updateLast` deliberately does not invalidate it: a forming candle rewrites OHLC and moves
+no timestamp, and a live feed calls it on every tick.
+
+**`OHLCPyramid.trimStart` is O(1) amortised rather than O(n).** It allocated a fresh
+buffer, shifted the tail into it, subtracted the trim count from every x, and rebuilt every
+level from scratch — four O(n) passes and two O(n) allocations, on every append batch that
+arrives while the series sits at its retention cap, which on a live feed is every batch.
+Measured at 1,000,000 bars: **34.9 ms to 0.005 ms**. It is now flat from 50,000 to
+1,000,000 bars, which is the property rather than the number: a trim advances a per-level
+window and recomputes only the one bucket per level that straddles the cut. A level is
+rebuilt solely when the trim exceeds that level's group size, which bounds the rebuilds to
+the size of the trim rather than the size of the series.
+
+Two consequences are worth stating because they are visible in the diff. `CANDLE_X` is now
+an **absolute** source-bar ordinal that is never rebased — rebasing is the O(n) pass — and
+the pyramid assigns it rather than accepting it, so there is no second source of truth for
+a coordinate a trim would otherwise rewrite on every bar. And the reduction grid is **not
+re-cut on a trim**: bucket `b` at level `L` still covers absolute bars
+`[b·2^L, (b+1)·2^L)`, holding only the part of that group still retained. Re-cutting is
+precisely the re-aggregation being avoided. Candles, volume and overlays all reduce on that
+grid, and `bucketCentreSlot` takes the base so the two cannot disagree — a chart that
+panned after a trim would otherwise show a whole bucket of drift between an indicator and
+the price it annotates.
+
+**The drawing hit test honours its documented priority.** The three passes each kept the
+nearest candidate by distance alone, and the body pass ran last, so a rectangle body 1px
+from the pointer could displace a drag handle 7px away — inverting the priority for exactly
+the case it exists to resolve. Rank now precedes distance. A handle's own `size` is also a
+floor on its capture radius, rather than the size being decorative; a rectangle reports
+distance to its outline rather than to its centre, which is the measure that means the same
+thing for every shape and is comparable across them; a fib retracement has a body hit test
+at all, where before it was ungrabbable once deselected; and a trend line's move handle sat
+exactly on top of its resize-end handle, because the index midpoint of two points is the
+last point, so a two-point trend line could never be picked up to move.
+
+**Each Fibonacci level is now individually addressable.** Seven level handles shared one
+role name, and the role is not a unique identifier, so a handle hit could not be turned back
+into "drag the 0.618 line". `DragHandle.index` and `DrawingOrderHitResult.handleIndex`
+carry it. A Fibonacci's levels are also interpolated onto the candle grid when the caller
+supplies a mapping, rather than linearly in wall-clock time — the horizontal axis is candle
+ordinals with closed intervals compressed out, so a linear time split lands between buckets
+and, across a session break, in dead air.
+
+**A null projection is skipped rather than dereferenced** by the drawing hit test. A
+timestamp inside a session break projects to the nearer of the two bars bounding it, not to
+`null` — snapping is what keeps a line drawn from Friday to Monday connected to the candles
+it annotates — but a caller with its own transform is free to answer `null` for a time it
+cannot place, and the model used to take the whole hit test down with it.
+
 **The floating OHLC panel and the last-price tag are off by default.** Both were drawn unconditionally and neither could be removed: `crosshair.visible: false` took the crosshair lines, the panel and both gutter tags together, and the last-price tag had no option at all. They are UI, and a chart library's job is to report state, so they are now `crosshair.readout` and `candlestick.lastPriceTag`, both defaulting to `false`. A caller who wants one reads `crosshairMove` — which carries the whole `candle` — or `getLastCandle()`, and draws it in their own components.
 
 This is a visible change: upgrading removes both. It is listed here rather than buried because the panel has been in every screenshot anyone has looked at.
@@ -108,6 +268,41 @@ precision was wide enough to show it.
 
 **If you are seeing seven decimals, something set `precision` to seven.** The default is `2`
 and a chart at the default now reads `100.10`.
+
+### Verification
+
+472 unit tests (268 at v1.0.2), 29 browser interaction invariants and 10 packaging
+checks, all from one `npm run verify`.
+
+The browser harness reports 28 of 29. The one failure is a pre-existing theme contrast
+issue on the price-axis chips — a worst pair of 1.06:1, which is a legibility problem
+rather than a logic one — and it was confirmed against a pristine checkout of the
+preceding commit before any of this work began, so it is not a regression from it. It
+will fail a build server that enforces the interaction harness, and it is worth fixing
+separately.
+
+The work above was measured rather than assumed, and two of the three performance numbers
+came from a finding that reversed the plan. `trimStart` was assumed to be one of three
+roughly equal O(n) operations; isolating each showed it was 96% of the retention cost and
+the other two together were under half a millisecond at the benchmark's retention level.
+The reduction grid not re-cutting on a trim is a semantic change that reaches the draw
+path, the overlay bucketing and the slot conversion, and is the reason the grid is stated
+as a tested contract rather than compared against a rebuild: a rebuild *does* re-cut, so
+comparing against one asserts the opposite of what was intended.
+
+The tests that caught the most were the ones asserting properties rather than examples.
+`assertLevelsAggregateTheAbsoluteGrid` derives each bucket's expected aggregate from the
+source bars and the grid, rather than from a second implementation, and it found four
+distinct defects: a level read before it was materialised, a sign error in the window
+shift, empty buckets surviving a trim to empty, and an append silently dropped because a
+capacity check was given a count where a position was needed. The last is the one worth
+remembering — a `Float32Array` write past the end is a no-op rather than a throw, so a
+capacity check that is off by a shift loses data without saying so.
+
+The incremental overlay tests assert equivalence with `setOverlays` bar for bar, and that
+both paths reject a misaligned timestamp the same way. A faster approximation of the
+batch path would have satisfied a weaker test and produced an indicator that draws
+differently depending on how it was fed, which is the hardest kind of defect to find.
 
 ## v1.0.2
 

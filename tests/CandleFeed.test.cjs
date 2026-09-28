@@ -3,6 +3,7 @@ const { test } = require('node:test');
 const { ChartFeedController } = require('../.test-build/feed/ChartFeedController.js');
 const { MockCandleSource } = require('../.test-build/feed/MockCandleSource.js');
 const { WebSocketCandleSource } = require('../.test-build/feed/WebSocketCandleSource.js');
+const { CandleReplaySource } = require('../.test-build/feed/CandleReplaySource.js');
 
 class CaptureTarget {
     constructor() {
@@ -85,6 +86,29 @@ test('mock source provides an initial snapshot and stops its update timer on dis
     await pause(80);
     assert.equal(controller.state, 'disconnected');
     assert.equal(target.updates.length, 0);
+});
+
+test('replay source steps deterministically and feed diagnostics count applied messages', () => {
+    const target = new CaptureTarget();
+    const source = new CandleReplaySource([
+        { message: { type: 'snapshot', sequence: 1, candles: [candle(1000)] } },
+        { message: { type: 'append', sequence: 2, candles: [candle(2000)] } },
+    ]);
+    const controller = new ChartFeedController(target, source);
+    source.pause();
+    assert.equal(source.position, 0);
+    assert.equal(source.step(), true);
+    assert.equal(source.step(), true);
+    assert.equal(source.step(), false);
+    assert.deepEqual(controller.getDiagnostics(), {
+        received: 2,
+        applied: 2,
+        rejected: 0,
+        lastSequence: 2,
+        lastMessageType: 'append',
+        lastError: null,
+    });
+    controller.dispose();
 });
 
 test('WebSocket source routes sequenced snapshot, append, and update then detaches on stop', () => {

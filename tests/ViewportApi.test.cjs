@@ -54,6 +54,60 @@ test('getPlotRect reports where the data is, not where the element is', () => {
     }
 });
 
+test('view state captures and restores the viewport and price range', () => {
+    const harness = chart(300);
+    try {
+        harness.chart.setVisibleLogicalRange({ from: 100, to: 200 });
+        harness.chart.setPriceRange([99, 103]);
+        const saved = harness.chart.getViewState();
+        harness.chart.setVisibleLogicalRange({ from: 10, to: 60 });
+        harness.chart.setPriceRange([80, 90]);
+        harness.chart.setViewState(saved);
+        assert.deepEqual(harness.chart.getVisibleLogicalRange(), saved.logical);
+        assert.deepEqual(harness.chart.getPriceRange(), [99, 103]);
+    } finally {
+        harness.dispose();
+    }
+});
+
+test('addSeries provides a managed line lifecycle', () => {
+    const harness = chart(20);
+    try {
+        const series = harness.chart.addSeries({ id: 'managed', color: '#00ff00' });
+        const points = [
+            { time: harness.chart.getCandleAt(5).time, value: 100 },
+            { time: harness.chart.getCandleAt(6).time, value: 101 },
+        ];
+        series.setData(points);
+        assert.deepEqual(harness.chart.getOverlayIds(), ['managed']);
+        assert.equal(harness.chart.getOverlayValueAt('managed', 6), 101);
+        series.setVisible(false);
+        series.remove();
+        assert.deepEqual(harness.chart.getOverlayIds(), []);
+    } finally {
+        harness.dispose();
+    }
+});
+
+test('orders validate, publish state, and resolve through hit testing', () => {
+    const harness = chart(30);
+    try {
+        const events = [];
+        harness.chart.subscribeOrders((orders) => events.push(orders));
+        harness.chart.setOrders([{ id: 'entry', side: 'buy', price: 100, quantity: 2 }]);
+        assert.equal(harness.chart.getOrders()[0].status, 'working');
+        const y = harness.chart.priceToCoordinate(100);
+        const hit = harness.chart.hitTest(harness.chart.getPlotRect().x + 10, y);
+        assert.equal(hit.kind, 'order');
+        assert.equal(hit.id, 'entry');
+        harness.chart.updateOrderStatus('entry', 'filled');
+        assert.equal(harness.chart.getOrders()[0].status, 'filled');
+        assert.ok(events.length >= 3);
+    } finally {
+        harness.dispose();
+    }
+});
+
 test('hitTest resolves engine-owned candles and decorations', () => {
     const harness = chart(40);
     try {

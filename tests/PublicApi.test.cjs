@@ -2,18 +2,40 @@ const assert = require('node:assert/strict');
 const { test } = require('node:test');
 const publicApi = require('../.test-build/index.js');
 
+// The exact set of runtime values the package entry exports. It is an allow-list
+// rather than a spot-check because the point of the barrel is that nothing reaches
+// an integrator that was not deliberately put there.
+//
+// The drawing-model functions are here because they are the renderer-agnostic half of
+// a drawing layer — geometry, hit testing, validation, the order state machine — and
+// an application building its own drawing tools needs them. They take their
+// projections as arguments and know nothing about the engine, so they are not a
+// second implementation of anything the engine does. The rendering half is not
+// exported at all; that goes through `Chart.setOverlayPainter`.
 const VALUE_EXPORTS = [
+    'CandleReplaySource',
+    'ChartSyncGroup',
     'Chart',
     'ChartFeedController',
+    'DRAWING_TYPES',
     'MockCandleSource',
     'WebSocketCandleSource',
+    'canTransitionOrder',
+    'createDrawingFromGesture',
+    'createOrderFromDrawing',
+    'getDrawingHandles',
+    'hitTestDrawings',
+    'validateDrawings',
 ];
 
 test('package entry exports only the v1 public surface', () => {
     const exportedNames = Object.keys(publicApi).filter((name) => name !== '__esModule').sort();
     assert.deepEqual(exportedNames, VALUE_EXPORTS.slice().sort());
     for (const name of VALUE_EXPORTS) {
-        assert.equal(typeof publicApi[name], 'function');
+        assert.ok(
+            typeof publicApi[name] === 'function' || Array.isArray(publicApi[name]),
+            `${name} should be callable or a frozen list, got ${typeof publicApi[name]}`,
+        );
     }
 });
 
@@ -56,6 +78,12 @@ test('the public read and write API is present, and nothing internal leaked besi
         'coordinateToSlot',
         'slotToCoordinate',
         'hitTest',
+        'addSeries',
+        'addDrawing',
+        'setOrders',
+        'getOrders',
+        'updateOrderStatus',
+        'subscribeOrders',
         // The live-edge pair. A chart that has been panned takes its view over and the
         // feed keeps appending into it, which from outside is indistinguishable from a
         // feed that has stopped — so a caller needs both the question and the way back.
@@ -102,11 +130,23 @@ test('the visible-range payload carries the live-edge state, additively', () => 
 });
 
 test('no public export is reachable only through a deep path', () => {
-    // A leaked deep import means the barrel in src/index.ts is incomplete.
+    // A leaked deep import means the barrel in src/index.ts is incomplete. Every
+    // value export is a named function, or the one frozen list, and is the *same*
+    // binding the internal module holds rather than a wrapper re-created here.
     for (const name of VALUE_EXPORTS) {
-        assert.equal(typeof publicApi[name].name, 'string');
+        const value = publicApi[name];
+        if (Array.isArray(value)) {
+            assert.equal(name, 'DRAWING_TYPES', 'the only list export should be declared as one');
+            continue;
+        }
+        assert.equal(typeof value.name, 'string', `${name} should be a named function`);
     }
     assert.equal(publicApi.Chart.prototype.constructor, publicApi.Chart);
+    // A wrapper would satisfy the checks above and still be a second implementation.
+    const model = require('../.test-build/core/drawingOrderModel.js');
+    assert.equal(publicApi.hitTestDrawings, model.hitTestDrawings);
+    assert.equal(publicApi.validateDrawings, model.validateDrawings);
+    assert.equal(publicApi.DRAWING_TYPES, model.DRAWING_TYPES);
 });
 
 test('the WebGL2 requirement ships as one stable, documented error string', async () => {

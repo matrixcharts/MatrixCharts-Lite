@@ -162,6 +162,8 @@ export interface CrosshairOptions {
 export interface SessionGapOptions {
     /** Whether closed sessions are shown as breaks. Defaults to true. */
     enabled?: boolean;
+    /** Fixed gap threshold in milliseconds. Supplying it enables incremental collapsed-gap updates. */
+    thresholdMs?: number;
     /**
      * `collapsed` gives every break the same half-bar width, and is the default.
      * `proportional` gives each break width in proportion to its duration, up to
@@ -306,6 +308,7 @@ export interface ResolvedCrosshair {
 }
 export interface ResolvedSessionBreaks {
     enabled: boolean;
+    thresholdMs: number | null;
     mode: 'collapsed' | 'proportional';
     maxWhitespaceRatio: number;
 }
@@ -373,6 +376,7 @@ const BASE_DEFAULTS: Omit<ResolvedChartOptions, 'theme' | 'locale' | 'candlestic
         maxBarSpacing: DEFAULT_MAX_BAR_SPACING,
         sessionBreaks: {
             enabled: true,
+            thresholdMs: null,
             mode: 'collapsed',
             maxWhitespaceRatio: DEFAULT_MAX_WHITESPACE_RATIO,
         },
@@ -769,6 +773,9 @@ export function resolveOptions(partial: ChartOptions, fallbackTheme: ChartTheme 
         const gaps = requirePlainObject(partial.timeScale.sessionBreaks, 'timeScale.sessionBreaks');
         const target = resolved.timeScale.sessionBreaks;
         if (gaps.enabled !== undefined) target.enabled = requireBoolean(gaps.enabled, 'timeScale.sessionBreaks.enabled');
+        if (gaps.thresholdMs !== undefined) {
+            target.thresholdMs = requireNonNegativeNumber(gaps.thresholdMs, 'timeScale.sessionBreaks.thresholdMs');
+        }
         if (gaps.mode !== undefined) {
             if (gaps.mode !== 'collapsed' && gaps.mode !== 'proportional') {
                 fail('timeScale.sessionBreaks.mode must be \'collapsed\' or \'proportional\'.');

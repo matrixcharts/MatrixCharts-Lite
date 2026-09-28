@@ -56,7 +56,10 @@ Each condition carries its own `.d.ts` so a CommonJS consumer's `require('matrix
 
 ## Runtime requirements
 
-`Chart` requires a browser document and **WebGL2**. `canvas.getContext('webgl2')` must succeed. There is no Canvas2D candlestick fallback in v1, no software WebGL polyfill, and no reduced-fidelity mode.
+`Chart` requires a browser document. WebGL2 is preferred for large datasets, and Chart
+falls back to a Canvas2D data renderer when WebGL2 cannot be acquired. The fallback keeps
+the same coordinate, feed, overlay, pane, and decoration contracts but is intended for
+small and medium datasets.
 
 When the context cannot be acquired, `new Chart(...)` throws exactly:
 
@@ -75,7 +78,8 @@ Supported engines, and the versions that first shipped WebGL2:
 | Safari (macOS, iOS) | 15 |
 | Internet Explorer | not supported, at any version |
 
-Safari 14 and earlier are out, including iOS 14. A Canvas2D renderer is a separate post-v1 milestone with a documented cap on visible candles; it is deliberately absent from v1 rather than half-present.
+Safari 14 and earlier use the Canvas2D path, including iOS 14. Applications displaying
+large histories should prefer WebGL2 and bound fallback work with `maxRetainedCandles`.
 
 ## `CandleData`
 
@@ -528,6 +532,96 @@ chart.setOverlays(Object.entries(output.plots).map(([id, points]) => ({
 
 A point may carry its own `color`, which overrides the overlay's colour for that point and lets one overlay change colour along its length — a MACD histogram signed by side, a stop level that flips between bullish and bearish. This is honoured rather than declared-and-ignored, and it costs nothing for the common case: an overlay whose points are all one colour carries no per-point colour array at all, and the renderer expands the single colour itself.
 
+## Overlays on the shared time index
+
+Values arrive from outside the library, on the candle time index, and every point's
+timestamp must match a candle exactly. There is no indicator maths here by design.
+
+### `setOverlays(specs)`
+
+Replaces the overlay set wholesale. Re-validates and re-aligns every point of every
+overlay, so its cost is O(total points) per call. That is the right shape for a bulk load
+and the wrong one for a live feed: feeding it one new value per tick is quadratic in the
+number of values, because each tick re-supplies everything fed so far.
+
+### `appendOverlayValue(id, time, value, color?)`
+
+Writes one value against a candle, in O(1) whatever the series length, and extends the
+overlay's covered window if the candle is new. `color` is an optional CSS colour for that
+point, overriding the overlay's own.
+
+### `updateOverlayValue(id, time, value, color?)`
+
+Revises a value on a bar the overlay already covers, in O(1). The other half of a live
+feed: a forming candle is revised many times before it closes. Returns -1 rather than
+extending the window, because writing a value across a gap the indicator never produced
+one for would draw a line through a stretch the caller has said nothing about.
+
+### `appendOverlayValues(id, points, color?)`
+
+Many values with one viewport update. `appendOverlayValue` recomputes the viewport per
+call, which is right for one bar per tick and wrong for a catch-up after a reconnect,
+where a thousand bars arrive in one tick.
+
+The timestamp must be a real candle's in all three. Snapping to the nearest — which is
+what the coordinate layer does for a pointer — would let a misaligned indicator look
+correct. A value for a time with no candle is refused and, for `updateOverlayValue`, a
+value outside the covered window is refused; neither path throws, because a misaligned
+indicator is a fact about the caller's data rather than a programming error.
+
+Overlay values are **shifted when history is trimmed**, along with any per-point colours.
+A chart at its retention cap moves the candles left, and the values have to move with
+them or every overlay is drawn on the wrong bars by exactly the trim count.
+
+## Drawing on top of the chart
+
+The engine draws candles, axes, grids, and the decorations it is told about. It does not
+draw trend lines, Fibonacci levels, order blocks, or an application's own overlays.
+`setOverlayPainter` is the one surface those reach the screen through.
+
+### `setOverlayPainter(painter | null)`
+
+Registers a callback run once per rendered frame on the UI layer, which composites over
+the candles and **under** the crosshair: the crosshair is drawn after the callback
+returns, so a filled rectangle cannot obscure it. Registering emits no frame, because a
+painter changes nothing the engine draws. `null` unregisters. The callback is dropped on
+`destroy()`.
+
+The `PaintContext` carries the layer's 2D context already scaled to CSS pixels — so a
+1px line is 1px at any device pixel ratio, which is the same guarantee the engine holds
+itself to — the plot rect, every pane's rect, the layer size and DPR, and `toScreen` /
+`toData` in both directions. `toScreen` returns `null` only when the chart has no data: a
+timestamp inside a session break projects to the nearer of the two bars bounding it, since
+that is what keeps a drawing drawn across a weekend connected to the candles it annotates.
+An x outside the plot is *not* `null`, so a line wider than the viewport is clipped by the
+canvas rather than truncated at the first bar.
+
+A callback that throws is reported once per distinct error and the frame still completes;
+the crosshair, the axes and the candles are unaffected.
+
+### `drawingProjector(pane?)` / `drawingUnprojector(pane?)`
+
+The same projections bound to the live view, for hit testing and editing outside the
+engine. Pane-aware, because a series anchored in a sub-pane is in that pane's units rather
+than in prices. Both are tested to agree with `indexToCoordinate`, and to stay in agreement
+across a pan.
+
+### Exported drawing geometry
+
+`hitTestDrawings`, `getDrawingHandles`, `createDrawingFromGesture`,
+`createOrderFromDrawing`, `canTransitionOrder`, `validateDrawings` and `DRAWING_TYPES`,
+with `DrawingOrderHitResult` and `DrawPointProjector` as types.
+
+These are renderer-agnostic and know nothing about this engine's internals: they take
+their projections as arguments, so they work against any chart that can report where a bar
+is. No drawing *rendering* is exported — that is the paint seam above, and the division is
+deliberate rather than incidental.
+
+Anchors are stored as `{ time, value }`, never as pixels and never as ordinals, so a
+drawing survives a pan, a zoom, a history trim and a change of aggregation level. A
+projector that answers `null` for a time it cannot place is tolerated: the hit test skips
+it rather than dereferencing it.
+
 ## Panes
 
 A pane is a horizontal band of the plot area with **its own vertical scale**. Pane 0 is the price pane and always exists. Every pane shares the *horizontal* transform, because every series is indexed on the same time axis; only the vertical one differs, which is why a series can be moved to a pane without anything about its data changing.
@@ -611,3 +705,15 @@ A candle field that is not a finite number is rejected at the transport boundary
 **Breaking:** changing `CandleData` field units; adding required fields; new required feed message types for a working live chart; removing any export in the table above; changing the package entry or its `exports` conditions; changing mutation ordering rules; changing the half-open index range or inclusive time range conventions; making a conversion depend on `devicePixelRatio`; changing when an event fires or what a `null` field means; making `maxRetainedCandles` settable at runtime; changing a resolved default or a validation rule; changing the WebGL2 or post-destroy error strings, or what `destroy()` removes; removing or reinterpreting the index-space read API; dropping the WebGL2 requirement without a replacement renderer.
 
 **Additive (allowed in 1.x):** extra optional `ChartOptions`; new `Chart` methods; optional feed fields the v1 client ignores; extra exports.
+
+Everything in v1.1.0 is additive by that rule. Two of them are worth naming because a
+reader might reasonably expect otherwise:
+
+- **`maxRetainedCandles` still bounds the data, and now bounds the overlays too.** An
+  overlay's values move with the candles when history is trimmed, so an overlay is
+  indexed by the same retained window as everything else. It was not shifted at all
+  before, which meant an overlay on a chart at its cap was drawn on the wrong bars.
+- **The pyramid's reduction grid is no longer re-cut on a trim.** This is internal — the
+  buckets it produces are not a public type — but it reaches the draw path and the overlay
+  bucketing, and a caller reading `CANDLE_X` out of a renderer buffer is unaffected
+  because the buffers handed to the renderer are in retained-window ordinals either way.

@@ -35,8 +35,13 @@ export interface ChartEvents {
      * Retained candle timestamps, used by the axis renderer to label ticks. The
      * candle buffer itself is passed straight to the WebGL renderer rather than
      * broadcast, so it is not copied per frame here.
+     *
+     * `interval` is the modal bar interval in ms. The time axis needs it to pick a
+     * step from the calendar ladder and runs on every frame, so the chart derives it
+     * once per data change and hands it over here. A renderer that recomputes it
+     * instead pays an O(n log n) sort of the whole retained series per frame.
      */
-    'data': { times: readonly number[] };
+    'data': { times: readonly number[]; interval?: number };
     /**
      * Decorations to draw on the UI layer: price lines, markers, and the
      * last-price tag state.

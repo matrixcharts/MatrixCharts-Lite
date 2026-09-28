@@ -17,12 +17,15 @@ import {
     coordinateToIndex,
     coordinateToSlot,
     indexToCoordinate,
+    nearestCandleIndex,
     slotToCoordinate,
 } from '../core/coordinates.js';
-import { paneValueAt, type PaneLayout } from '../core/panes.js';
+import { paneValueAt, PRICE_PANE, type PaneLayout } from '../core/panes.js';
 import { fromScaleSpace, priceTicks, toScaleSpace, type PriceScale, type Tick } from '../core/priceScale.js';
-import { contiguousRuns } from '../core/sessionScale.js';
+import { contiguousRuns, indexAtTime } from '../core/sessionScale.js';
 import { timeAxisDetail, timeAxisLabels, timeAxisTicks, type TimeAxisTick } from '../core/timeAxis.js';
+import type { OverlayPainter, PaintContext } from '../core/paint.js';
+import type { DrawingPoint } from '../core/tradingTools.js';
 import {
     LABEL_PRIORITY,
     layoutLabels,
@@ -113,6 +116,25 @@ export class Canvas2DRenderer implements IRenderer {
     private crosshairPane: number | null = null;
     private crosshairValue: number | null = null;
     private timeValues: readonly number[] = [];
+    /**
+     * The modal bar interval, when the chart supplied one.
+     *
+     * Undefined means the chart did not say, and the time axis derives it — correct
+     * and O(n log n). The chart owns the timestamps, so it owns this too, and at a
+     * million retained candles deriving it per frame is the single most expensive
+     * thing in the render path.
+     */
+    private timeInterval: number | undefined = undefined;
+    /**
+     * The caller's registered painter, or null.
+     *
+     * Held on the UI layer rather than on the chart, because the chart has no way to
+     * reach a 2D context and the layer is the thing that owns one. The chart
+     * forwards the registration.
+     */
+    private overlayPainter: OverlayPainter | null = null;
+    /** Last error key already reported, so a throwing painter logs once. */
+    private lastOverlayPainterError: string | null = null;
     private options: ResolvedChartOptions = themeDefaults('dark');
     // Parsed once per apply, not per label or per frame.
     private colors = this.parseColors(themeDefaults('dark'));
@@ -223,6 +245,7 @@ public init(canvas: HTMLCanvasElement, emitter: EventEmitter<ChartEvents>): void
 
     private handleDataEvent = (payload: ChartEvents['data']): void => {
         this.timeValues = payload.times;
+        this.timeInterval = payload.interval;
     };
 
     private handleDecorationsEvent = (payload: ChartEvents['decorations']): void => {
@@ -252,6 +275,111 @@ public init(canvas: HTMLCanvasElement, emitter: EventEmitter<ChartEvents>): void
         };
     }
 
+    /**
+     * Runs the caller's registered painter, if any, with a context bound to this
+     * layer's current view.
+     *
+     * The context object is rebuilt per frame rather than cached, because almost
+     * everything in it — the plot rect, the pane rects, the transform, the scale —
+     * changes when the view does, and a stale one would draw a trend line at the
+     * zoom it was registered at. The cost is one small object per frame, which is
+     * not what a painter costs anyway.
+     */
+    private paintCallerOverlay(): void {
+        const painter = this.overlayPainter;
+        if (painter === null) return;
+        // A painter that throws must not take the crosshair, the axis, or the frame
+        // with it. The chart keeps a corrupted overlay layer; the rest of the UI
+        // still works, and the error is reported rather than swallowed.
+        try {
+            painter(this.paintContext());
+        } catch (error) {
+            this.reportOverlayPainterError(error);
+        }
+    }
+
+    /** The context handed to a painter, resolved against this frame's view. */
+    private paintContext(): PaintContext {
+        const viewport: ChartViewport = this.viewport;
+        // No pane frame has arrived yet, on the first frame or before the chart has
+        // been sized. The price pane's own plot rect is the right answer in the
+        // meantime: it is the only pane that exists independently of a layout event,
+        // and a painter asked to draw before the chart is measured is a caller
+        // painting into a zero-sized container, which is its own problem to notice.
+        const layout: PaneLayout = this.panes ?? {
+            rects: [viewport.plot],
+            transforms: [{
+                // Identity in y: value 0 at the bottom of the plot, 1 unit per pixel
+                // downward. Enough to place something before the real transform lands.
+                scaleY: -1,
+                offsetY: viewport.plot.y + viewport.plot.height,
+            }],
+            empty: [false],
+        };
+        const paneCount: number = layout.rects.length;
+        const width: number = this.canvas.width / this.devicePixelRatio;
+        const height: number = this.canvas.height / this.devicePixelRatio;
+
+        const toScreen = (point: DrawingPoint, pane: number = 0): { x: number; y: number } | null => {
+            const index: number = pane >= paneCount ? -1 : indexAtTime(this.timeValues, point.time);
+            // Only an empty series gets here: `indexAtTime` snaps to the nearer
+            // bounding bar, so a timestamp inside a session break lands on a real bar
+            // rather than in dead air. That is what keeps a drawing drawn across a
+            // weekend connected to the candles it annotates.
+            if (index < 0 || index >= this.timeValues.length) return null;
+            const rect: PlotRect | undefined = layout.rects[pane];
+            const transform: VerticalTransform | undefined = layout.transforms[pane];
+            if (rect === undefined || transform === undefined) return null;
+            // Pane 0 is drawn on the price scale, so on a log chart a raw price has to
+            // be converted before it meets the transform. The same conversion the axis
+            // labels go through, so a painter's value lands where its own label would.
+            const scaled: number = pane === PRICE_PANE
+                ? toScaleSpace(point.value, this.options.priceScale.mode)
+                : point.value;
+            return {
+                x: indexToCoordinate(viewport, index),
+                y: scaled * transform.scaleY + transform.offsetY,
+            };
+        };
+
+        const toData = (x: number, y: number, pane: number = 0): DrawingPoint => {
+            const index: number = nearestCandleIndex(viewport, x, this.timeValues.length);
+            const time: number = index < 0
+                ? (this.timeValues[0] ?? 0)
+                : this.timeValues[index];
+            const rect: PlotRect | undefined = layout.rects[pane];
+            const transform: VerticalTransform | undefined = layout.transforms[pane];
+            if (rect === undefined || transform === undefined) return { time, value: 0 };
+            const scaled: number = paneValueAt(transform, y);
+            return {
+                time,
+                value: pane === PRICE_PANE ? fromScaleSpace(scaled, this.options.priceScale.mode) : scaled,
+            };
+        };
+
+        return {
+            ctx: this.ctx,
+            plot: viewport.plot,
+            paneRects: layout.rects,
+            paneCount,
+            width,
+            height,
+            dpr: this.devicePixelRatio,
+            toScreen,
+            toData,
+        };
+    }
+
+    private reportOverlayPainterError(error: unknown): void {
+        // Reported once per distinct error, not per frame. A painter that throws
+        // would otherwise produce sixty identical console entries a second, which
+        // buries the first one and the actual stack.
+        const key: string = error instanceof Error ? `${error.name}: ${error.message}` : String(error);
+        if (this.lastOverlayPainterError === key) return;
+        this.lastOverlayPainterError = key;
+        console.error('MatrixCharts: an overlay painter threw; the rest of the UI is unaffected.', error);
+    }
+
     public clear(): void {
         const cssWidth: number = this.canvas.width / this.devicePixelRatio;
         const cssHeight: number = this.canvas.height / this.devicePixelRatio;
@@ -270,6 +398,15 @@ public init(canvas: HTMLCanvasElement, emitter: EventEmitter<ChartEvents>): void
 
     public render(): void {
         if (!this.isGridLayer) {
+            // The caller's own drawing, under the crosshair and over the candles.
+            //
+            // The UI layer is the right place for it: it is already cleared to
+            // transparent every frame, it already composites over the data layer, and
+            // the crosshair is drawn after this returns so a crosshair stays legible
+            // over a filled rectangle. Drawing it anywhere else would mean either
+            // repainting the candles to accommodate a trend line, or putting the
+            // crosshair underneath one.
+            this.paintCallerOverlay();
             this.renderCrosshair();
             return;
         }
@@ -302,6 +439,7 @@ public init(canvas: HTMLCanvasElement, emitter: EventEmitter<ChartEvents>): void
             fromSlot: coordinateToSlot(viewport, plot.x),
             toSlot: coordinateToSlot(viewport, plotRight),
             widthPx: plot.width,
+            interval: this.timeInterval,
         });
 
         // Which axis labels are drawn is decided once, with the decorations, because
@@ -520,7 +658,31 @@ public init(canvas: HTMLCanvasElement, emitter: EventEmitter<ChartEvents>): void
             this.emitter.off('options', this.handleOptionsEvent);
             this.emitter.off('crosshair', this.handleCrosshairEvent);
         }
+        // Dropped, not just left unused. The painter is a caller's closure over its
+        // own drawing model, and this renderer is reachable from the chart that owns
+        // it — so a painter that outlived `destroy()` keeps a whole application
+        // reachable from a detached canvas.
+        this.overlayPainter = null;
         this.clear();
+    }
+
+    /**
+     * Registers the caller's paint callback, or clears it with null.
+     *
+     * Only the UI layer accepts one. The grid layer is the one that gets an opaque
+     * background fill, so anything drawn there would be erased by the next frame's
+     * background; a registration aimed at the wrong layer is refused rather than
+     * silently ignored.
+     */
+    public setOverlayPainter(painter: OverlayPainter | null): void {
+        if (painter !== null && this.isGridLayer) {
+            throw new Error('MatrixCharts: an overlay painter must be registered on the UI layer, not the grid layer.');
+        }
+        this.overlayPainter = painter;
+        // A fresh painter has not reported an error yet, so the once-per-error log
+        // gate reopens. Otherwise a caller that fixed a throwing painter and
+        // re-registered it would still be silenced by the old message.
+        this.lastOverlayPainterError = null;
     }
 
     private renderCrosshair(): void {

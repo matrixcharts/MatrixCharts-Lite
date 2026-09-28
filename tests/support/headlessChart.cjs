@@ -245,6 +245,16 @@ function makeStubRenderer(name, log) {
             }
         },
         crosshair: [],
+        // The UI layer is the one that hosts a caller's paint callback, so the stub
+        // implements it and records the painter. A double that omitted it would make
+        // `setOverlayPainter` a call into undefined, which is the failure mode the
+        // `IOverlayHost` contract exists to prevent — and the reason the stub carries
+        // it rather than the chart guarding defensively.
+        overlayPainter: null,
+        setOverlayPainter(painter) {
+            this.overlayPainter = painter;
+            log.push([name, 'setOverlayPainter', { painter: painter === null ? null : typeof painter }]);
+        },
         resize(width, height, dpr) {
             log.push([name, 'resize', { width, height, dpr }]);
         },
@@ -356,10 +366,13 @@ function createHeadlessChart(options = {}) {
     const dataRenderer = makeStubDataRenderer(rendererLog);
     // The grid stub is kept so a test can read what the crosshair was told.
     const gridRenderer = makeStubRenderer('grid', rendererLog);
+    // The UI stub is kept for the same reason: it is the layer a caller's paint
+    // callback is registered on, so a test needs to read back what was registered.
+    const uiRenderer = makeStubRenderer('ui', rendererLog);
     const restoreFactory = setRendererFactory({
         data: () => dataRenderer,
         grid: () => gridRenderer,
-        ui: () => makeStubRenderer('ui', rendererLog),
+        ui: () => uiRenderer,
     });
     let chart = null;
     try {
@@ -376,6 +389,7 @@ function createHeadlessChart(options = {}) {
         dom,
         dataRenderer,
         gridRenderer,
+        uiRenderer,
         rendererLog,
         /** The chart's own wrapper element — the single input surface. */
         wrapper: dom.container.children[0],

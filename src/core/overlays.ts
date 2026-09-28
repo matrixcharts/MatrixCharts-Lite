@@ -58,6 +58,12 @@ export interface ResolvedOverlay {
      * matched no candle is rejected rather than skipped, so this array is always
      * the same length as the candle count and index `i` always means candle `i`.
      * Ordinals outside `firstIndex`..`lastIndex` hold 0 and are never drawn.
+     *
+     * `length` is **capacity**, not the candle count. It is over-allocated so that a
+     * live feed can append a value per tick without reallocating the buffer on every
+     * bar, and a caller must never read past the candle count it was told about. The
+     * bucket reduction and the value read both take the count as an argument for that
+     * reason.
      */
     values: Float32Array;
     /**
@@ -221,6 +227,108 @@ function indexOfTime(candleTimes: readonly number[], time: number): number {
     return -1;
 }
 
+/**
+ * Extends an overlay's value buffer so it can hold `required` ordinals.
+ *
+ * Geometric, because the growth this exists for is one bar at a time. A buffer
+ * sized exactly to the candle count reallocates on every append, and a reallocation
+ * of a 10,000-value array per tick is the whole cost an incremental path is supposed
+ * to remove.
+ *
+ * Doubling also keeps the amortised cost per appended value constant, which a
+ * "grow by one" strategy does not.
+ */
+export function growOverlayValues(overlay: ResolvedOverlay, required: number): void {
+    if (overlay.values.length >= required) return;
+    const capacity: number = Math.max(required, Math.max(64, overlay.values.length * 2));
+    const values = new Float32Array(capacity);
+    values.set(overlay.values);
+    overlay.values = values;
+    if (overlay.pointColors !== null) {
+        const colors = new Float32Array(capacity * 4);
+        colors.set(overlay.pointColors);
+        overlay.pointColors = colors;
+    }
+}
+
+/**
+ * Records one indicator value against a candle ordinal. O(1).
+ *
+ * The live-feed path. `setOverlays` re-validates and re-aligns every point of every
+ * overlay on every call, so feeding it one new value per tick costs a reallocation
+ * and a full pass over the series per tick — which is how an engine with a complete
+ * indicator *rendering* layer ends up unable to run an indicator in real time.
+ *
+ * `rgba` is optional and only pays for a buffer when a point actually carries a
+ * colour, so a uniform overlay stays one float per ordinal.
+ */
+export function appendOverlayValue(
+    overlay: ResolvedOverlay,
+    ordinal: number,
+    value: number,
+    rgba?: Rgba,
+): void {
+    if (!Number.isInteger(ordinal) || ordinal < 0) {
+        fail(`Overlay ${JSON.stringify(overlay.id)} value at ordinal ${ordinal} is not a candle position.`);
+    }
+    if (!Number.isFinite(value)) {
+        fail(`Overlay ${JSON.stringify(overlay.id)} value at ordinal ${ordinal} must be finite.`);
+    }
+    growOverlayValues(overlay, ordinal + 1);
+    overlay.values[ordinal] = value;
+    if (rgba !== undefined) {
+        if (overlay.pointColors === null) overlay.pointColors = new Float32Array(overlay.values.length * 4);
+        overlay.pointColors.set(rgba, ordinal * 4);
+    }
+    if (overlay.firstIndex < 0) overlay.firstIndex = ordinal;
+    if (ordinal > overlay.lastIndex) overlay.lastIndex = ordinal;
+    // `visible` is deliberately untouched. It is the caller's intent, and a value
+    // arriving is not a request to draw something the caller switched off.
+}
+
+/**
+ * Shifts an overlay's window after `count` candles are trimmed from the front.
+ *
+ * Without this, every overlay on a chart that reaches its retention cap is drawn on
+ * the wrong bars: the candles move left and the values do not, so an EMA lags the
+ * price by exactly the trim count from the first frame. Nothing about it looks wrong
+ * on a short series, which is why it survives — and why it is pinned by a test rather
+ * than left to be found.
+ *
+ * `copyWithin` rather than a loop: a memmove of the live window, and there is one
+ * buffer per overlay rather than one per bar, so this is a handful of passes whatever
+ * the candle count.
+ *
+ * The buffer's capacity is left alone. It is over-allocated by design, and shrinking
+ * it would mean an allocation on the retention path — the one path that must not
+ * allocate. Reads are bounded by the candle count the caller holds, so the values left
+ * above it are never seen.
+ */
+export function trimOverlayStart(overlay: ResolvedOverlay, count: number): void {
+    if (count <= 0) return;
+    if (count < overlay.values.length) {
+        overlay.values.copyWithin(0, count);
+        if (overlay.pointColors !== null) {
+            overlay.pointColors.copyWithin(0, count * 4);
+        }
+    }
+    if (overlay.firstIndex >= 0) {
+        overlay.firstIndex = Math.max(0, overlay.firstIndex - count);
+    }
+    if (overlay.lastIndex >= 0) {
+        overlay.lastIndex = overlay.lastIndex - count;
+    }
+    // A window that has been trimmed past its own start has nothing left to draw. -1
+    // is the "covers nothing" marker the rest of the module already uses, and it is
+    // what stops a stale window from being reduced into buckets the caller believes
+    // are covered.
+    if (overlay.lastIndex < 0 || overlay.firstIndex > overlay.lastIndex) {
+        overlay.firstIndex = -1;
+        overlay.lastIndex = -1;
+        overlay.visible = false;
+    }
+}
+
 export interface BucketedOverlay {
     /** Interleaved points: `[x, value]` or `[x, value, r, g, b, a]`. */
     points: Float32Array;
@@ -254,6 +362,13 @@ export interface BucketedOverlay {
  * a value missing between two covered ones would be drawn as a straight line
  * across the gap. Indicators that emit a contiguous run, which is what a warm-up
  * produces, are unaffected.
+ *
+ * `barBase` is the absolute ordinal of the first retained bar. The emitted x is an
+ * **absolute** bucket index, matching the pyramid's own grid, which is cut on absolute
+ * boundaries and is deliberately not re-cut when history is trimmed. Passing the base
+ * is what keeps an overlay and the candles beneath it reducing to the same buckets: two
+ * grids that differ by the trim count put a moving average one bucket away from the
+ * price it annotates, which is invisible until the chart is panned.
  */
 export function bucketOverlay(
     values: Float32Array,
@@ -262,40 +377,60 @@ export function bucketOverlay(
     firstIndex: number = 0,
     lastIndex: number = sourceCount - 1,
     pointColors: Float32Array | null = null,
+    barBase: number = 0,
 ): BucketedOverlay {
     if (firstIndex < 0 || lastIndex < firstIndex) return { points: new Float32Array(0), stride: 2 };
 
     const stride: 2 | 6 = pointColors === null ? 2 : 6;
-    const out: number[] = [];
+    // A preallocated buffer rather than a growing array of boxed numbers. This runs
+    // once per overlay per frame, and `Float32Array.from` on a plain array is a second
+    // pass over every value with a double-to-float narrowing at each step.
+    const capacity: number = factor > 1
+        ? Math.ceil(sourceCount / factor) + 1
+        : Math.max(0, Math.min(sourceCount, lastIndex + 1) - Math.max(0, firstIndex));
+    const out: Float32Array = new Float32Array(Math.max(0, capacity) * stride);
+    let written = 0;
+
     // `x` is the *bucket index*, not a position. Bucketing is index arithmetic and
     // stays that way: converting to a position is the renderer's job, via
     // `bucketCentreSlot`, because a bucket has no position until it is drawn and
     // deciding one here would put the conversion in two places.
     const emit = (x: number, ordinal: number): void => {
-        out.push(x, values[ordinal]);
-        if (pointColors === null) return;
-        out.push(
-            pointColors[ordinal * 4],
-            pointColors[ordinal * 4 + 1],
-            pointColors[ordinal * 4 + 2],
-            pointColors[ordinal * 4 + 3],
-        );
+        if (written + stride > out.length) return;
+        out[written] = x;
+        out[written + 1] = values[ordinal];
+        if (pointColors === null) {
+            written += 2;
+            return;
+        }
+        out[written + 2] = pointColors[ordinal * 4];
+        out[written + 3] = pointColors[ordinal * 4 + 1];
+        out[written + 4] = pointColors[ordinal * 4 + 2];
+        out[written + 5] = pointColors[ordinal * 4 + 3];
+        written += 6;
     };
 
     if (factor <= 1) {
         const from = Math.max(0, firstIndex);
         const to = Math.min(sourceCount - 1, lastIndex);
-        for (let ordinal = from; ordinal <= to; ordinal++) emit(ordinal, ordinal);
+        for (let ordinal = from; ordinal <= to; ordinal++) emit(ordinal + barBase, ordinal);
     } else {
-        const bucketCount = Math.ceil(sourceCount / factor);
-        for (let bucket = 0; bucket < bucketCount; bucket++) {
-            const first = bucket * factor;
-            const last = Math.min(first + factor, sourceCount) - 1;
-            if (last < firstIndex || first > lastIndex) continue;
+        // Walked by absolute bucket rather than by retained ordinal, because that is
+        // the grid the candles are reduced on. The retained range each bucket covers
+        // is clipped at both ends, so a bucket straddling the trim contributes only
+        // the part of itself that survives — the same clipping `bucketCentreSlot`
+        // does when it places the bucket.
+        const firstBucket: number = Math.floor((barBase + Math.max(0, firstIndex)) / factor);
+        const lastBucket: number = Math.floor((barBase + Math.min(sourceCount - 1, lastIndex)) / factor);
+        for (let bucket = firstBucket; bucket <= lastBucket; bucket++) {
+            const first: number = Math.max(0, bucket * factor - barBase);
+            const last: number = Math.min((bucket + 1) * factor - barBase, sourceCount) - 1;
+            if (last < first) continue;
+            if (last < Math.max(0, firstIndex) || first > Math.min(sourceCount - 1, lastIndex)) continue;
             // The bucket's index, which the candles' own slice is keyed by, so the two
             // reduce to the same buckets and land on the same x by construction.
             emit(bucket, last);
         }
     }
-    return { points: Float32Array.from(out), stride };
+    return { points: out.length === written ? out : out.subarray(0, written), stride };
 }

@@ -26,6 +26,16 @@ export interface CandleSource {
     requestSnapshot?(reason: string): void;
 }
 
+/** Operational counters for a feed controller, suitable for telemetry or replay UIs. */
+export interface FeedDiagnostics {
+    received: number;
+    applied: number;
+    rejected: number;
+    lastSequence: number | null;
+    lastMessageType: CandleFeedMessage['type'] | null;
+    lastError: string | null;
+}
+
 export interface CandleTarget {
     setData(candles: readonly CandleData[]): void;
     replaceData(candles: readonly CandleData[]): void;

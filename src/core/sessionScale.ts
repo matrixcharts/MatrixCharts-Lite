@@ -111,6 +111,16 @@ export interface ResolvedSessionBreaks {
     mode: 'collapsed' | 'proportional';
     collapsedSlots: number;
     maxWhitespaceRatio: number;
+    /**
+     * The modal bar interval the threshold was derived from, in ms.
+     *
+     * Carried so that sizing the breaks does not have to derive it again. It is not
+     * the same as the threshold divided by anything — a caller who pinned
+     * `thresholdMs` broke that relationship, and deriving the interval from the
+     * threshold anyway would size their breaks against a number that has nothing to
+     * do with their bars.
+     */
+    interval: number;
 }
 
 export function resolveSessionBreaks(
@@ -135,7 +145,7 @@ export function resolveSessionBreaks(
     if (mode !== 'collapsed' && mode !== 'proportional') {
         fail(`timeScale.sessionBreaks.mode is ${JSON.stringify(options?.mode)}; expected 'collapsed' or 'proportional'.`);
     }
-    return { thresholdMs, mode, collapsedSlots, maxWhitespaceRatio };
+    return { thresholdMs, mode, collapsedSlots, maxWhitespaceRatio, interval };
 }
 
 /**
@@ -149,12 +159,41 @@ export function sizeSessionBreaks(
     times: readonly number[],
     resolved: ResolvedSessionBreaks,
 ): SessionBreak[] {
-    const raw: Array<{ index: number; gapMs: number }> = findSessionBreaks(times, resolved.thresholdMs);
-    if (raw.length === 0) return [];
+    return sizeSessionBreaksWithScale(times, resolved).breaks;
+}
 
-    const interval: number = modalInterval(times);
+/**
+ * `sizeSessionBreaks`, reporting the budget scale that was applied.
+ *
+ * The scale has to travel with the breaks. A full rebuild and an incremental
+ * append both cap total whitespace against the same budget, and an incremental
+ * append recovers the widths of breaks already in the table by measuring the steps
+ * between adjacent offsets — which are the *capped* widths. Without the factor, the
+ * append reads an already-capped width as a raw one and caps it again, and the
+ * gaps decay geometrically across successive appends until a proportional chart
+ * shows no breaks at all. `sizeSessionBreaks` alone cannot report the factor, so a
+ * caller that will later append incrementally needs this form.
+ *
+ * @returns The sized breaks, and the uniform scale applied to their widths.
+ */
+export function sizeSessionBreaksWithScale(
+    times: readonly number[],
+    resolved: ResolvedSessionBreaks,
+): { breaks: SessionBreak[]; scale: number } {
+    const raw: Array<{ index: number; gapMs: number }> = findSessionBreaks(times, resolved.thresholdMs);
+    if (raw.length === 0) return { breaks: [], scale: 1 };
+
     const barCount: number = times.length;
     let slots: number[];
+    // Taken from `resolved`, which already holds it.
+    //
+    // `resolveSessionBreaks` derives the modal interval to get a default threshold,
+    // and this function used to derive it a second time to size the breaks. That is
+    // two O(n log n) sorts of the whole retained series for one number, on every
+    // rebuild — and the two could disagree, because a caller who pinned
+    // `thresholdMs` was still getting this second, independently derived interval.
+    // A shared field makes the disagreement impossible rather than unlikely.
+    const interval: number = resolved.interval;
 
     if (resolved.mode === 'collapsed') {
         slots = raw.map((): number => resolved.collapsedSlots);
@@ -168,20 +207,24 @@ export function sizeSessionBreaks(
 
     const total: number = slots.reduce((sum, value) => sum + value, 0);
     const budget: number = resolved.maxWhitespaceRatio * barCount;
+    let scale = 1;
     if (total > budget && total > 0) {
         // Scaled rather than truncated: a break that is over budget is still a
         // break, and dropping the surplus would collapse some breaks to nothing
         // while leaving others at full width, which reads as data rather than as
         // a cap.
-        const scale: number = budget / total;
+        scale = budget / total;
         slots = slots.map((value): number => value * scale);
     }
 
-    return raw.map((entry, order): SessionBreak => ({
-        index: entry.index,
-        gapMs: entry.gapMs,
-        slots: Math.max(0, slots[order]),
-    }));
+    return {
+        breaks: raw.map((entry, order): SessionBreak => ({
+            index: entry.index,
+            gapMs: entry.gapMs,
+            slots: Math.max(0, slots[order]),
+        })),
+        scale,
+    };
 }
 
 /**
@@ -212,12 +255,47 @@ export function computeSlotOffsets(
     return offsets;
 }
 
+/**
+ * `computeSlotOffsets` and `trimSlotOffsetsIncremental` in
+ * `incrementalSlots.ts` are the only implementations of appending to and trimming
+ * a slot table. Two near-duplicates used to live here as well:
+ *
+ * `appendCollapsedSlotOffsets` was a second collapsed append, and it was wrong. On
+ * a fresh table it set `priorTime` to negative infinity, so the very first bar's
+ * gap was `+Infinity` — over any threshold — and a continuous series got a
+ * phantom half-slot break before bar 0. The equivalent in `incrementalSlots` has
+ * an explicit first-bar guard; this one did not.
+ *
+ * `trimSlotOffsets` was a second trim, byte-for-byte in behaviour.
+ *
+ * Both were imported into `Chart` and called by nothing, and neither was tested.
+ * A duplicate with a latent defect and no test is worse than no function at all:
+ * it is the one a later author wires up, and it fails on a gapped series at the
+ * left edge where nothing is looking. `incrementalSlots` owns both operations.
+ */
+
 /** Total slots the series occupies, bars and breaks together. */
 export function totalSlots(offsets: Float64Array): number {
     if (offsets.length === 0) return 0;
     const last: number = offsets[offsets.length - 1];
     return last + 1;
 }
+
+// Re-exported from `incrementalSlots`, which owns every mutation of the table. The
+// re-export is a convenience for the pure functions here that need to read it, not
+// a second home: there is one implementation of each, and these are the same
+// bindings rather than wrappers.
+export {
+    appendSlotOffsetsCollapsed,
+    appendSlotOffsetsProportional,
+    appendSlotOffsetsProportionalWithScale,
+    trimSlotOffsetsIncremental,
+    totalSlotsFast,
+    slotOffsetAt,
+    incrementalSlotUpdate,
+    incrementalSlotUpdateWithScale,
+    type SlotTableUpdate,
+} from './incrementalSlots.js';
 
 /**
  * Bar containing a slot position.
@@ -381,16 +459,34 @@ export function slotAtIndex(offsets: Float64Array | null, index: number): number
  *
  * A bucket of one is that bar, and a series with no breaks makes this the identity, so
  * neither of those cases changes.
+ *
+ * `barBase` is the absolute ordinal of the first retained bar, and `bucketIndex` is
+ * **absolute**. The pyramid's buckets are cut on absolute boundaries and are not
+ * re-cut when history is trimmed, because re-cutting is an O(n) re-aggregation of
+ * every level and the trim is on the append path. So a bucket's bars, in absolute
+ * terms, are `[bucketIndex * factor, (bucketIndex + 1) * factor)`, and only the part
+ * of that which is still retained has a position.
+ *
+ * With `barBase` at 0 — a series that has never been trimmed, which is every chart at
+ * load — this reduces exactly to the untrimmed formula. That matters: the whole
+ * coordinate layer is exercised by tests and charts that never trim, and a change here
+ * must be a no-op for them.
  */
 export function bucketCentreSlot(
     offsets: Float64Array | null,
     bucketIndex: number,
     factor: number,
     sourceCount: number,
+    barBase: number = 0,
 ): number {
-    if (!(factor > 1)) return slotAtIndex(offsets, bucketIndex);
-    const first: number = Math.max(0, Math.trunc(bucketIndex) * factor);
-    const last: number = Math.min(first + factor, sourceCount) - 1;
+    if (!(factor > 1)) return slotAtIndex(offsets, bucketIndex - barBase);
+    const bucket: number = Math.trunc(bucketIndex);
+    // Retained-window ordinals of the bars this bucket actually holds. Both ends are
+    // clipped against the window rather than against the series, so a bucket that
+    // straddles the trim is placed at the centre of what is left of it instead of at
+    // the centre of a group that is no longer wholly on screen.
+    const first: number = Math.max(0, bucket * factor - barBase);
+    const last: number = Math.min((bucket + 1) * factor - barBase, sourceCount) - 1;
     if (last <= first) return slotAtIndex(offsets, first);
     return (slotAtIndex(offsets, first) + slotAtIndex(offsets, last)) / 2;
 }

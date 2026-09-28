@@ -5,6 +5,7 @@
 
 import type { CandleData } from './CandleData.js';
 import type { LogicalRange, TimeRange } from './coordinates.js';
+import type { OrderSide, OrderStatus, DrawingOrderEvent } from './tradingTools.js';
 
 /** Cancels a subscription. Safe to call more than once. */
 export type Unsubscribe = () => void;
@@ -50,6 +51,7 @@ export type CrosshairMoveEvent = CrosshairData | CrosshairCleared;
 export type HitTestResult =
     | { kind: 'candle'; index: number; time: number; candle: CandleData; price: number }
     | { kind: 'priceLine'; id: string; price: number }
+    | { kind: 'order'; id: string; side: OrderSide; status: OrderStatus; price: number; quantity: number }
     | { kind: 'marker'; index: number; time: number; price: number }
     | { kind: 'zone'; id: string; fromIndex: number; toIndex: number | null; top: number; bottom: number };
 
@@ -121,4 +123,23 @@ export interface PaneRangeEvent {
      * price pane reports prices rather than logs.
      */
     range: readonly [number, number];
+}
+
+/**
+ * A drawing or order interaction event.
+ *
+ * Covers the full lifecycle of drawings and orders: selection, creation, moves,
+ * resizes, deletions, and order status transitions. A single subscription
+ * receives all interaction events, so a UI layer can update its state from
+ * one place rather than subscribing to each event type separately.
+ */
+export interface DrawingOrderInteractionEvent {
+    /** The interaction that occurred. */
+    type: DrawingOrderEvent['type'];
+    /** ID of the drawing or order involved. */
+    id: string;
+    /** Timestamp of the event. */
+    time: number;
+    /** The full event payload. */
+    detail: DrawingOrderEvent;
 }

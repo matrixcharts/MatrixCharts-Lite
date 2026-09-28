@@ -1,5 +1,5 @@
 // src/core/Chart.ts
-import type { IRenderer } from './IRenderer.js';
+import type { IRenderer, IOverlayHost } from './IRenderer.js';
 // The concrete renderers are reached through `rendererFactory`, not imported here: the
 // factory is the single place that decides what a layer is, which is what lets a headless
 // test stand one in without this file knowing.
@@ -29,6 +29,7 @@ import type {
 import { mergeOptionPartials, parseCssColor, resolveCandleColors, resolveOptions } from './options.js';
 import { createRenderer } from './rendererFactory.js';
 import type { IDataRenderer } from './IDataRenderer.js';
+import { Canvas2DDataRenderer } from '../renderers/Canvas2DDataRenderer.js';
 import { resolveChartContainer } from './resolveChartContainer.js';
 import {
     fitPaneTransform,
@@ -64,25 +65,55 @@ import {
     computeSlotOffsets,
     indexAtTime,
     resolveSessionBreaks,
-    sizeSessionBreaks,
+    sizeSessionBreaksWithScale,
     slotAtIndex,
     totalSlots,
     modalInterval,
 } from './sessionScale.js';
 import {
+    appendOverlayValue,
     bucketOverlay,
+    growOverlayValues,
     resolveOverlays,
+    trimOverlayStart,
+    type OverlayPoint,
     type OverlaySpec,
     type ResolvedOverlay,
 } from './overlays.js';
 import type {
     ChartClickEvent,
     CrosshairMoveEvent,
+    DrawingOrderInteractionEvent,
     Unsubscribe,
     VisibleRangeEvent,
     PaneRangeEvent,
     HitTestResult,
 } from './ChartEvents.js';
+import type { ChartViewState } from './viewState.js';
+import type { LineSeriesHandle, LineSeriesOptions } from './series.js';
+import type {
+    DrawingPoint,
+    DrawingType,
+    EditableDrawing,
+    DragHandle,
+    OrderSide,
+    OrderSpec,
+    OrderStatus,
+    ResolvedOrder,
+} from './tradingTools.js';
+import {
+    canTransitionOrder,
+    createDrawingFromGesture,
+    createOrderFromDrawing,
+    getDrawingHandles,
+    validateDrawings,
+    type DrawingOrderEvent,
+    type DrawingOrderHitResult,
+    type DrawPointProjector,
+    type DragState,
+} from './drawingOrderModel.js';
+import { incrementalSlotUpdateWithScale, type SlotTableUpdate } from './incrementalSlots.js';
+import type { OverlayPainter } from './paint.js';
 import {
     type ChartViewport,
     type LogicalRange,
@@ -146,6 +177,19 @@ function candleVolume(candle: CandleData): number {
     return candle.volume ?? 0;
 }
 
+/**
+ * A drawing detached from the chart's own copy.
+ *
+ * Points are cloned as well as the drawing, because a drawing handed to a caller
+ * and kept would otherwise share its `points` array with the live one: `points` is
+ * a mutable reference, and a spread copies the reference rather than the array.
+ * So does `getDrawings()`, and so does every drawing published to a
+ * `subscribeDrawingOrderEvents` subscriber.
+ */
+function cloneDrawing(drawing: EditableDrawing): EditableDrawing {
+    return { ...drawing, points: drawing.points.map((point) => ({ ...point })) };
+}
+
 export class Chart {
     private container: HTMLElement;
     private emitter: EventEmitter<ChartEvents> = new EventEmitter();
@@ -155,6 +199,16 @@ export class Chart {
     
     // Store your active renderers
     private renderers: IRenderer[] = [];
+    /**
+     * The UI layer, held for the caller's paint callback.
+     *
+     * Separate from `renderers` because the painter has to reach a method that is
+     * not on `IRenderer` — `setOverlayPainter` is specific to the layer that owns a
+     * transparent 2D context. Held as a separate field rather than found in the array
+     * so the role is explicit, and so a test double that implements `IRenderer` alone
+     * is a compile error here instead of a painter that silently does nothing.
+     */
+    private uiRenderer: (IRenderer & IOverlayHost) | null = null;
     /** Held directly rather than by position, since init order is not paint order. */
     /**
      * The layer that draws the series, held as the contract Chart actually holds with it
@@ -187,6 +241,7 @@ export class Chart {
         baseLow: number;
         baseHigh: number;
     } | null = null;
+    private orderDrag: { id: string } | null = null;
     private offsetX: number = 0;
     private scaleX: number = 1;
     private offsetY: number = 0;
@@ -205,6 +260,16 @@ export class Chart {
     private priceLines: ResolvedPriceLine[] = [];
     private markers: ResolvedMarker[] = [];
     private zones: PlacedZone[] = [];
+    private orders: ResolvedOrder[] = [];
+    private orderHandlers: Set<(orders: readonly ResolvedOrder[]) => void> = new Set();
+    /** Editable drawings with drag handles. */
+    private drawings: EditableDrawing[] = [];
+    /** Drawing/order interaction event handlers. */
+    private drawingOrderHandlers: Set<(event: DrawingOrderInteractionEvent) => void> = new Set();
+    /** The drag operation currently in progress. */
+    private activeDrag: DragState | null = null;
+    /** The drawing type currently being created. */
+    private creatingDrawingType: DrawingType | null = null;
     /**
      * The range each pane has been locked to, by pane index. Absent means that pane
      * fits its own data.
@@ -241,6 +306,27 @@ export class Chart {
      * Recomputed with the viewport, because both depend on it.
      */
     private paneLayout: PaneLayout = { rects: [], transforms: [], empty: [] };
+    /**
+     * Cached `modalInterval(this.candleTimes)`, or null when it must be re-derived.
+     *
+     * Null means "not yet computed", which is distinct from a computed 0 — a series
+     * whose bars all share a timestamp has a real modal interval of 0, and
+     * conflating the two would re-derive it on every frame forever, which is the
+     * cost this field exists to remove.
+     */
+    private cachedModalInterval: number | null = null;
+    /**
+     * The budget scale the current slot table's break widths are under.
+     *
+     * Only meaningful in `proportional` mode, and only read by the incremental
+     * append path. A full rebuild derives the scale from the timestamps and knows
+     * it; an incremental append recovers the widths of breaks already in the table
+     * by reading the steps between adjacent offsets, and those steps are scaled
+     * values. Without carrying the factor forward, each append treats the previous
+     * append's capped widths as raw and caps them again, and the gaps decay
+     * geometrically until the chart stops showing session breaks at all.
+     */
+    private slotBreakScale: number = 1;
     private paneRects: PlotRect[] = [];
     private followsLiveEdge: boolean = true;
     private scheduledViewportFrame: number | null = null;
@@ -344,8 +430,15 @@ export class Chart {
             // that decides what a layer is. The factory constructs; the `init` calls
             // below are Chart's, because handing over the canvas and the emitter is
             // lifecycle and lifecycle is not the factory's to own.
-            const dataRenderer = createRenderer('data');
-            dataRenderer.init(dataCanvas, this.emitter);
+            let dataRenderer = createRenderer('data');
+            try {
+                dataRenderer.init(dataCanvas, this.emitter);
+            } catch (error: unknown) {
+                dataRenderer.destroy();
+                if (!(error instanceof Error) || error.message !== 'MatrixCharts: WebGL2 is required.') throw error;
+                dataRenderer = new Canvas2DDataRenderer();
+                dataRenderer.init(dataCanvas, this.emitter);
+            }
             this.dataRenderer = dataRenderer;
             this.renderers.push(dataRenderer);
 
@@ -358,6 +451,7 @@ export class Chart {
             const uiRenderer = createRenderer('ui');
             uiRenderer.init(uiCanvas, this.emitter);
             this.renderers.push(uiRenderer);
+            this.uiRenderer = uiRenderer;
         } catch (error) {
             // Release whatever did come up before rethrowing. The wrapper was never
             // attached, so there is nothing in the caller's DOM to clean up.
@@ -568,9 +662,17 @@ export class Chart {
                 }
             } else {
                 this.priceAxisDrag = null;
-                this.isDragging = true;
-                this.lastPointerX = event.clientX;
-                this.lastPointerY = event.clientY;
+                const rect = this.canvasWrapper.getBoundingClientRect();
+                const hit = this.hitTest(event.clientX - rect.left, event.clientY - rect.top);
+                if (hit?.kind === 'order' && hit.status === 'working') {
+                    this.orderDrag = { id: hit.id };
+                    this.isDragging = false;
+                } else {
+                    this.orderDrag = null;
+                    this.isDragging = true;
+                    this.lastPointerX = event.clientX;
+                    this.lastPointerY = event.clientY;
+                }
             }
         } else if (this.activePointers.size === 2) {
             // A second finger converts the gesture to a pinch, which is horizontal.
@@ -805,6 +907,14 @@ export class Chart {
             this.updatePaneAxisDrag(event.clientY);
             return;
         }
+        if (this.orderDrag !== null) {
+            const rect = this.canvasWrapper.getBoundingClientRect();
+            const price = this.coordinateToPrice(event.clientY - rect.top);
+            this.orders = this.orders.map((order) => order.id === this.orderDrag?.id ? { ...order, price } : order);
+            this.emitDecorations();
+            this.emitOrders();
+            return;
+        }
         if (!this.isDragging) return;
 
         const deltaX: number = event.clientX - this.lastPointerX;
@@ -858,6 +968,7 @@ export class Chart {
             // baseline here is what stops a later press from measuring against a
             // range captured several gestures ago.
             this.priceAxisDrag = null;
+            this.orderDrag = null;
             // A press that never travelled is a click; one that travelled was a pan.
             if (wasSinglePointer && !this.pressMoved) {
                 this.emitClick(event.clientX, event.clientY, this.pressButton);
@@ -1193,7 +1304,11 @@ export class Chart {
             candle = null;
 
             if (candleCount > 0) {
-                const interval = modalInterval(this.candleTimes);
+                // Cached, not derived. This is on the pointer-move path and outside
+                // the series, so it runs on every mouse move over the chart's
+                // whitespace — deriving the interval here was an O(n log n) sort of
+                // the whole retained series per pointer event.
+                const interval = this.modalInterval();
                 if (interval > 0) {
                     if (roundedSlot > lastSlot) {
                         const lastCandle = this.getCandleAt(candleCount - 1);
@@ -1343,6 +1458,43 @@ export class Chart {
         return { from: first.time, to: last.time };
     }
 
+    /** Captures the user-owned viewport and pane ranges for persistence or linking. */
+    public getViewState(): ChartViewState {
+        this.assertAlive();
+        const paneRanges: Array<{ pane: number; range: readonly [number, number] }> = [];
+        for (let pane = 1; pane < this.getPaneCount(); pane++) {
+            const range = this.getPaneValueRange(pane);
+            if (range !== null) paneRanges.push({ pane, range });
+        }
+        return {
+            logical: this.getVisibleLogicalRange(),
+            barSpacing: this.getBarSpacing(),
+            priceRange: this.getPriceRange(),
+            paneRanges,
+            atRealtime: this.isAtRealtime(),
+        };
+    }
+
+    /** Restores a previously captured viewport and pane state. */
+    public setViewState(state: ChartViewState): void {
+        this.assertAlive();
+        if (!state || !Number.isFinite(state.logical.from) || !Number.isFinite(state.logical.to)) {
+            throw new Error('MatrixCharts: setViewState expects a finite logical range.');
+        }
+        if (!Number.isFinite(state.barSpacing) || state.barSpacing <= 0) {
+            throw new Error('MatrixCharts: setViewState expects a positive bar spacing.');
+        }
+        this.applyOptions({ timeScale: { barSpacing: state.barSpacing } });
+        this.setVisibleLogicalRange(state.logical);
+        if (state.priceRange[1] > state.priceRange[0]) this.setPriceRange(state.priceRange);
+        for (const entry of state.paneRanges) {
+            if (entry.pane > 0 && entry.pane < this.getPaneCount() && entry.range[1] > entry.range[0]) {
+                this.setPaneRange(entry.pane, entry.range);
+            }
+        }
+        if (state.atRealtime) this.scrollToRealtime();
+    }
+
     /**
      * Places the view on a logical candle range, the counterpart to
      * `getVisibleLogicalRange`.
@@ -1470,6 +1622,456 @@ export class Chart {
         this.overlaySpecs = [...overlays];
         this.overlays = resolved;
         this.updateViewport();
+    }
+
+    /**
+     * Records one indicator value against a candle. O(1), whatever the series length.
+     *
+     * This is the live-feed counterpart to `setOverlays`. That method re-validates
+     * every point of every overlay and reallocates a full-length buffer, so feeding it
+     * one new value per tick costs a reallocation and a pass over the whole series per
+     * tick — on a 10,000-bar chart, more than a frame budget per value. This writes one
+     * slot and extends the window.
+     *
+     * The timestamp must be a real candle's. Snapping to the nearest would let a
+     * misaligned indicator look right, which is the same rule `setOverlays` enforces
+     * and for the same reason.
+     *
+     * This does **not** add the candle. A caller receiving a bar calls `appendData`
+     * and then this, in that order, and a caller that appends several bars can call
+     * this once per bar.
+     *
+     * @param id    The overlay's id, as supplied to `setOverlays`.
+     * @param time  The candle's timestamp.
+     * @param value The indicator's value there.
+     * @param color Optional CSS colour for this point, overriding the overlay's.
+     * @returns The candle ordinal the value was written to, or -1 if it was rejected.
+     */
+    public appendOverlayValue(
+        id: string,
+        time: number,
+        value: number,
+        color?: string,
+    ): number {
+        this.assertAlive();
+        const overlay: ResolvedOverlay | undefined = this.overlays.find(
+            (entry: ResolvedOverlay): boolean => entry.id === id,
+        );
+        if (overlay === undefined) {
+            throw new Error(`MatrixCharts: No overlay has id ${JSON.stringify(id)}.`);
+        }
+        const ordinal: number = this.overlayOrdinalFor(overlay, time);
+        if (ordinal < 0) return -1;
+        let rgba: Rgba | undefined;
+        if (color !== undefined) {
+            rgba = parseCssColor(color, '');
+        }
+        appendOverlayValue(overlay, ordinal, value, rgba);
+        this.updateViewport();
+        return ordinal;
+    }
+
+    /**
+     * Records many indicator values at once, with one viewport update.
+     *
+     * `appendOverlayValue` recomputes the viewport per call, which is the right shape
+     * for a live feed — one new bar, one new value — and the wrong shape for a catch-up
+     * after a reconnect or a replay, where a thousand bars arrive in one tick. Doing it
+     * per value there is a thousand full viewport recomputations to reach one frame.
+     *
+     * The window is extended from the first value to the last, so a series with a gap
+     * in the middle is reduced across that gap — which is what a `LINE_STRIP` draws
+     * anyway, and what `setOverlays` does with the same points. Split the call if the
+     * gap matters.
+     *
+     * @param id     The overlay's id.
+     * @param points `{ time, value }` pairs, ascending by time.
+     * @param color  Optional CSS colour for every point in the batch.
+     * @returns How many values were written.
+     */
+    public appendOverlayValues(
+        id: string,
+        points: readonly OverlayPoint[],
+        color?: string,
+    ): number {
+        this.assertAlive();
+        const overlay: ResolvedOverlay | undefined = this.overlays.find(
+            (entry: ResolvedOverlay): boolean => entry.id === id,
+        );
+        if (overlay === undefined) {
+            throw new Error(`MatrixCharts: No overlay has id ${JSON.stringify(id)}.`);
+        }
+        if (points.length === 0) return 0;
+        const rgba: Rgba | undefined = color !== undefined ? parseCssColor(color, '') : undefined;
+        let written = 0;
+        for (const point of points) {
+            const ordinal: number = this.overlayOrdinalFor(overlay, point.time);
+            if (ordinal < 0) continue;
+            appendOverlayValue(overlay, ordinal, point.value, rgba);
+            written++;
+        }
+        // Once, not once per value.
+        this.updateViewport();
+        return written;
+    }
+
+    /**
+     * Revises a value already recorded against a candle. O(1).
+     *
+     * The other half of the live feed: a forming candle is revised many times before
+     * it closes, and each revision is a new value for the same bar. It is deliberately
+     * a separate method rather than an argument to `appendOverlayValue`, because the
+     * two have different failure modes — a revision is expected to land on a bar the
+     * overlay already covers, and an append is expected to extend the window — and one
+     * method that silently does either is one nobody can reason about.
+     *
+     * @returns The ordinal revised, or -1 if the overlay does not cover that candle.
+     */
+    public updateOverlayValue(
+        id: string,
+        time: number,
+        value: number,
+        color?: string,
+    ): number {
+        this.assertAlive();
+        const overlay: ResolvedOverlay | undefined = this.overlays.find(
+            (entry: ResolvedOverlay): boolean => entry.id === id,
+        );
+        if (overlay === undefined) {
+            throw new Error(`MatrixCharts: No overlay has id ${JSON.stringify(id)}.`);
+        }
+        const ordinal: number = this.overlayOrdinalFor(overlay, time);
+        if (ordinal < 0) return -1;
+        if (ordinal < overlay.firstIndex || ordinal > overlay.lastIndex) {
+            // Not covered. Writing it anyway would extend the window across a gap the
+            // indicator never produced a value for, and the line would be drawn through
+            // a stretch the caller has said nothing about.
+            return -1;
+        }
+        if (color !== undefined) {
+            if (overlay.pointColors === null) {
+                overlay.pointColors = new Float32Array(overlay.values.length * 4);
+            }
+            overlay.pointColors.set(parseCssColor(color, ''), ordinal * 4);
+        }
+        growOverlayValues(overlay, ordinal + 1);
+        overlay.values[ordinal] = value;
+        this.updateViewport();
+        return ordinal;
+    }
+
+    /**
+     * The ordinal a timestamp names, or -1.
+     *
+     * An exact match only, for the same reason `resolveOverlays` insists on one: a
+     * value landing on a bar the caller did not mean is a defect that looks correct.
+     */
+    private overlayOrdinalFor(overlay: ResolvedOverlay, time: number): number {
+        if (!Number.isFinite(time)) {
+            throw new Error(`MatrixCharts: Overlay ${JSON.stringify(overlay.id)} was given a non-finite time.`);
+        }
+        const count: number = this.candlePyramid.candleCount;
+        if (count === 0) return -1;
+        const times: readonly number[] = this.candleTimes;
+        let low = 0;
+        let high = count - 1;
+        while (low <= high) {
+            const middle = (low + high) >>> 1;
+            if (times[middle] === time) return middle;
+            if (times[middle] < time) low = middle + 1;
+            else high = middle - 1;
+        }
+        return -1;
+    }
+
+    /** Adds a managed line series using the chart's validated overlay pipeline. */
+    public addSeries(options: LineSeriesOptions): LineSeriesHandle {
+        this.assertAlive();
+        if (typeof options.id !== 'string' || options.id.trim().length === 0) {
+            throw new Error('MatrixCharts: A series needs a non-empty string id.');
+        }
+        if (this.overlaySpecs.some((spec: OverlaySpec): boolean => spec.id === options.id)) {
+            throw new Error(`MatrixCharts: Series id ${JSON.stringify(options.id)} is already in use.`);
+        }
+        const initial: OverlaySpec = {
+            id: options.id,
+            points: [],
+            color: options.color,
+            pane: options.pane,
+            visible: options.visible,
+        };
+        this.setOverlays([...this.overlaySpecs, initial]);
+        let removed: boolean = false;
+        const update = (change: (spec: OverlaySpec) => OverlaySpec): void => {
+            this.assertAlive();
+            if (removed) throw new Error(`MatrixCharts: Series ${JSON.stringify(options.id)} has been removed.`);
+            const current: OverlaySpec | undefined = this.overlaySpecs.find(
+                (spec: OverlaySpec): boolean => spec.id === options.id,
+            );
+            if (current === undefined) {
+                throw new Error(`MatrixCharts: Series ${JSON.stringify(options.id)} is no longer attached.`);
+            }
+            this.setOverlays(this.overlaySpecs.map((spec: OverlaySpec): OverlaySpec => (
+                spec.id === options.id ? change(spec) : spec
+            )));
+        };
+        return {
+            id: options.id,
+            setData: (points: readonly OverlayPoint[]): void => update((spec): OverlaySpec => ({ ...spec, points })),
+            setVisible: (visible: boolean): void => update((spec): OverlaySpec => ({ ...spec, visible })),
+            remove: (): void => {
+                if (removed) return;
+                this.assertAlive();
+                this.setOverlays(this.overlaySpecs.filter((spec: OverlaySpec): boolean => spec.id !== options.id));
+                removed = true;
+            },
+        };
+    }
+
+    /** Adds an editable drawing backed by the managed line-series pipeline. */
+    public addDrawing(options: LineSeriesOptions & { points?: readonly DrawingPoint[] }): LineSeriesHandle {
+        const handle = this.addSeries(options);
+        if (options.points !== undefined) handle.setData(options.points);
+        return handle;
+    }
+
+    /** Replaces working orders shown as interactive price lines. */
+    public setOrders(orders: readonly OrderSpec[]): void {
+        this.assertAlive();
+        const seen = new Set<string>();
+        this.orders = orders.map((order): ResolvedOrder => {
+            if (typeof order.id !== 'string' || order.id.trim().length === 0 || seen.has(order.id)) {
+                throw new Error('MatrixCharts: Order ids must be non-empty and unique.');
+            }
+            if (order.side !== 'buy' && order.side !== 'sell') throw new Error(`MatrixCharts: Order ${order.id} has an invalid side.`);
+            if (!Number.isFinite(order.price) || !Number.isFinite(order.quantity) || order.quantity <= 0) {
+                throw new Error(`MatrixCharts: Order ${order.id} has invalid price or quantity.`);
+            }
+            const status: OrderStatus = order.status ?? 'working';
+            if (!['working', 'filled', 'cancelled', 'rejected'].includes(status)) throw new Error(`MatrixCharts: Order ${order.id} has an invalid status.`);
+            seen.add(order.id);
+            return { ...order, status };
+        });
+        this.emitDecorations();
+        this.emitOrders();
+    }
+
+    public getOrders(): ResolvedOrder[] { this.assertAlive(); return this.orders.map((order) => ({ ...order })); }
+    /**
+     * Moves an order to a new status.
+     *
+     * The transition is checked, not just the membership. `ORDER_TRANSITIONS`
+     * declares `filled`, `cancelled`, and `rejected` terminal, and this method used
+     * to validate only that the requested status was one of the four names — so a
+     * filled order could be handed back to `working`, and a cancelled one to
+     * `filled`. The state machine existed, was tested, and was not consulted from
+     * here; the only place it ran was inside `transitionOrder`, which nothing in
+     * this class calls.
+     *
+     * Terminal orders are left alone rather than throwing, because the caller that
+     * observes a rejection usually has a stale view of the order and an illegal
+     * transition there is a race, not a programming error to crash a trading
+     * screen over.
+     */
+    public updateOrderStatus(id: string, status: OrderStatus): void {
+        this.assertAlive();
+        if (!['working', 'filled', 'cancelled', 'rejected'].includes(status)) throw new Error(`MatrixCharts: Order ${id} has an invalid status.`);
+        const order = this.orders.find((entry) => entry.id === id);
+        if (!order) return;
+        // Same status is not a transition. A terminal order re-sent its own status
+        // is the common case — a feed replaying a snapshot — and must be a no-op
+        // rather than being refused as illegal.
+        if (order.status === status) return;
+        if (!canTransitionOrder(order.status, status)) return;
+        order.status = status;
+        this.emitDecorations();
+        this.emitOrders();
+    }
+    public subscribeOrders(handler: (orders: readonly ResolvedOrder[]) => void): Unsubscribe {
+        this.assertAlive();
+        this.orderHandlers.add(handler);
+        handler(this.getOrders());
+        return () => this.orderHandlers.delete(handler);
+    }
+    private emitOrders(): void {
+        const orders = this.getOrders();
+        for (const handler of Array.from(this.orderHandlers)) handler(orders);
+    }
+
+    // --- drawings ---------------------------------------------------------------
+
+    /**
+     * Replaces all editable drawings.
+     *
+     * Validated before anything is replaced, so a refused call leaves the existing
+     * set exactly as it was. Every other bulk-ingest method on this class already
+     * worked that way; this one did not, which meant a drawing with a NaN anchor
+     * entered the store and then failed every projection and every hit test
+     * invisibly.
+     */
+    public setDrawings(drawings: readonly EditableDrawing[]): void {
+        this.assertAlive();
+        this.drawings = validateDrawings(drawings);
+        this.emitDrawings();
+    }
+
+    /**
+     * Returns all editable drawings.
+     *
+     * Cloned, and so is every drawing handed to a `subscribeDrawingOrderEvents`
+     * subscriber. Those two were inconsistent: `getDrawings()` deep-copied each
+     * drawing and its points, while the create/select/deselect events passed the
+     * live instance out of `this.drawings` by reference. A subscriber could
+     * therefore write `drawing.points[0].value = 999` and move a drawing on screen
+     * without going through any API, with no `redraw()` and no notification — and
+     * a caller holding that object kept it usable after `deleteDrawing`.
+     */
+    public getDrawings(): EditableDrawing[] {
+        this.assertAlive();
+        return this.drawings.map(cloneDrawing);
+    }
+
+    /** Returns drag handles for a specific drawing. */
+    public getDrawingHandles(id: string): DragHandle[] {
+        this.assertAlive();
+        const drawing = this.drawings.find(d => d.id === id);
+        if (!drawing) return [];
+        return getDrawingHandles(drawing);
+    }
+
+    /** Starts creating a drawing of the given type. Call on pointer down. */
+    public beginDrawingCreate(type: DrawingType, point: DrawingPoint): void {
+        this.assertAlive();
+        this.creatingDrawingType = type;
+        this.activeDrag = {
+            target: 'create',
+            id: '',
+            startPoint: point,
+            currentPoint: point,
+            createStart: point,
+        };
+    }
+
+    /**
+     * Updates the drawing creation drag. Call on pointer move.
+     *
+     * `assertAlive()` here and in the two below is load-bearing rather than
+     * ceremonial. These three mutate state and publish to subscribers, and they
+     * were the only public drawing methods without the guard. On a destroyed chart
+     * they still pushed into the drawing array and still invoked live handlers,
+     * which is precisely the callback-after-destroy the rest of the API refuses.
+     * A gesture is asynchronous by nature — pointer down, moves, up — so a chart
+     * torn down mid-gesture lands here by ordinary use, not by misuse.
+     */
+    public updateDrawingCreate(point: DrawingPoint): void {
+        this.assertAlive();
+        if (this.activeDrag === null || this.activeDrag.target !== 'create') return;
+        if (this.creatingDrawingType === null) return;
+        this.activeDrag.currentPoint = point;
+    }
+
+    /** Completes the drawing creation. Call on pointer up. */
+    public finishDrawingCreate(id: string): EditableDrawing | null {
+        this.assertAlive();
+        if (this.activeDrag === null || this.activeDrag.target !== 'create') return null;
+        if (this.creatingDrawingType === null) return null;
+        const drawing = createDrawingFromGesture(
+            this.creatingDrawingType,
+            this.activeDrag.createStart ?? this.activeDrag.startPoint,
+            this.activeDrag.currentPoint,
+            id,
+        );
+        this.creatingDrawingType = null;
+        this.activeDrag = null;
+        if (drawing) {
+            this.drawings.push(drawing);
+            this.emitDrawings();
+            // Cloned, not the instance just pushed. See `cloneDrawing`.
+            this.emitDrawingOrderEvent({ type: 'drawing-create', id, time: Date.now(), drawing: cloneDrawing(drawing) });
+        }
+        return drawing;
+    }
+
+    /** Cancels the drawing creation. */
+    public cancelDrawingCreate(): void {
+        this.assertAlive();
+        this.creatingDrawingType = null;
+        this.activeDrag = null;
+    }
+
+    /** Selects a drawing by id. */
+    public selectDrawing(id: string): void {
+        this.assertAlive();
+        const drawing = this.drawings.find(d => d.id === id);
+        if (!drawing) return;
+        drawing.selected = true;
+        this.emitDrawings();
+        this.emitDrawingOrderEvent({ type: 'drawing-select', id, time: Date.now(), drawing: cloneDrawing(drawing) });
+    }
+
+    /** Deselects all drawings. */
+    public deselectAllDrawings(): void {
+        this.assertAlive();
+        for (const drawing of this.drawings) {
+            if (drawing.selected) {
+                drawing.selected = false;
+                this.emitDrawingOrderEvent({ type: 'drawing-deselect', id: drawing.id, time: Date.now(), drawing: cloneDrawing(drawing) });
+            }
+        }
+        this.emitDrawings();
+    }
+
+    /** Deletes a drawing by id. */
+    public deleteDrawing(id: string): boolean {
+        this.assertAlive();
+        const index = this.drawings.findIndex(d => d.id === id);
+        if (index < 0) return false;
+        this.drawings.splice(index, 1);
+        this.emitDrawings();
+        this.emitDrawingOrderEvent({ type: 'drawing-delete', id, time: Date.now() });
+        return true;
+    }
+
+    /** Creates an order from a horizontal-line or trend-line drawing. */
+    public createOrderFromDrawing(drawingId: string, side: OrderSide, orderId: string, quantity: number = 1): boolean {
+        this.assertAlive();
+        const drawing = this.drawings.find(d => d.id === drawingId);
+        if (!drawing) return false;
+        const order = createOrderFromDrawing(drawing, side, orderId, quantity);
+        if (!order) return false;
+        this.setOrders([...this.orders, order]);
+        this.emitDrawingOrderEvent({
+            type: 'order-create',
+            id: orderId,
+            time: Date.now(),
+            side,
+            price: order.price,
+            quantity,
+            status: 'working',
+        });
+        return true;
+    }
+
+    /** Subscribes to drawing/order interaction events. */
+    public subscribeDrawingOrderEvents(handler: (event: DrawingOrderInteractionEvent) => void): Unsubscribe {
+        this.assertAlive();
+        this.drawingOrderHandlers.add(handler);
+        return () => this.drawingOrderHandlers.delete(handler);
+    }
+
+    private emitDrawings(): void {
+        this.redraw();
+    }
+
+    private emitDrawingOrderEvent(event: DrawingOrderEvent): void {
+        if (this.drawingOrderHandlers.size === 0) return;
+        const payload: DrawingOrderInteractionEvent = {
+            type: event.type,
+            id: event.id,
+            time: event.time,
+            detail: event,
+        };
+        for (const handler of Array.from(this.drawingOrderHandlers)) handler(payload);
     }
 
     /**
@@ -1665,7 +2267,7 @@ export class Chart {
 
     private emitDecorations(redraw: boolean = true): void {
         this.emitter.emit('decorations', {
-            priceLines: this.priceLines,
+            priceLines: this.priceLinesWithOrders(),
             markers: this.markersWithPrices(),
             zones: this.zones,
             lastPrice: this.lastPrice(),
@@ -1674,6 +2276,20 @@ export class Chart {
         // viewport work. Called with `false` from `updateViewport`, which is about
         // to redraw anyway.
         if (redraw) this.redraw();
+    }
+
+    private priceLinesWithOrders(): ResolvedPriceLine[] {
+        const orderLines: ResolvedPriceLine[] = this.orders.map((order): ResolvedPriceLine => ({
+            id: `order:${order.id}`,
+            price: order.price,
+            color: parseCssColor(order.color ?? (order.side === 'buy' ? '#1ad98c' : '#f24059'), `order ${order.id} color`),
+            lineWidth: order.status === 'working' ? 2 : 1,
+            lineStyle: order.status === 'working' ? 'solid' : 'dashed',
+            axisLabelVisible: true,
+            title: order.label ?? `${order.side} ${order.quantity}`,
+            axisLabelColor: null,
+        }));
+        return [...this.priceLines, ...orderLines];
     }
 
     /**
@@ -1930,6 +2546,7 @@ export class Chart {
      */
     private slotOverlayPoints(points: Float32Array, stride: 2 | 6): Float32Array {
         const convertValue: boolean = this.priceScale() === 'log';
+        const barBase: number = this.candlePyramid.getLevelBase(0);
         if (this.slotOffsets === null && !convertValue) return points;
         const out: Float32Array = new Float32Array(points.length);
         out.set(points);
@@ -1937,9 +2554,18 @@ export class Chart {
         const factor: number = this.overlayAggregationFactor;
         const sourceCount: number = this.candlePyramid.candleCount;
         for (let i = 0; i < points.length; i += stride) {
-            // The same conversion the candles' x went through, from the same bucket
-            // index, so an overlay lands on the candle it annotates rather than near it.
-            out[i] = bucketCentreSlot(this.slotOffsets, points[i], factor, sourceCount);
+            // The same conversion the candles' x went through, from the same **absolute**
+            // bucket index, so an overlay lands on the candle it annotates rather than
+            // near it. `bucketOverlay` emits absolute indices and the base is supplied
+            // here rather than folded in there, so the two cannot disagree about which
+            // grid they are on — which after a history trim is a whole bucket of drift.
+            out[i] = bucketCentreSlot(
+                this.slotOffsets,
+                points[i],
+                factor,
+                sourceCount,
+                barBase,
+            );
             if (convertValue) out[i + 1] = toScaleSpace(points[i + 1], scale);
         }
         return out;
@@ -1950,18 +2576,26 @@ export class Chart {
         const times: readonly number[] = this.candleTimes;
         if (!gaps.enabled || times.length < 2) {
             this.slotOffsets = null;
+            this.slotBreakScale = 1;
             return;
         }
         const resolved = resolveSessionBreaks(times, {
+            thresholdMs: gaps.thresholdMs ?? undefined,
             mode: gaps.mode,
             maxWhitespaceRatio: gaps.maxWhitespaceRatio,
         });
-        const breaks = sizeSessionBreaks(times, resolved);
-        if (breaks.length === 0) {
+        // `WithScale` rather than the plain form: a full rebuild caps total
+        // whitespace just as an incremental append does, so its factor is the
+        // starting point for the next append's recovery. Reading the breaks without
+        // it and then appending is how the scale used to get applied twice.
+        const sized = sizeSessionBreaksWithScale(times, resolved);
+        if (sized.breaks.length === 0) {
             this.slotOffsets = null;
+            this.slotBreakScale = 1;
             return;
         }
-        this.slotOffsets = computeSlotOffsets(times, breaks);
+        this.slotOffsets = computeSlotOffsets(times, sized.breaks);
+        this.slotBreakScale = sized.scale;
     }
 
 
@@ -2143,6 +2777,152 @@ export class Chart {
     }
 
     /**
+     * A data-to-screen projector for drawing geometry, bound to the current view.
+     *
+     * The engine stores a drawing's anchors as `{ time, value }` and knows how to
+     * turn those into pixels, but nothing in the engine composes the two: there was
+     * no way to obtain a `toScreen` callback to hand to the drawing model, so the
+     * model was unreachable from outside even though the pieces were public. This
+     * is that composition, and it is the seam a drawing layer built on top of this
+     * engine needs and previously had to reimplement.
+     *
+     * Returns `null` only when there is nothing to project onto — an empty chart.
+     * A timestamp inside an overnight gap projects to the nearer of the two bars
+     * bounding it, deliberately: a line drawn across a weekend has a midpoint anchor
+     * in the dead air between the sessions, and snapping it to the last bar before
+     * the gap is what keeps that line connected to the candles it annotates. The
+     * alternative — a fabricated x in the middle of the compressed break, or `null` —
+     * draws a line that leans on nothing or cannot be moved at all.
+     *
+     * @param pane Optional pane index, for geometry anchored in a sub-pane's units.
+     */
+    public drawingProjector(pane: number = PRICE_PANE): DrawPointProjector {
+        this.assertAlive();
+        const index: number = this.assertPaneExists(pane, 'drawingProjector');
+        // Resolved once, not per call: a projector runs once per anchor per hit
+        // test, and re-resolving the rect and transform on each of those would be
+        // the dominant cost of a hit test at a realistic drawing count.
+        const transform: VerticalTransform = this.paneTransform(index)!;
+        return (point: DrawingPoint): { x: number; y: number } | null => {
+            const x: number | null = this.timeToCoordinateUnchecked(point.time);
+            if (x === null) return null;
+            // Pane 0 is drawn on the price scale, so on a log chart a raw price has
+            // to be converted before it meets the transform. The same conversion
+            // `priceToCoordinate` performs, taken through the pane's own path.
+            // `offsetY` is already absolute — `fitPaneTransform` folds the rect's
+            // origin into it — so this is the exact inverse of `paneValueAt`.
+            const scaled: number = index === PRICE_PANE
+                ? toScaleSpace(point.value, this.priceScale())
+                : point.value;
+            return { x, y: scaled * transform.scaleY + transform.offsetY };
+        };
+    }
+
+    /**
+     * Registers a paint callback for content the engine does not own.
+     *
+     * This is the engine's one drawing surface. A charting engine draws candles,
+     * axes, grids, and the decorations it is told about; it does not draw trend
+     * lines, Fibonacci levels, order blocks, or an application's own overlays. Those
+     * belong in the application's files — and this is how they reach the screen.
+     *
+     * The callback runs once per rendered frame on the UI layer, which sits over the
+     * candles and under the crosshair. It receives a `PaintContext` carrying the
+     * layer's 2D context already scaled to CSS pixels, the plot rect, every pane's
+     * rect, and projections in both directions. The crosshair is drawn after the
+     * callback returns, so a crosshair stays legible over a filled rectangle without
+     * the painter knowing anything about it.
+     *
+     * Pass `null` to unregister. The callback is dropped on `destroy()` as well, so a
+     * painter that closes over a drawing model cannot keep it reachable from a
+     * detached canvas.
+     *
+     * A callback that throws is reported once per distinct error and the frame still
+     * completes; the crosshair, the axes, and the candles are unaffected.
+     *
+     * @param painter The callback, or null to clear.
+     */
+    public setOverlayPainter(painter: OverlayPainter | null): void {
+        this.assertAlive();
+        if (painter !== null && typeof painter !== 'function') {
+            throw new Error('MatrixCharts: setOverlayPainter requires a function or null.');
+        }
+        // No frame is emitted here. A painter has no effect on the chart's state, so
+        // forcing a redraw would repaint three layers to show something that was
+        // already going to be painted on the next frame anyway. A caller that has
+        // just changed its own model and wants it on screen now calls `redraw()`.
+        this.uiRenderer?.setOverlayPainter(painter);
+    }
+
+    /**
+     * Screen-to-data for drawing geometry, matching `drawingProjector`.
+     *
+     * A y outside the pane is converted rather than rejected, for the same reason
+     * `coordinateToPrice` converts one: a crosshair dragged off the top of the
+     * chart still has a price, and it is a real one.
+     *
+     * @param pane Optional pane index, for geometry anchored in a sub-pane's units.
+     */
+    public drawingUnprojector(pane: number = PRICE_PANE): (x: number, y: number) => DrawingPoint {
+        this.assertAlive();
+        const index: number = this.assertPaneExists(pane, 'drawingUnprojector');
+        const transform: VerticalTransform = this.paneTransform(index)!;
+        return (x: number, y: number): DrawingPoint => {
+            // Nearest real candle, so an anchor is always a timestamp the chart can
+            // re-project after a pan. An interpolated time would be a drawing the
+            // engine cannot place again — the same defect a fib's interpolated
+            // levels had.
+            const time: number = this.coordinateToTimeUnchecked(x);
+            const scaled: number = paneValueAt(transform, y);
+            const value: number = index === PRICE_PANE
+                ? fromScaleSpace(scaled, this.priceScale())
+                : scaled;
+            return { time, value };
+        };
+    }
+
+    /**
+     * Validates a pane index for a geometry helper, and returns it.
+     *
+     * The same bounds `getPaneValueRange` enforces, reported against the helper that
+     * was asked for rather than against whichever one happened to be edited next.
+     */
+    private assertPaneExists(pane: number, which: string): number {
+        if (!Number.isInteger(pane) || pane < 0) {
+            throw new Error(`MatrixCharts: ${which} pane must be a non-negative integer; received ${pane}.`);
+        }
+        const count: number = this.paneLayout.rects.length;
+        if (pane >= count) {
+            throw new Error(
+                `MatrixCharts: ${which} pane ${pane}, but the chart has ${count} `
+                + `pane${count === 1 ? '' : 's'}. Panes are created by declaring panes.weights, `
+                + 'one entry per pane.',
+            );
+        }
+        return pane;
+    }
+
+    /**
+     * `timeToCoordinate` without the liveness check, for the projectors above.
+     *
+     * A projector calls this on every anchor of every hit test, and the
+     * `assertAlive()` inside `timeToCoordinate` is a per-anchor branch against a
+     * flag the projector is already inside. The projector is guarded once, at the
+     * point it is handed out.
+     */
+    private timeToCoordinateUnchecked(time: number): number | null {
+        const index: number = indexAtTime(this.candleTimes, time);
+        if (index < 0 || index >= this.candleTimes.length) return null;
+        return this.indexToCoordinate(index);
+    }
+
+    private coordinateToTimeUnchecked(coordinateX: number): number {
+        const index: number = nearestCandleIndex(this.viewport, coordinateX, this.candlePyramid.candleCount);
+        if (index < 0) return this.candleTimes[0] ?? 0;
+        return this.candleTimes[index];
+    }
+
+    /**
      * Price at a screen y on the price pane, honouring the scale and the inversion.
      *
      * The inverse of `priceToCoordinate`. A y outside the pane is still converted
@@ -2166,6 +2946,11 @@ export class Chart {
 
         const axisTolerance: number = 6;
         let nearestLine: { line: ResolvedPriceLine; distance: number } | null = null;
+        for (const order of this.orders) {
+            if (Math.abs(this.priceToCoordinate(order.price) - coordinateY) <= axisTolerance) {
+                return { kind: 'order', id: order.id, side: order.side, status: order.status, price: order.price, quantity: order.quantity };
+            }
+        }
         for (const line of this.priceLines) {
             const distance: number = Math.abs(this.priceToCoordinate(line.price) - coordinateY);
             if (distance <= axisTolerance && (nearestLine === null || distance < nearestLine.distance)) {
@@ -2286,12 +3071,13 @@ export class Chart {
             if (candleIndex < retainedStart) continue;
 
             const retainedIndex: number = candleIndex - retainedStart;
-            this.writeCandleRecord(rawCandles, retainedIndex, retainedIndex, candle);
+            this.writeCandleRecord(rawCandles, retainedIndex, candle);
             times[retainedIndex] = candle.time;
         }
 
         this.candlePyramid.reset(rawCandles);
         this.candleTimes = times;
+        this.invalidateModalInterval();
         this.rebuildSlots();
         this.followsLiveEdge = true;
 
@@ -2490,16 +3276,13 @@ export class Chart {
     private writeCandleRecord(
         target: Float32Array,
         recordIndex: number,
-        ordinalIndex: number,
         candle: CandleData,
     ): void {
         const offset: number = recordIndex * CANDLE_STRIDE;
-        // An **ordinal**, not a slot, and the pyramid is index-space end to end so this
-        // stays true at every aggregation level. Levels above this one already hold
-        // ordinals, and `trimStart` re-bases them by subtracting the trimmed count, which
-        // is only correct in index space. The draw path maps a bucket to a position
-        // through `bucketCentreSlot`, so exactly one layer knows about slots.
-        target[offset + CANDLE_X] = ordinalIndex;
+        // `CANDLE_X` is left alone. The pyramid assigns ordinals itself, because it has
+        // to keep them consistent with the level each bucket belongs to across a trim,
+        // and an ordinal supplied from here is a second source of truth for exactly
+        // the number a trim would have to rewrite on every bar.
         target[offset + CANDLE_OPEN] = candle.open;
         target[offset + CANDLE_HIGH] = candle.high;
         target[offset + CANDLE_LOW] = candle.low;
@@ -2519,11 +3302,12 @@ export class Chart {
             const times: number[] = new Array<number>(replacement.length);
             for (let index: number = 0; index < replacement.length; index++) {
                 const candle: CandleData = replacement[index];
-                this.writeCandleRecord(rawCandles, index, index, candle);
+                this.writeCandleRecord(rawCandles, index, candle);
                 times[index] = candle.time;
             }
             this.candlePyramid.reset(rawCandles);
             this.candleTimes = times;
+            this.invalidateModalInterval();
             this.rebuildSlots();
             if (this.followsLiveEdge) {
                 this.offsetX = liveEdgeOffsetX(
@@ -2547,9 +3331,10 @@ export class Chart {
 
         const shouldFollow: boolean = this.followsLiveEdge;
         if (lastUpdate !== null) {
-            const lastIndex: number = this.candlePyramid.candleCount - 1;
+            // No ordinal argument: the pyramid owns its own ordinals, so there is no
+            // second place for the caller to state one and get it out of step with the
+            // level a trim left behind.
             this.candlePyramid.updateLast(
-                lastIndex,
                 lastUpdate.open,
                 lastUpdate.high,
                 lastUpdate.low,
@@ -2560,6 +3345,9 @@ export class Chart {
         }
 
         const firstNewIndex: number = this.candlePyramid.candleCount;
+        const previousLastTime: number = firstNewIndex > 0
+            ? this.candleTimes[firstNewIndex - 1]
+            : Number.NEGATIVE_INFINITY;
         // The anchor bar's slot under the table as it stands *now*, captured before the
         // append. Afterwards the same ordinal names a different place, because the table
         // has been rebuilt to describe a longer series — so "where was this bar" has to be
@@ -2572,7 +3360,6 @@ export class Chart {
         for (let index: number = 0; index < appends.length; index++) {
             const candle: CandleData = appends[index];
             this.candlePyramid.append(
-                firstNewIndex + index,
                 candle.open,
                 candle.high,
                 candle.low,
@@ -2582,11 +3369,26 @@ export class Chart {
             );
             this.candleTimes.push(candle.time);
         }
+        // The timestamps are different now, so the cached interval is stale. Only
+        // when bars were actually appended: `updateLast` on a forming candle
+        // rewrites OHLC and leaves every timestamp alone, and a live feed calls it
+        // on every tick.
+        if (appends.length > 0) this.invalidateModalInterval();
 
         const overflow: number = Math.max(0, this.candlePyramid.candleCount - this.maxRetainedCandles);
         if (overflow > 0) {
             this.candlePyramid.trimStart(overflow);
             this.candleTimes.splice(0, overflow);
+            // The overlays move left with the candles. They did not used to, and the
+            // result was that every overlay on a chart that reached its retention cap
+            // was drawn on the wrong bars by exactly the trim count, from the first
+            // frame and with no visible symptom: an EMA lagging the price it annotates,
+            // reading as a stale indicator rather than as a defect. Nothing else in the
+            // engine can catch it, because the values are perfectly valid numbers on
+            // perfectly valid ordinals — they are just the wrong ones.
+            for (const overlay of this.overlays) {
+                trimOverlayStart(overlay, overflow);
+            }
         }
 
         // The slot table is rebuilt here, and this line is the whole of a shipped defect.
@@ -2604,7 +3406,40 @@ export class Chart {
         // feed calls `updateLast` on every tick, so rebuilding a million-bar table at ten
         // hertz to accommodate a price change that moved no timestamp would be a far worse
         // defect than the one being fixed.
-        if (appends.length > 0) this.rebuildSlots();
+        if (appends.length > 0) {
+            const gaps = this.resolvedOptions.timeScale.sessionBreaks;
+            if (gaps.enabled && this.slotOffsets !== null) {
+                const appendedTimes: number[] = appends.map((candle: CandleData): number => candle.time);
+                const interval: number = this.modalInterval();
+                // The threshold comes from the same resolved policy `rebuildSlots`
+                // uses, rather than from a `interval * 3` written here. The two paths
+                // were independent sources of one rule, and a caller who set
+                // `collapsedSlots` on the full-rebuild path found the incremental
+                // path still inserting half a slot — the only way to change it was to
+                // edit two files, and the two disagreed the moment either default moved.
+                const resolvedGaps = resolveSessionBreaks(this.candleTimes, {
+                    thresholdMs: gaps.thresholdMs ?? undefined,
+                    mode: gaps.mode,
+                    maxWhitespaceRatio: gaps.maxWhitespaceRatio,
+                });
+                const update: SlotTableUpdate = incrementalSlotUpdateWithScale(
+                    this.slotOffsets,
+                    previousLastTime,
+                    appendedTimes,
+                    gaps.mode,
+                    resolvedGaps.thresholdMs,
+                    resolvedGaps.collapsedSlots,
+                    resolvedGaps.maxWhitespaceRatio,
+                    interval,
+                    overflow,
+                    this.slotBreakScale,
+                );
+                this.slotOffsets = update.offsets;
+                this.slotBreakScale = update.scale;
+            } else if (gaps.enabled) {
+                this.rebuildSlots();
+            }
+        }
 
         if (appends.length > 0) {
             if (shouldFollow) {
@@ -3161,6 +3996,9 @@ export class Chart {
             this.overlayAggregationFactor = aggregationFactor;
             const level: Float32Array = this.candlePyramid.getLevelData(levelIndex);
             const levelCount: number = this.candlePyramid.getLevelCount(levelIndex);
+            // Non-zero once the series has been trimmed: the level's x values are
+            // absolute ordinals, and the slice has to hand back retained-window ones.
+            const levelBase: number = this.candlePyramid.getLevelBase(levelIndex);
             // The window is found in **bars**, not in the x the shader transforms.
             // `coordinateToIndex` resolves a coordinate through the slot table, so the
             // bar it names is the bar actually under that edge of the plot, and dividing
@@ -3173,14 +4011,23 @@ export class Chart {
                 viewport,
                 viewport.plot.x + viewport.plot.width,
             );
-            const startBucket: number = Math.max(0, Math.floor(visibleMinX / aggregationFactor) - 1);
-            const endBucket: number = Math.min(
-                levelCount,
-                Math.ceil(visibleMaxX / aggregationFactor) + 2,
-            );
+            // A trimmed series is bucketed on **absolute** boundaries, so a
+            // retained-relative bar index has to be taken to absolute before it can be
+            // divided by the factor, and the resulting absolute bucket translated back
+            // into a position in this level's window. Dividing the retained index
+            // directly is off by the trim count from the first bucket onwards, which
+            // shows up as a zoomed-out chart whose candles and overlays are a whole
+            // bucket out of step.
+            const barBase: number = this.candlePyramid.getLevelBase(0);
+            const firstBucket: number = Math.floor((barBase + visibleMinX) / aggregationFactor);
+            const lastBucket: number = Math.ceil((barBase + visibleMaxX) / aggregationFactor);
+            const startBucket: number = Math.max(0, firstBucket - levelBase - 1);
+            const endBucket: number = Math.min(levelCount, lastBucket - levelBase + 2);
             this.displayedStartBucket = startBucket;
             this.displayedCandles = endBucket > startBucket
-                ? this.sliceInSlotSpace(level, startBucket, endBucket, aggregationFactor)
+                ? this.sliceInSlotSpace(
+                    level, startBucket, endBucket, aggregationFactor, levelBase, barBase,
+                )
                 : new Float32Array(0);
         }
 
@@ -3194,31 +4041,40 @@ export class Chart {
      * sum that changes only when the data does, so this is O(buckets on screen) and never
      * runs per bar of the series.
      *
-     * On a series with no breaks the two spaces are the same number, so the slice is
-     * returned as it came out — which is also the only case in which no copy is needed,
-     * and it is the case every chart without session gaps is in.
+     * `levelBase` is the absolute ordinal the level's first bucket carries, which is
+     * non-zero once the series has been trimmed. The slice's own x values are absolute
+     * and have to come back as retained-window ordinals, because that is the numbering
+     * every other layer works in — the slot table, `coordinateToIndex`, and the live
+     * edge. Both branches below apply it, including the unbroken one: a series that has
+     * never been trimmed has a base of zero and the loop is a no-op, and a series that
+     * has been trimmed needs it even with no session breaks at all.
      */
     private sliceInSlotSpace(
         level: Float32Array,
         startBucket: number,
         endBucket: number,
         factor: number,
+        levelBase: number,
+        barBase: number,
     ): Float32Array {
-        if (this.slotOffsets === null) {
-            return level.slice(startBucket * CANDLE_STRIDE, endBucket * CANDLE_STRIDE);
-        }
         const from: number = startBucket * CANDLE_STRIDE;
         const to: number = endBucket * CANDLE_STRIDE;
-        const out: Float32Array = new Float32Array(to - from);
-        out.set(level.subarray(from, to));
+        const out: Float32Array = level.slice(from, to);
+        if (levelBase === 0 && barBase === 0 && this.slotOffsets === null) return out;
         const sourceCount: number = this.candlePyramid.candleCount;
         for (let offset = 0; offset < out.length; offset += CANDLE_STRIDE) {
-            out[offset + CANDLE_X] = bucketCentreSlot(
-                this.slotOffsets,
-                startBucket + offset / CANDLE_STRIDE,
-                factor,
-                sourceCount,
-            );
+            const position: number = startBucket + offset / CANDLE_STRIDE;
+            out[offset + CANDLE_X] = this.slotOffsets === null
+                // Unbroken: ordinal space and slot space are the same number, so the only
+                // conversion is the absolute ordinal this bucket covers.
+                ? levelBase + position - barBase
+                : bucketCentreSlot(
+                    this.slotOffsets,
+                    levelBase + position,
+                    factor,
+                    sourceCount,
+                    barBase,
+                );
         }
         return out;
     }
@@ -3288,7 +4144,37 @@ export class Chart {
         }
         this.uploadVisibleVolume();
         this.uploadVisibleOverlays();
-        this.emitter.emit('data', { times: this.candleTimes });
+        this.emitter.emit('data', { times: this.candleTimes, interval: this.modalInterval() });
+    }
+
+    /**
+     * The modal interval between retained bars, in ms, derived once per data change.
+     *
+     * `modalInterval` is O(n log n): it collects every gap in the series and sorts
+     * it to find the median. It is needed on the time axis to choose a step from
+     * the calendar ladder, and the time axis runs on **every rendered frame** — so
+     * it was being paid on every pan, zoom, append, resize, and crosshair frame.
+     * At the default retention of 1,000,000 candles that is a sort of a million
+     * boxed doubles, several times a second, to produce a number that changes only
+     * when the timestamps do.
+     *
+     * Cached here, next to the array it describes, and invalidated by every path
+     * that writes to that array. The cache is a plain field rather than a
+     * `WeakMap` keyed on the array: `candleTimes` is mutated in place by `push`
+     * and `splice`, so an identity-keyed cache would go stale without anything
+     * changing the array's identity — the failure would be a wrong axis step that
+     * no test could reproduce from a sequence of calls.
+     */
+    private modalInterval(): number {
+        if (this.cachedModalInterval === null) {
+            this.cachedModalInterval = modalInterval(this.candleTimes);
+        }
+        return this.cachedModalInterval;
+    }
+
+    /** Drops the cached modal interval. Called by every path that writes timestamps. */
+    private invalidateModalInterval(): void {
+        this.cachedModalInterval = null;
     }
 
     /**
@@ -3317,6 +4203,9 @@ export class Chart {
                 overlay.firstIndex,
                 overlay.lastIndex,
                 overlay.pointColors,
+                // The absolute origin of the retained window, so the overlay is bucketed
+                // on the same grid the candles are.
+                this.candlePyramid.getLevelBase(0),
             );
             // An overlay on the price pane is measured in prices, so it needs the
             // same conversion the candles got. One on any other pane is left alone:
@@ -3475,9 +4364,20 @@ export class Chart {
         this.canvasWrapper.removeEventListener('wheel', this.handleWheel);
         // Drop every subscriber so a destroyed chart cannot call back into
         // application code, and so handlers are not retained by this instance.
+        //
+        // Every set has to be named here. The three that were missing — order,
+        // drawing/order interaction, and pane range — are the ones whose payloads
+        // carry the caller's own objects, so a handler closure pinning a DOM node
+        // or a drawing survived `destroy()` and stayed reachable from whatever
+        // still held the chart. A set that is not cleared is not a leak the GC can
+        // ever collect, because the chart holds the handler and the handler's
+        // owner usually holds something the chart also references.
         this.crosshairHandlers.clear();
         this.clickHandlers.clear();
         this.visibleRangeHandlers.clear();
+        this.orderHandlers.clear();
+        this.drawingOrderHandlers.clear();
+        this.paneRangeHandlers.clear();
         this.lastReportedRange = null;
         this.emittingCrosshair = false;
         this.emittingVisibleRange = false;

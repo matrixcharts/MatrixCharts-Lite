@@ -1,0 +1,85 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><style>body{margin:0;background:#111} .chart{width:900px;height:480px}</style></head>
+<body><div id="webgl" class="chart"></div><div id="canvas" class="chart"></div>
+<script type="module">
+import { Chart } from '../../src/index.ts';
+let capturedWebgl = null;
+const originalDrawElements = WebGL2RenderingContext.prototype.drawElements;
+const originalDrawArrays = WebGL2RenderingContext.prototype.drawArrays;
+const capture = function(gl) {
+    const pixels = new Uint8Array(gl.drawingBufferWidth * gl.drawingBufferHeight * 4);
+    gl.readPixels(0, 0, gl.drawingBufferWidth, gl.drawingBufferHeight, gl.RGBA, gl.UNSIGNED_BYTE, pixels);
+    if (capturedWebgl === null) {
+        capturedWebgl = { width: gl.drawingBufferWidth, height: gl.drawingBufferHeight, pixels };
+        return;
+    }
+    for (let index = 3; index < pixels.length; index += 4) {
+        if (pixels[index] > capturedWebgl.pixels[index]) capturedWebgl.pixels[index] = pixels[index];
+    }
+};
+WebGL2RenderingContext.prototype.drawElements = function(...args) {
+    const result = originalDrawElements.apply(this, args);
+    capture(this);
+    return result;
+};
+WebGL2RenderingContext.prototype.drawArrays = function(...args) {
+    const result = originalDrawArrays.apply(this, args);
+    capture(this);
+    return result;
+};
+const candles = Array.from({ length: 180 }, (_, index) => {
+    const base = 100 + Math.sin(index * 0.18) * 6;
+    const close = base + Math.sin(index * 0.41) * 1.2;
+    return { time: 1_700_000_000_000 + index * 60_000, open: base, high: Math.max(base, close) + 1, low: Math.min(base, close) - 1, close };
+});
+const options = { layout: { priceAxisWidth: 0, timeAxisHeight: 0 }, candlestick: { lastPriceTag: false }, crosshair: { visible: false } };
+const webgl = new Chart(document.querySelector('#webgl'), options);
+webgl.setData(candles);
+const originalGetContext = HTMLCanvasElement.prototype.getContext;
+let forceCanvas = true;
+HTMLCanvasElement.prototype.getContext = function(kind, ...args) {
+    if (forceCanvas && kind === 'webgl2') return null;
+    return originalGetContext.call(this, kind, ...args);
+};
+const canvas = new Chart(document.querySelector('#canvas'), options);
+canvas.setData(candles);
+forceCanvas = false;
+const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+await wait(100);
+const readMask = (chartHost, kind) => {
+    const dataCanvas = chartHost.querySelectorAll('canvas')[1];
+    if (kind === 'webgl') {
+        const gl = dataCanvas.getContext('webgl2');
+        const pixels = new Uint8Array(gl.drawingBufferWidth * gl.drawingBufferHeight * 4);
+        gl.readPixels(0, 0, gl.drawingBufferWidth, gl.drawingBufferHeight, gl.RGBA, gl.UNSIGNED_BYTE, pixels);
+        return { width: gl.drawingBufferWidth, height: gl.drawingBufferHeight, pixels };
+    }
+    const ctx = dataCanvas.getContext('2d');
+    return { width: dataCanvas.width, height: dataCanvas.height, pixels: ctx.getImageData(0, 0, dataCanvas.width, dataCanvas.height).data };
+};
+const webglMask = capturedWebgl ?? readMask(document.querySelector('#webgl'), 'webgl');
+const canvasMask = readMask(document.querySelector('#canvas'), 'canvas');
+let webglCount = 0;
+let canvasCount = 0;
+let overlap = 0;
+const total = Math.min(webglMask.pixels.length, canvasMask.pixels.length) / 4;
+for (let index = 0; index < total; index++) {
+    const x = index % webglMask.width;
+    const y = Math.floor(index / webglMask.width);
+    const webglIndex = ((webglMask.height - 1 - y) * webglMask.width + x) * 4;
+    const canvasIndex = index * 4;
+    const webglPixel = webglMask.pixels[webglIndex + 3] > 16;
+    const canvasPixel = canvasMask.pixels[canvasIndex + 3] > 16;
+    if (webglPixel) webglCount++;
+    if (canvasPixel) canvasCount++;
+    if (webglPixel && canvasPixel) overlap++;
+}
+window.__parityResult = {
+    webgl: { width: webglMask.width, height: webglMask.height, pixels: webglCount },
+    canvas: { width: canvasMask.width, height: canvasMask.height, pixels: canvasCount },
+    overlap,
+    iou: overlap / Math.max(webglCount + canvasCount - overlap, 1),
+};
+webgl.destroy();
+canvas.destroy();
+</script></body></html>

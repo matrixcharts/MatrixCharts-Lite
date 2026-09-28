@@ -1,6 +1,6 @@
 # MatrixCharts
 
-Zero-dependency WebGL2 candlestick chart with a sequenced live candle feed.
+Zero-dependency candlestick chart with WebGL2, Canvas2D fallback, and a sequenced live candle feed.
 
 ## Install
 
@@ -24,9 +24,9 @@ Ships ESM and CommonJS with separate declarations for each, so both work in Vite
 ## Requirements
 
 - A browser DOM.
-- **WebGL2 is required.** There is no Canvas2D fallback in v1.
+- WebGL2 is preferred. Canvas2D is used as a bounded fallback when WebGL2 is unavailable.
 
-If `canvas.getContext('webgl2')` fails, `new Chart(...)` throws `MatrixCharts: WebGL2 is required.` and leaves your container exactly as it was — no empty canvases, no half-mounted chart. Detection is therefore a `try`/`catch` around the constructor:
+If the data canvas cannot acquire WebGL2, `Chart` keeps the same public API and uses the Canvas2D data renderer. Direct low-level WebGL renderer construction still throws `MatrixCharts: WebGL2 is required.` for capability diagnostics. WebGL2 remains the preferred path for large datasets.
 
 ```ts
 try {

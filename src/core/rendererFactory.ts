@@ -29,7 +29,7 @@
 // the first draw. Keeping construction and initialisation apart means Chart's own call
 // site is the one that hands over the canvas and the emitter, and a double that is never
 // initialised is visibly never initialised.
-import type { IRenderer } from './IRenderer.js';
+import type { IRenderer, IOverlayHost } from './IRenderer.js';
 import type { IDataRenderer } from './IDataRenderer.js';
 import { WebGL2Renderer } from '../renderers/WebGL2Renderer.js';
 import { Canvas2DRenderer } from '../renderers/Canvas2DRenderer.js';
@@ -73,7 +73,8 @@ export function setRendererFactory(factory: RendererFactory | null): () => void 
  * a hole exactly the size of the bug this seam exists to catch.
  */
 export function createRenderer(role: 'data'): IDataRenderer;
-export function createRenderer(role: 'grid' | 'ui'): IRenderer;
+export function createRenderer(role: 'ui'): IRenderer & IOverlayHost;
+export function createRenderer(role: 'grid'): IRenderer;
 export function createRenderer(role: 'data' | 'grid' | 'ui'): IRenderer {
     return (override ?? defaultFactory)[role]();
 }

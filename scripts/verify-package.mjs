@@ -22,7 +22,30 @@ const workspace = path.join(repoRoot, '.tmp', 'verify');
 const consumerModules = path.join(workspace, 'node_modules', 'matrixcharts');
 const tsc = path.join(repoRoot, 'node_modules', 'typescript', 'bin', 'tsc');
 
-const VALUE_EXPORTS = ['Chart', 'ChartFeedController', 'MockCandleSource', 'WebSocketCandleSource'];
+// The exact set of runtime values the published entry exports. An allow-list, so
+// anything added to the barrel has to be added here deliberately and any leak is
+// caught in the tarball rather than only in the source tree.
+//
+// The drawing-model functions are part of it because they are the renderer-agnostic
+// half of a drawing layer — geometry, hit testing, validation, the order state
+// machine — and the whole point of the paint seam is that an application supplies the
+// other half itself. The rendering half of drawings is not exported; that goes
+// through `Chart.setOverlayPainter`.
+const VALUE_EXPORTS = [
+    'CandleReplaySource',
+    'Chart',
+    'ChartFeedController',
+    'ChartSyncGroup',
+    'DRAWING_TYPES',
+    'MockCandleSource',
+    'WebSocketCandleSource',
+    'canTransitionOrder',
+    'createDrawingFromGesture',
+    'createOrderFromDrawing',
+    'getDrawingHandles',
+    'hitTestDrawings',
+    'validateDrawings',
+];
 
 const REQUIRED_PACK_PATHS = [
     'package.json',
