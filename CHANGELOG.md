@@ -4,7 +4,13 @@ Notable changes to MatrixCharts, newest first. The frozen v1 public surface and
 its reasoning live in [docs/v1-contract.md](docs/v1-contract.md); this file
 records what moved and why, per release.
 
-## Unreleased
+## v1.2.0
+
+Released: 2026-09-29
+
+An additive release: two new public methods and a fix to a per-frame cost that made a
+chart with many indicators miss the frame budget. No export, option or event field is
+removed or repurposed.
 
 ### Added
 

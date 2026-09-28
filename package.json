@@ -1,8 +1,16 @@
 {
   "name": "matrixcharts",
-  "version": "1.1.0",
-  "description": "WebGL2 candlestick chart with a sequenced live candle feed.",
+  "version": "1.2.0",
+  "description": "Zero-dependency WebGL2 candlestick chart with a Canvas2D fallback and a sequenced live candle feed.",
   "license": "ISC",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/matrixcharts/MatrixCharts-Lite.git"
+  },
+  "homepage": "https://github.com/matrixcharts/MatrixCharts-Lite#readme",
+  "bugs": {
+    "url": "https://github.com/matrixcharts/MatrixCharts-Lite/issues"
+  },
   "type": "module",
   "main": "./dist/cjs/index.js",
   "module": "./dist/esm/index.js",
