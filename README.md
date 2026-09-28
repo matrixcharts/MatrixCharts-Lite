@@ -103,9 +103,18 @@ npm run dev       # demo at /index.html
 npm test          # deterministic unit + integration suite
 npm run verify    # test, then build and check the published tarball
 npm run benchmark # sustained-feed throughput and memory
+npm run dev       # required for the browser renderer benchmark
+npm run benchmark:renderer # Puppeteer/WebGL frame and upload benchmark
 ```
 
 Open `/tests/browser/streaming.e2e.html` under `npm run dev` for the WebGL integration run. It sets `data-test-result="pass"` on the `<html>` element.
+
+The renderer benchmark opens `/tests/browser/performance.e2e.html` in headless Chrome and
+reports animation-callback p50/p95/p99/max time, frames over the 16.67 ms 60 Hz budget,
+WebGL draw calls, and uploaded buffer bytes. Set `CHROME_PATH` when Chrome is not in the
+usual installation paths, or pass a different page URL as the first argument. Results are
+machine- and GPU-dependent; compare repeated runs on the same browser and device rather
+than treating one run as a universal limit.
 
 ## v1 API
 

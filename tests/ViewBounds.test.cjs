@@ -59,11 +59,14 @@ test('a plot drag pans the price range vertically without changing its span', ()
     const harness = chart();
     try {
         const before = harness.chart.getPriceRange();
+        const beforeY = harness.chart.priceToCoordinate(100);
         const span = before[1] - before[0];
-        harness.drag(600, 300, 600, 380);
+        harness.drag(600, 300, 600, 220);
         harness.flush();
         const after = harness.chart.getPriceRange();
+        const afterY = harness.chart.priceToCoordinate(100);
         assert.notDeepEqual(after, before, 'a vertical plot drag did not move the price range');
+        assert.ok(afterY < beforeY, 'dragging up moved the chart down');
         assert.ok(Math.abs((after[1] - after[0]) - span) < 1e-6,
             'a plot pan changed the price span');
     } finally {

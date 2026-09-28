@@ -1,0 +1,118 @@
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>MatrixCharts Performance Benchmark</title>
+    <style>
+        body { margin: 20px; background: #0d1117; color: #c9d1d9; font: 14px sans-serif; }
+        #chart { width: 1200px; height: 600px; background: #161b22; }
+        #result { white-space: pre-wrap; }
+    </style>
+</head>
+<body>
+    <h1>MatrixCharts renderer benchmark</h1>
+    <div id="chart"></div>
+    <pre id="result">running</pre>
+    <script type="module">
+        // Capture the work performed inside the chart's own animation callbacks. The
+        // benchmark waits with timers so its bookkeeping does not become a measured
+        // requestAnimationFrame callback.
+        const frameDurations = [];
+        const originalRequestAnimationFrame = window.requestAnimationFrame.bind(window);
+        window.requestAnimationFrame = (callback) => originalRequestAnimationFrame((timestamp) => {
+            const start = performance.now();
+            callback(timestamp);
+            frameDurations.push(performance.now() - start);
+        });
+
+        const gpu = { drawCalls: 0, uploads: 0, uploadBytes: 0 };
+        const originalDrawArrays = WebGL2RenderingContext.prototype.drawArrays;
+        const originalDrawElements = WebGL2RenderingContext.prototype.drawElements;
+        const originalBufferData = WebGL2RenderingContext.prototype.bufferData;
+        WebGL2RenderingContext.prototype.drawArrays = function (...args) {
+            gpu.drawCalls++;
+            return originalDrawArrays.apply(this, args);
+        };
+        WebGL2RenderingContext.prototype.drawElements = function (...args) {
+            gpu.drawCalls++;
+            return originalDrawElements.apply(this, args);
+        };
+        WebGL2RenderingContext.prototype.bufferData = function (target, dataOrSize, usage) {
+            gpu.uploads++;
+            gpu.uploadBytes += typeof dataOrSize === 'number'
+                ? dataOrSize
+                : dataOrSize?.byteLength ?? 0;
+            return originalBufferData.call(this, target, dataOrSize, usage);
+        };
+
+        const { Chart } = await import('../../src/index.ts');
+        const chart = new Chart(document.querySelector('#chart'), {
+            maxRetainedCandles: 50_000,
+            volume: { visible: true },
+            candlestick: { lastPriceTag: true },
+        });
+
+        const minute = 60_000;
+        const candleAt = (index) => {
+            const base = 100 + Math.sin(index * 0.013) * 8;
+            const close = base + Math.sin(index * 0.11) * 1.25;
+            return {
+                time: 1_700_000_000_000 + index * minute,
+                open: base,
+                high: Math.max(base, close) + (index % 9) * 0.1 + 0.5,
+                low: Math.min(base, close) - (index % 7) * 0.1 - 0.5,
+                close,
+                volume: 1000 + (index % 911),
+            };
+        };
+
+        const makeBatch = (start, count) => Array.from({ length: count }, (_, offset) => candleAt(start + offset));
+        const wait = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
+        const percentile = (values, fraction) => {
+            if (values.length === 0) return 0;
+            const sorted = [...values].sort((a, b) => a - b);
+            return sorted[Math.min(sorted.length - 1, Math.floor((sorted.length - 1) * fraction))];
+        };
+
+        const initialCount = 20_000;
+        chart.setData(makeBatch(0, initialCount));
+        await wait(150);
+        frameDurations.length = 0;
+        gpu.drawCalls = 0;
+        gpu.uploads = 0;
+        gpu.uploadBytes = 0;
+
+        const batchSize = 500;
+        const batchCount = 30;
+        for (let batch = 0; batch < batchCount; batch++) {
+            chart.appendBatch(makeBatch(initialCount + batch * batchSize, batchSize));
+            await wait(40);
+        }
+
+        const budgetMs = 1000 / 60;
+        const result = {
+            initialCandles: initialCount,
+            appendedCandles: batchSize * batchCount,
+            finalCandles: chart.getCandleCount(),
+            batchSize,
+            batchCount,
+            measuredFrames: frameDurations.length,
+            frameMs: {
+                p50: percentile(frameDurations, 0.50),
+                p95: percentile(frameDurations, 0.95),
+                p99: percentile(frameDurations, 0.99),
+                max: frameDurations.length === 0 ? 0 : Math.max(...frameDurations),
+            },
+            frameBudgetMs: budgetMs,
+            overBudgetFrames: frameDurations.filter((duration) => duration > budgetMs).length,
+            gpu,
+            browser: navigator.userAgent,
+            devicePixelRatio: window.devicePixelRatio,
+        };
+        window.__mcPerformanceResult = result;
+        document.querySelector('#result').textContent = JSON.stringify(result, null, 2);
+        chart.destroy();
+    </script>
+</body>
+</html>

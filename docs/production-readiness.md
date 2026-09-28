@@ -94,7 +94,26 @@ Axis gutters are asserted by reading both layers at once, because neither layer 
 
 ## Known coverage limits
 
-**The benchmark does not measure the renderer.** `benchmarks/sustained-feed.cjs` imports only `OHLCPyramid` and never constructs a chart, a renderer, or a GL context. Its `candlesPerSecond`, `batchP95Ms`, and `rssMiB` therefore say nothing about per-frame vertex generation, which is the hot path the geometry, border, clipping, and series work all touch. Run-to-run spread on a shared machine is large enough (78k-113k candles/s observed) that a change to those numbers cannot be attributed to code. There is no benchmark covering renderer frame cost, and p95 sits near the 16.6 ms budget of a 60 Hz frame, so that gap matters.
+**The renderer now has a browser benchmark.** `benchmarks/sustained-feed.cjs` remains the
+Node-side pyramid and retention benchmark, while `npm run benchmark:renderer` opens
+`tests/browser/performance.e2e.html` through Puppeteer and a real WebGL2 context. The
+browser page measures the work inside chart animation callbacks, WebGL draw calls, and
+buffer upload bytes while appending controlled batches. It reports p50/p95/p99/max callback
+time and frames over the 16.67 ms 60 Hz budget. The measurements are intentionally not
+merged with the pyramid numbers: a faster data structure does not prove a faster frame.
+
+Run the Vite server first:
+
+```powershell
+npm run dev
+npm run benchmark:renderer
+```
+
+The benchmark currently uses 20,000 initial candles and thirty 500-candle append batches.
+Those are workload defaults, not guarantees; compare repeated runs on the same browser,
+device-pixel ratio, and GPU backend. Set `CHROME_PATH` when Chrome is not auto-detected.
+The 60 Hz target is met only when p95 and the maximum stay below 16.67 ms with zero
+over-budget frames under the workload being used.
 
 Two things are deliberately not covered, and should not be read as verified:
 

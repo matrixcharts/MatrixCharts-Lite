@@ -81,6 +81,7 @@ import type {
     Unsubscribe,
     VisibleRangeEvent,
     PaneRangeEvent,
+    HitTestResult,
 } from './ChartEvents.js';
 import {
     type ChartViewport,
@@ -149,6 +150,7 @@ export class Chart {
     private container: HTMLElement;
     private emitter: EventEmitter<ChartEvents> = new EventEmitter();
     private canvasWrapper: HTMLDivElement;
+    private dataCanvas!: HTMLCanvasElement;
     private resizeObserver: ResizeObserver;
     
     // Store your active renderers
@@ -290,6 +292,8 @@ export class Chart {
      * boundary.
      */
     private destroyed: boolean = false;
+    /** A lost WebGL context pauses data uploads until the browser restores it. */
+    private dataContextLost: boolean = false;
     /** Guards against a handler re-entering its own event and looping forever. */
     private emittingCrosshair: boolean = false;
     private emittingVisibleRange: boolean = false;
@@ -327,6 +331,7 @@ export class Chart {
         // Initialize layers
         const gridCanvas = this.createLayer(0);
         const dataCanvas = this.createLayer(1);
+        this.dataCanvas = dataCanvas;
         const uiCanvas = this.createLayer(2);
 
         try {
@@ -363,6 +368,9 @@ export class Chart {
             throw error;
         }
 
+        this.dataCanvas.addEventListener('webglcontextlost', this.handleDataContextLost);
+        this.dataCanvas.addEventListener('webglcontextrestored', this.handleDataContextRestored);
+
         this.container.appendChild(this.canvasWrapper);
         this.emitter.emit('options', initial);
 
@@ -393,6 +401,30 @@ export class Chart {
         this.canvasWrapper.appendChild(canvas);
         return canvas;
     }
+
+    private handleDataContextLost = (event: Event): void => {
+        event.preventDefault();
+        this.dataContextLost = true;
+    };
+
+    private handleDataContextRestored = (): void => {
+        if (this.destroyed || !this.dataContextLost) return;
+
+        const previous: IDataRenderer = this.dataRenderer;
+        previous.destroy();
+        const restored: IDataRenderer = createRenderer('data');
+        restored.init(this.dataCanvas, this.emitter);
+        const index: number = this.renderers.indexOf(previous);
+        if (index >= 0) this.renderers[index] = restored;
+        this.dataRenderer = restored;
+        this.dataContextLost = false;
+
+        // The retained model is authoritative. Replaying the normal viewport path
+        // regenerates candles, overlays, and optional series without retaining a
+        // second CPU copy solely for GPU recovery.
+        this.emitter.emit('options', this.resolvedOptions);
+        this.updateViewport();
+    };
 
     private handleResize(): void {
         this.syncRendererSize();
@@ -798,7 +830,10 @@ export class Chart {
 
         const top: number = paneValueAt(transform, rect.y);
         const bottom: number = paneValueAt(transform, rect.y + rect.height);
-        const shift: number = deltaY / transform.scaleY;
+        // Screen Y grows downward while price grows upward. Negating the pixel
+        // delta makes the drawn series follow the pointer: dragging up moves a
+        // fixed price up on screen instead of reversing the gesture.
+        const shift: number = -deltaY / transform.scaleY;
         const low: number = this.paneScaleToValue(PRICE_PANE, Math.min(top, bottom) + shift);
         const high: number = this.paneScaleToValue(PRICE_PANE, Math.max(top, bottom) + shift);
         if (!Number.isFinite(low) || !Number.isFinite(high) || high <= low) return;
@@ -2055,11 +2090,8 @@ export class Chart {
      * Not clamped, like `coordinateToIndex`: a caller deciding whether a pointer is inside
      * the plot needs to be able to see that it is not, and a clamped answer cannot say so.
      *
-     * There is deliberately no public inverse yet. A caller anchoring something to a bar
-     * has `indexToCoordinate`; a caller anchoring it *between* bars has to interpolate, and
-     * two `indexToCoordinate` calls either side is exact because the transform is affine in
-     * slots. Freezing the inverse is worth doing the first time something needs it, and not
-     * before.
+    * `slotToCoordinate` is the public inverse for callers anchoring a drawing between
+    * bars or in the extrapolated whitespace beyond the retained series.
      */
     public coordinateToSlot(coordinateX: number): number {
         this.assertAlive();
@@ -2120,6 +2152,102 @@ export class Chart {
     public coordinateToPrice(coordinateY: number): number {
         this.assertAlive();
         return fromScaleSpace((coordinateY - this.offsetY) / this.scaleY, this.priceScale());
+    }
+
+    /** Resolves the nearest engine-owned drawing target at CSS-pixel coordinates. */
+    public hitTest(coordinateX: number, coordinateY: number): HitTestResult | null {
+        this.assertAlive();
+        if (!Number.isFinite(coordinateX) || !Number.isFinite(coordinateY)) return null;
+        const plot: PlotRect = this.viewport.plot;
+        if (
+            coordinateX < plot.x || coordinateX > plot.x + plot.width
+            || coordinateY < plot.y || coordinateY > plot.y + plot.height
+        ) return null;
+
+        const axisTolerance: number = 6;
+        let nearestLine: { line: ResolvedPriceLine; distance: number } | null = null;
+        for (const line of this.priceLines) {
+            const distance: number = Math.abs(this.priceToCoordinate(line.price) - coordinateY);
+            if (distance <= axisTolerance && (nearestLine === null || distance < nearestLine.distance)) {
+                nearestLine = { line, distance };
+            }
+        }
+        if (nearestLine !== null) {
+            return { kind: 'priceLine', id: nearestLine.line.id, price: nearestLine.line.price };
+        }
+
+        const markers: PlacedMarker[] = this.markersWithPrices();
+        let nearestMarker: { marker: PlacedMarker; distance: number } | null = null;
+        for (const marker of markers) {
+            if (!Number.isFinite(marker.price)) continue;
+            const markerX: number = this.indexToCoordinate(marker.index);
+            const dx: number = markerX - coordinateX;
+            const dy: number = this.priceToCoordinate(marker.price) - coordinateY;
+            const distance: number = Math.hypot(dx, dy);
+            if (distance <= 10 && (nearestMarker === null || distance < nearestMarker.distance)) {
+                nearestMarker = { marker, distance };
+            }
+        }
+        if (nearestMarker !== null) {
+            const marker: PlacedMarker = nearestMarker.marker;
+            const candle: CandleData | null = this.getCandleAt(marker.index);
+            if (candle !== null) {
+                return {
+                    kind: 'marker',
+                    index: marker.index,
+                    time: candle.time,
+                    price: marker.price,
+                };
+            }
+        }
+
+        for (const zone of this.zones) {
+            const left: number = zone.extendLeft
+                ? plot.x
+                : this.indexToCoordinate(zone.fromIndex) - this.scaleX / 2;
+            const right: number = zone.toIndex === null
+                ? plot.x + plot.width
+                : this.indexToCoordinate(zone.toIndex) + this.scaleX / 2;
+            const top: number = this.priceToCoordinate(zone.top);
+            const bottom: number = this.priceToCoordinate(zone.bottom);
+            if (
+                coordinateX >= Math.min(left, right)
+                && coordinateX <= Math.max(left, right)
+                && coordinateY >= Math.min(top, bottom)
+                && coordinateY <= Math.max(top, bottom)
+            ) {
+                return {
+                    kind: 'zone',
+                    id: zone.id,
+                    fromIndex: zone.fromIndex,
+                    toIndex: zone.toIndex,
+                    top: zone.top,
+                    bottom: zone.bottom,
+                };
+            }
+        }
+
+        const index: number = this.coordinateToNearestIndex(coordinateX);
+        const candle: CandleData | null = this.getCandleAt(index);
+        if (candle === null) return null;
+        const candleX: number = this.indexToCoordinate(index);
+        const xTolerance: number = Math.max(this.scaleX / 2, 8);
+        const highY: number = this.priceToCoordinate(candle.high);
+        const lowY: number = this.priceToCoordinate(candle.low);
+        if (
+            Math.abs(candleX - coordinateX) <= xTolerance
+            && coordinateY >= Math.min(highY, lowY) - axisTolerance
+            && coordinateY <= Math.max(highY, lowY) + axisTolerance
+        ) {
+            return {
+                kind: 'candle',
+                index,
+                time: candle.time,
+                candle,
+                price: this.coordinateToPrice(coordinateY),
+            };
+        }
+        return null;
     }
 
     /** Replaces authoritative feed history while retaining the current time anchor when available. */
@@ -2853,6 +2981,7 @@ export class Chart {
         this.updateVisibleCandles();
         this.autoScaleY();
         this.emitViewportFrame();
+        if (this.dataContextLost) return;
         this.uploadVisibleCandles();
         // The last-price tag is derived from the newest candle, so it has to follow
         // every append; emitting it here is what makes it track the live edge
@@ -3335,6 +3464,8 @@ export class Chart {
         this.cancelScheduledVisibleRangeChange();
         this.cancelScheduledPaneRangeChange();
         document.removeEventListener('visibilitychange', this.handleVisibilityChange);
+        this.dataCanvas.removeEventListener('webglcontextlost', this.handleDataContextLost);
+        this.dataCanvas.removeEventListener('webglcontextrestored', this.handleDataContextRestored);
         this.canvasWrapper.removeEventListener('pointerdown', this.handlePointerDown);
         this.canvasWrapper.removeEventListener('pointermove', this.handlePointerMove);
         this.canvasWrapper.removeEventListener('pointerup', this.handlePointerEnd);

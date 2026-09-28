@@ -35,6 +35,7 @@
     "verify:package": "npm run build && node scripts/verify-package.mjs",
     "verify": "npm test && npm run check:interaction && npm run verify:package",
     "benchmark": "tsc -p tsconfig.test.json && node scripts/write-dual-package-json.cjs && node benchmarks/sustained-feed.cjs",
+    "benchmark:renderer": "node scripts/benchmark-renderer.cjs",
     "screenshot": "node scripts/screenshot.cjs",
     "check:interaction": "node scripts/check-interaction.mjs"
   },

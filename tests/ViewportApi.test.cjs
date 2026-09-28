@@ -54,6 +54,39 @@ test('getPlotRect reports where the data is, not where the element is', () => {
     }
 });
 
+test('hitTest resolves engine-owned candles and decorations', () => {
+    const harness = chart(40);
+    try {
+        const chartInstance = harness.chart;
+        const candle = chartInstance.getCandleAt(20);
+        const x = chartInstance.indexToCoordinate(20);
+        assert.ok(candle);
+
+        let hit = chartInstance.hitTest(x, chartInstance.priceToCoordinate(candle.close));
+        assert.equal(hit.kind, 'candle');
+        assert.equal(hit.index, 20);
+
+        chartInstance.setPriceLines([{ id: 'level', price: candle.close }]);
+        hit = chartInstance.hitTest(x, chartInstance.priceToCoordinate(candle.close));
+        assert.deepEqual(hit, { kind: 'priceLine', id: 'level', price: candle.close });
+
+        chartInstance.setPriceLines([]);
+        chartInstance.setMarkers([{ time: candle.time, position: 'inBar' }]);
+        hit = chartInstance.hitTest(x, chartInstance.priceToCoordinate(candle.close));
+        assert.equal(hit.kind, 'marker');
+        assert.equal(hit.index, 20);
+
+        chartInstance.clearMarkers();
+        chartInstance.setZones([{ id: 'zone', time: candle.time, top: candle.high, bottom: candle.low }]);
+        hit = chartInstance.hitTest(x, chartInstance.priceToCoordinate(candle.close));
+        assert.deepEqual(hit.kind, 'zone');
+        assert.equal(hit.id, 'zone');
+        assert.equal(chartInstance.hitTest(-1, -1), null);
+    } finally {
+        harness.dispose();
+    }
+});
+
 test('getPlotRect follows a layout change', () => {
     // Reported, not cached. A gutter the caller widens has to move the plot with it, or
     // the number is a snapshot of the first frame and quietly wrong after the first

@@ -180,6 +180,7 @@ Every method below is synchronous, works in CSS pixels relative to the container
 | `timeToCoordinate(time)` | Screen x of the candle nearest a timestamp, or `null` when empty. |
 | `priceToCoordinate(price)` | Screen y of a price. |
 | `coordinateToPrice(y)` | Price at a screen y, on the current auto-fitted vertical scale. |
+| `hitTest(x, y)` | Semantic candle, price-line, marker, or zone target at CSS coordinates, or `null`. Additive in 1.x. |
 | `getPaneAtCoordinate(x, y)` | Index of the pane at a point, or `null` on a pane divider or outside the chart. |
 | `isAtRealtime()` | Whether the chart is following the newest candle. |
 | `scrollToRealtime()` | Re-arms that following. No-op on a chart with no data. |
@@ -308,7 +309,7 @@ A press that travels more than a few CSS pixels is a pan, not a click, and repor
 
 | Gesture | Surface | Effect |
 |---|---|---|
-| Drag | the plot | pans horizontally, about the pointer |
+| Drag | the plot | pans horizontally and vertically, about the pointer |
 | Wheel, pinch | the plot | zooms horizontally, about the pointer |
 | Drag | the **axis gutter**, in a pane's rows | scales that pane's span vertically |
 | Drag | the axis gutter, on a divider | nothing |
@@ -321,6 +322,11 @@ A press in the axis gutter is a vertical gesture and nowhere else is. It does no
 A pan and a pinch cannot scroll the series out of sight. Both hold the view to **half the plot width** of empty space past either end of the data, in slots, so the allowance is a fraction of the screen rather than a number of bars and means the same thing at any zoom and across a session break. Past the bound there is nothing to see, and the bound is what turns "I have scrolled the data off the screen" into a dead end the caller can undo with `scrollToRealtime()`.
 
 A **plot fraction rather than a bar count is load-bearing.** A margin of one bar stops the series roughly one bar past the newest candle, so an ordinary drag of a couple of hundred pixels runs into it and the series stops following the pointer — a chart that does not track 1:1, which is the one property a trading chart cannot trade away, since a cursor and the data under it must never disagree. Half a plot is past any realistic gesture and still bounded. The floor is one bar, so a heavily zoomed chart always has somewhere to go.
+
+Plot dragging translates the price pane vertically without changing its span and takes
+that pane off auto-fit, just as an axis drag does. A zero-width price axis disables all
+vertical gestures. The horizontal and vertical components are independent, so a caller
+can pan the time view while keeping a chosen price range intact.
 
 A **zoom is deliberately not bounded.** A zoom is anchored on the bar under the pointer, so it cannot throw the view anywhere the user is not already pointing: there is no fling to prevent, and clamping it would only pull the anchored bar out from under the cursor. The two invariants that matter here are that a wheel step holds the bar under the pointer and that a bar-spacing change scales about one fixed anchor, and both are enforced in the browser harness.
 

@@ -46,6 +46,13 @@ export interface CrosshairCleared {
 
 export type CrosshairMoveEvent = CrosshairData | CrosshairCleared;
 
+/** A semantic target under a CSS-pixel chart coordinate. */
+export type HitTestResult =
+    | { kind: 'candle'; index: number; time: number; candle: CandleData; price: number }
+    | { kind: 'priceLine'; id: string; price: number }
+    | { kind: 'marker'; index: number; time: number; price: number }
+    | { kind: 'zone'; id: string; fromIndex: number; toIndex: number | null; top: number; bottom: number };
+
 /** A click that was not a pan. Same payload as `CrosshairMoveEvent` plus the button. */
 export type ChartClickEvent = (CrosshairData | CrosshairCleared) & { button: number };
 

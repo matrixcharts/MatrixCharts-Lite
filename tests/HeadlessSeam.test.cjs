@@ -27,3 +27,25 @@ test('setData and the price API work headlessly', () => {
         h.dispose();
     }
 });
+
+test('a restored data context rebuilds the data renderer from retained chart state', () => {
+    const h = createHeadlessChart();
+    try {
+        h.chart.setData(flatCandles(50));
+        h.flush();
+        const dataCanvas = h.wrapper.children[1];
+        dataCanvas.dispatch('webglcontextlost', { preventDefault() {} });
+        h.chart.appendData(flatCandles(1, { from: 1_700_000_000_000 + 50 * 60_000 } )[0]);
+        h.flush();
+        dataCanvas.dispatch('webglcontextrestored', {});
+        h.flush();
+
+        const dataInits = h.rendererLog.filter((entry) => entry[0] === 'data' && entry[1] === 'init');
+        assert.equal(dataInits.length, 2, 'restoration did not recreate the data renderer');
+        assert.equal(h.chart.getCandleCount(), 51, 'data received during context loss was dropped');
+        assert.ok(h.dataRenderer.calls.some((entry) => entry[0] === 'drawCandlesticks'),
+            'restoration did not replay candle geometry');
+    } finally {
+        h.dispose();
+    }
+});
