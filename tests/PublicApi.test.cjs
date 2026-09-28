@@ -54,6 +54,7 @@ test('the public read and write API is present, and nothing internal leaked besi
         'getPriceRange',
         'subscribePaneRangeChange',
         'coordinateToSlot',
+        'slotToCoordinate',
         // The live-edge pair. A chart that has been panned takes its view over and the
         // feed keeps appending into it, which from outside is indistinguishable from a
         // feed that has stopped — so a caller needs both the question and the way back.

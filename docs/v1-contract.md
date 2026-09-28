@@ -174,6 +174,7 @@ Every method below is synchronous, works in CSS pixels relative to the container
 | `indexToCoordinate(index)` | Screen x of a candle index. |
 | `coordinateToIndex(x)` | Whole candle index at a screen x. Not clamped. |
 | `coordinateToSlot(x)` | Fractional **slot** at a screen x. Not clamped. Additive in 1.x. |
+| `slotToCoordinate(slot)` | Screen x of a fractional slot. The inverse of `coordinateToSlot`. Additive in 1.x. |
 | `coordinateToNearestIndex(x)` | Nearest whole candle index, or `-1` when empty. |
 | `coordinateToTime(x)` | Timestamp of the nearest candle, or `null` when empty. |
 | `timeToCoordinate(time)` | Screen x of the candle nearest a timestamp, or `null` when empty. |

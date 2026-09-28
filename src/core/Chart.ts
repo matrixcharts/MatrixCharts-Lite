@@ -162,6 +162,7 @@ export class Chart {
     private dataRenderer!: IDataRenderer;
     private isDragging: boolean = false;
     private lastPointerX: number = 0;
+    private lastPointerY: number = 0;
     private activePointers: Map<number, { x: number; y: number }> = new Map();
     private lastPinchDistance: number = 0;
     private lastPinchCenterX: number = 0;
@@ -537,6 +538,7 @@ export class Chart {
                 this.priceAxisDrag = null;
                 this.isDragging = true;
                 this.lastPointerX = event.clientX;
+                this.lastPointerY = event.clientY;
             }
         } else if (this.activePointers.size === 2) {
             // A second finger converts the gesture to a pinch, which is horizontal.
@@ -774,14 +776,35 @@ export class Chart {
         if (!this.isDragging) return;
 
         const deltaX: number = event.clientX - this.lastPointerX;
+        const deltaY: number = event.clientY - this.lastPointerY;
         this.lastPointerX = event.clientX;
+        this.lastPointerY = event.clientY;
         this.offsetX += deltaX;
+        this.panPricePane(deltaY);
         // Bounded before the latch is read, so `followsLiveEdge` describes where the
         // view actually ended up rather than where an unbounded drag would have put it.
         this.clampView();
         this.followsLiveEdge = this.isAtLiveEdge();
         this.updateViewport();
     };
+
+    /** Translates the price range with a plot drag, preserving its span. */
+    private panPricePane(deltaY: number): void {
+        if (deltaY === 0) return;
+        if (!(this.resolvedOptions.layout.priceAxisWidth > 0)) return;
+        const rect: PlotRect = this.pricePaneRect();
+        const transform: VerticalTransform | null = this.paneTransform(PRICE_PANE);
+        if (transform === null || !(rect.height > 0) || transform.scaleY === 0) return;
+
+        const top: number = paneValueAt(transform, rect.y);
+        const bottom: number = paneValueAt(transform, rect.y + rect.height);
+        const shift: number = deltaY / transform.scaleY;
+        const low: number = this.paneScaleToValue(PRICE_PANE, Math.min(top, bottom) + shift);
+        const high: number = this.paneScaleToValue(PRICE_PANE, Math.max(top, bottom) + shift);
+        if (!Number.isFinite(low) || !Number.isFinite(high) || high <= low) return;
+        if (this.priceScale() === 'log' && low <= 0) return;
+        this.adoptLockedPaneRange(PRICE_PANE, [low, high]);
+    }
 
     private handlePointerEnd = (event: PointerEvent): void => {
         const wasSinglePointer: boolean = this.activePointers.size === 1;
@@ -2041,6 +2064,12 @@ export class Chart {
     public coordinateToSlot(coordinateX: number): number {
         this.assertAlive();
         return coordinateToSlot(this.viewport, coordinateX);
+    }
+
+    /** Screen x of a fractional slot, the inverse of `coordinateToSlot`. */
+    public slotToCoordinate(slot: number): number {
+        this.assertAlive();
+        return slotToCoordinate(this.viewport, slot);
     }
 
     /** Index of the candle nearest a screen x, or -1 when the chart has no data. */

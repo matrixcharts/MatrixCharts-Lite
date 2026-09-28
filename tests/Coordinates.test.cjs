@@ -20,6 +20,7 @@ const {
     plotCentreX,
     plotRight,
     priceToCoordinate,
+    slotToCoordinate,
     visibleLogicalRange,
     visiblePriceRange,
 } = require('../.test-build/core/coordinates.js');
@@ -73,6 +74,17 @@ test('index and coordinate conversions invert each other', () => {
     for (const x of [0, 1, 137.5, 799, 1200]) {
         closeTo(indexToCoordinate(view, coordinateToIndex(view, x)), x, `x ${x}`);
     }
+});
+
+test('index coordinates extrapolate through session whitespace', () => {
+    const view = viewport({
+        offsetX: 10,
+        scaleX: 8,
+        slots: Float64Array.from([0, 1, 2, 5, 6]),
+    });
+    closeTo(indexToCoordinate(view, -2), 10 - 12, 'before the first candle');
+    closeTo(indexToCoordinate(view, 99), 10 + (6 + 95.5) * 8, 'after the last candle');
+    closeTo(slotToCoordinate(view, 7.25), 68, 'fractional slot inverse');
 });
 
 test('price and coordinate conversions invert each other', () => {

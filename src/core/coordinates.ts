@@ -108,7 +108,14 @@ export interface TimeRange {
 export const LIVE_EDGE_INSET = 0.5;
 
 export function indexToCoordinate(viewport: ChartViewport, index: number): number {
-    return viewport.offsetX + slotAtIndex(viewport.slots, index) * viewport.scaleX;
+    if (viewport.slots === null) {
+        return viewport.offsetX + index * viewport.scaleX;
+    }
+    const count: number = viewport.slots.length;
+    const slot: number = index >= 0 && index < count
+        ? slotAtIndex(viewport.slots, index)
+        : slotForIndex(viewport.slots, index, count) + 0.5;
+    return viewport.offsetX + slot * viewport.scaleX;
 }
 
 /**

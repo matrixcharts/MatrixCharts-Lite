@@ -55,6 +55,22 @@ test('the margin is half the plot, so an ordinary drag never meets it', () => {
     assert.equal(marginFor(1122, 2000), PANNING_MARGIN_SLOTS, 'a bar of slack at high zoom');
 });
 
+test('a plot drag pans the price range vertically without changing its span', () => {
+    const harness = chart();
+    try {
+        const before = harness.chart.getPriceRange();
+        const span = before[1] - before[0];
+        harness.drag(600, 300, 600, 380);
+        harness.flush();
+        const after = harness.chart.getPriceRange();
+        assert.notDeepEqual(after, before, 'a vertical plot drag did not move the price range');
+        assert.ok(Math.abs((after[1] - after[0]) - span) < 1e-6,
+            'a plot pan changed the price span');
+    } finally {
+        harness.dispose();
+    }
+});
+
 test('the bound is a half-plot of slack past each end', () => {
     // 300 bars at 8px is 2400px of series in a 1000px plot, so the series is *wider* than
     // the plot and the two bounds are ordered: a large negative offset is "scrolled past
