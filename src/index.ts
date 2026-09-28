@@ -51,6 +51,10 @@ export type {
 } from './core/drawingOrderModel.js';
 // The paint seam: the one place a caller's own content reaches the screen.
 export type { OverlayPainter, PaintContext } from './core/paint.js';
+// The gesture seam: the one place a caller can take a press the engine would otherwise
+// turn into a pan. A drawing tool that cannot claim its own drag is dragging the chart
+// and the drawing at once.
+export type { PointerClaim, PointerClaimHandler } from './core/paint.js';
 export { ChartSyncGroup } from './core/ChartSyncGroup.js';
 export type { ChartSyncOptions } from './core/ChartSyncGroup.js';
 export type { OverlayPoint, OverlaySpec } from './core/overlays.js';

@@ -1201,6 +1201,97 @@ try {
         crosshair: { readout: false },
         candlestick: { lastPriceTag: false },
     }));
+
+    // --- a claimed press is the caller's, and the claim is released -------------------
+    //
+    // The same real drag, twice: once with a handler that declines, once with one that
+    // claims. Both directions are asserted, because each alone passes against a broken
+    // seam — an always-claim passes the claimed case, and a seam that did not exist passes
+    // the declined one. The comparison is the assertion.
+    await page.evaluate(() => globalThis.__mc.chart.scrollToRealtime());
+    await wait(120);
+    const claimStartX = plot.x + plot.width * 0.5;
+    const claimMidY = plot.y + plot.height * 0.5;
+    const claimDrag = 120;
+
+    // Declined: the chart pans, as it always did.
+    await page.evaluate(() => globalThis.__mc.claimAll(false));
+    await page.mouse.move(claimStartX, claimMidY);
+    await page.mouse.down();
+    await page.mouse.move(claimStartX + claimDrag, claimMidY, { steps: 12 });
+    await page.mouse.up();
+    await wait(120);
+    const afterDeclined = await page.evaluate(() => globalThis.__mc.chart.getVisibleLogicalRange());
+
+    // Claimed: the identical gesture moves nothing at all.
+    await page.evaluate(() => {
+        globalThis.__mc.chart.scrollToRealtime();
+        globalThis.__mc.claimAll(true);
+    });
+    await wait(120);
+    const beforeClaimed = await page.evaluate(() => globalThis.__mc.chart.getVisibleLogicalRange());
+    await page.mouse.move(claimStartX, claimMidY);
+    await page.mouse.down();
+    await page.mouse.move(claimStartX + claimDrag, claimMidY, { steps: 12 });
+    await page.mouse.up();
+    await wait(120);
+    const afterClaimed = await page.evaluate(() => globalThis.__mc.chart.getVisibleLogicalRange());
+
+    // The declined drag and the claimed drag ended in different places. Comparing the two
+    // rather than asserting the declined one moved is what makes this an assertion about
+    // the seam: a handler that claimed nothing and a handler that claimed everything would
+    // have to differ, and a seam that did not exist could only produce the first.
+    const declinedPanned = afterDeclined.from !== afterClaimed.from
+        || afterDeclined.to !== afterClaimed.to;
+    const claimedHeld = afterClaimed.from === beforeClaimed.from
+        && afterClaimed.to === beforeClaimed.to;
+    record(
+        'a claimed press does not pan, and the claim is released on mouseup',
+        declinedPanned && claimedHeld,
+        `declined ${afterDeclined.from.toFixed(1)}..${afterDeclined.to.toFixed(1)}, `
+        + `claimed ${beforeClaimed.from.toFixed(1)}..${beforeClaimed.to.toFixed(1)} -> `
+        + `${afterClaimed.from.toFixed(1)}..${afterClaimed.to.toFixed(1)}`,
+    );
+
+    // Released: the very next unclaimed drag has to pan again. A claim that outlived its
+    // gesture would leave the chart unpannable for the rest of the session, and the user
+    // has no way to recover except reloading the page.
+    await page.evaluate(() => globalThis.__mc.claimAll(false));
+    const beforeRecovered = await page.evaluate(() => globalThis.__mc.chart.getVisibleLogicalRange());
+    await page.mouse.move(claimStartX, claimMidY);
+    await page.mouse.down();
+    await page.mouse.move(claimStartX - claimDrag, claimMidY, { steps: 12 });
+    await page.mouse.up();
+    await wait(120);
+    const afterRecovered = await page.evaluate(() => globalThis.__mc.chart.getVisibleLogicalRange());
+    record(
+        'the chart pans again after a claimed gesture ended',
+        Math.abs(afterRecovered.from - beforeRecovered.from) > 1
+            || Math.abs(afterRecovered.to - beforeRecovered.to) > 1,
+        `${beforeRecovered.from.toFixed(1)}..${beforeRecovered.to.toFixed(1)} -> `
+        + `${afterRecovered.from.toFixed(1)}..${afterRecovered.to.toFixed(1)}`,
+    );
+
+    // --- redraw() reaches the caller's painter ----------------------------------------
+    //
+    // A real 2D context is in play on this page, so the painter genuinely runs. Before
+    // `redraw()` was public there was no way to get a caller's own model change on screen
+    // without provoking a gesture, and the symptom was a drawing that only appeared when
+    // the user happened to pan.
+    const painterReach = await page.evaluate(async () => {
+        const { chart, installPainter, paintCount } = globalThis.__mc;
+        chart.setPointerClaimHandler(null);
+        installPainter();
+        await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+        const before = paintCount();
+        chart.redraw();
+        return { before, after: paintCount() };
+    });
+    record(
+        'redraw() repaints a registered painter',
+        painterReach.after > painterReach.before,
+        `${painterReach.before} -> ${painterReach.after} paints`,
+    );
 } finally {
     await browser.close();
 }

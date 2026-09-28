@@ -446,6 +446,32 @@ test('registering a painter repaints nothing', () => {
     }
 });
 
+test('but redraw() is how a caller gets its own change on screen', () => {
+    // The other half of the test above, and the reason it needs saying next to it.
+    //
+    // Emitting no frame on registration is right: a painter changes nothing the engine
+    // draws, so a repaint there would produce a frame that is going to be painted on the
+    // next tick anyway. It left a caller whose *own* model changed with no way to reach
+    // the screen — `setOverlayPainter`'s documentation told them to call `redraw()`,
+    // which was not public. The observable symptom is that a drawing only appears when
+    // the user happens to pan or move the pointer, which reads as a lag in the tool
+    // rather than as a missing API.
+    const h = createHeadlessChart();
+    try {
+        h.chart.setData(candles(50));
+        h.flush();
+        const paints = () => h.rendererLog
+            .filter(([name, action]) => action === 'render' || action === 'clear').length;
+        h.chart.setOverlayPainter(() => {});
+        const before = paints();
+
+        h.chart.redraw();
+        assert.ok(paints() > before, 'redraw() did not repaint after a caller model change');
+    } finally {
+        h.dispose();
+    }
+});
+
 test('a non-function painter is refused', () => {
     const h = createHeadlessChart();
     try {

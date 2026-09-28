@@ -26,6 +26,8 @@ Installable entry is the package root (`matrixcharts`). Only these names are pub
 | `ResolvedChartOptions` | type |
 | `LogicalRange` | type |
 | `PlotRect` | type (additive in 1.x) |
+| `PointerClaim` | type (additive in 1.x) |
+| `PointerClaimHandler` | type (additive in 1.x) |
 | `TimeRange` | type |
 | `CrosshairMoveEvent` | type |
 | `CrosshairData` | type |
@@ -321,6 +323,36 @@ A press that travels more than a few CSS pixels is a pan, not a click, and repor
 
 A press in the axis gutter is a vertical gesture and nowhere else is. It does not pan, it does not move the series, and it does not disturb the live-edge latch, so the two axes stay independent and a caller never gets one gesture's side effects along with the other's.
 
+### A drawing anchored past the data, and where to put the viewport
+
+A **pan** is bounded (below) to half a plot width of slack past either end. That bound is
+deliberate and worth keeping: it turns "I have scrolled the data off the screen" into a
+dead end the caller can undo with `scrollToRealtime()`, rather than an arbitrarily far
+fling. It is also the reason a drawing whose anchor sits in empty space is reachable by
+**placing the viewport**, and not by dragging to it.
+
+The two are not in conflict, because they answer different questions. A gesture is a
+gesture the user is performing on the chart, and a chart that can be flung into nothing
+has no bottom. A drawing is content the caller owns, and a caller is entitled to put it
+where it likes and then show the user.
+
+**To view a drawing that extends past the data, set the range rather than panning to it:**
+
+```ts
+// The drawing's rightmost bar is past the newest candle. Place the viewport there.
+chart.setVisibleLogicalRange({ from: anchor.index, to: anchor.index + 40 });
+```
+
+`setVisibleLogicalRange` honours a range past the series in both directions — `from` below
+zero, `to` above the candle count — holding only to the same pan bound, so an ask and a
+gesture can never disagree about how far the view may go. Space out there is real: it is
+drawn, it is hit-testable, and a drawing anchored to it stays put.
+
+**The bound is on the gesture, not on the view.** A viewport the caller has set belongs to
+the caller, so appends, `fitContent()` and a live-edge re-anchor are all exempt. A bound
+applied on every update would pull the chart sideways every time a bar printed — the user
+did not move it, the slack around it did.
+
 ### A pan is bounded; a zoom is not
 
 A pan and a pinch cannot scroll the series out of sight. Both hold the view to **half the plot width** of empty space past either end of the data, in slots, so the allowance is a fraction of the screen rather than a number of bars and means the same thing at any zoom and across a session break. Past the bound there is nothing to see, and the bound is what turns "I have scrolled the data off the screen" into a dead end the caller can undo with `scrollToRealtime()`.
@@ -598,6 +630,57 @@ canvas rather than truncated at the first bar.
 
 A callback that throws is reported once per distinct error and the frame still completes;
 the crosshair, the axes and the candles are unaffected.
+
+### `redraw()`
+
+Repaints every layer from the state the chart already holds, now, and calls a registered
+painter again. **This is what a caller uses after changing its own model.** Registering a
+painter emits no frame, as above, so without this a caller whose undo, reload, edit or
+deletion changed its own drawings had no way to get that change on screen — the chart
+would sit on the last frame until a pan, a zoom or a pointer move happened to repaint. The
+symptom reads as lag in the tool rather than as a missing API.
+
+**It repaints; it does not recompute.** The visible candle slice, the vertical fit and the
+viewport are left exactly as they are. That makes it the right call after changing
+something the chart did not store, and the wrong call after changing something it did:
+`setData`, `applyOptions`, `setVisibleLogicalRange` and the rest recompute and repaint on
+their own. Emits no event, because nothing the chart reports has changed — a caller
+repainting its own layer is not a viewport change.
+
+### `setPointerClaimHandler(handler | null)`
+
+The engine owns the pointer surface: a press in the plot pans, a press in the gutter scales
+that pane. Both are right for a chart and wrong for a drawing tool, and without a way to
+decline, a tool has to stop the engine's events from reaching it and the caller and the
+chart each end up holding half of one gesture. The visible failure is the series sliding
+while a drawing moves, or a drawing moving while the series does not.
+
+A handler is offered **every press, before the chart decides what the gesture is**, and
+returns `true` to take it. A claimed press is the caller's from the release down: no pan, no
+zoom, no pane scale, no order drag, and **no click** — a press that travelled far enough
+to be a pan is not also a click, and a claimed press is reported by the caller through its
+own means. The crosshair does not track the pointer as a hover while a claim is
+outstanding, because a pointer placing a drawing is not hovering the chart.
+
+A claim ends on release, cancel, or lost capture, and **cannot outlive its gesture**. An
+unended claim would leave the chart unpannable for the rest of the session with nothing on
+screen to say why, which is why the release path is the first thing the pointer-end handler
+does. A claim is tracked by pointer id rather than in the set a pan and a pinch are built
+from, so a second finger during a claimed drag cannot become a pinch underneath the
+caller's gesture.
+
+Two consequences worth stating, because they are what a handler has to know:
+
+- **`pointerCount` excludes a press this handler already claimed.** It is the number of
+  presses down *in the engine's own gesture bookkeeping*. A handler that wants to decline
+  a second finger tracks its own outstanding claim and treats the next press as a second.
+- **A handler that throws does not claim, and the chart keeps working.** The error is
+  reported once per distinct error and the press is declined, so a handler failing on every
+  press leaves a chart that still pans rather than one that cannot be moved at all. The
+  fallback direction is the point.
+
+Replacing the handler drops an outstanding claim, so a chart is pannable immediately rather
+than claimed against a handler the caller has discarded. Dropped on `destroy()`.
 
 ### `drawingProjector(pane?)` / `drawingUnprojector(pane?)`
 

@@ -333,3 +333,168 @@ test('an overlay and a bucket of candles get the same slot, breaks and all', () 
         );
     }
 });
+
+// --- The visible-window cull -------------------------------------------------
+//
+// An overlay is reduced over the bars the plot covers rather than the whole
+// retained series. The reduction therefore has to be the *same* reduction on a
+// narrower range: same buckets, same order, same values. These tests derive the
+// expectation from the buckets rather than from a second implementation, because a
+// hand-written cull that re-derives the answer would agree with a wrong one.
+
+const BARS = 512;
+const bigTimes = Array.from({ length: BARS }, (_, i) => BASE + i * 60_000);
+
+/** values[i] is a distinct, order-revealing number so a shift cannot hide. */
+const ramp = (n) => Float32Array.from({ length: n }, (_, i) => i * 1.5 + 1);
+
+/** Unwrap to a list of [x, value] pairs. */
+function pairs(result) {
+    const out = [];
+    for (let i = 0; i < result.points.length; i += result.stride) {
+        out.push([result.points[i], result.points[i + 1]]);
+    }
+    return out;
+}
+
+test('a culled reduction is a contiguous slice of the full reduction', () => {
+    // The load-bearing property. Whatever the window, every emitted bucket must be
+    // the same bucket the full reduction emitted, carrying the same value.
+    for (const factor of [1, 2, 4, 8, 16]) {
+        for (const [from, to] of [[0, BARS - 1], [100, 200], [0, 40], [BARS - 40, BARS - 1]]) {
+            const values = ramp(BARS);
+            const full = bucketOverlay(values, factor, BARS, 0, BARS - 1, null, 0);
+            const culled = bucketOverlay(values, factor, BARS, 0, BARS - 1, null, 0, from, to);
+            const fullPairs = pairs(full);
+            const culledPairs = pairs(culled);
+
+            assert.ok(culledPairs.length > 0, `factor ${factor}: window ${from}..${to} emitted nothing`);
+            // Every culled point is present, in order, with the identical value.
+            let cursor = 0;
+            for (const point of culledPairs) {
+                while (cursor < fullPairs.length && fullPairs[cursor][0] < point[0]) cursor++;
+                assert.ok(cursor < fullPairs.length, `factor ${factor}: x ${point[0]} absent from full reduction`);
+                assert.deepEqual(
+                    fullPairs[cursor], point,
+                    `factor ${factor} window ${from}..${to}: culled point ${JSON.stringify(point)} `
+                    + `does not match full point ${JSON.stringify(fullPairs[cursor])}`,
+                );
+                cursor++;
+            }
+        }
+    }
+});
+
+test('the cull keeps an overlay entering from off-screen', () => {
+    // A window in the middle of the series must still draw the bar just left of it,
+    // or the line starts in mid-air instead of reaching the plot edge.
+    const values = ramp(BARS);
+    const result = bucketOverlay(values, 1, BARS, 0, BARS - 1, null, 0, 200, 240);
+    const xs = pairs(result).map((p) => p[0]);
+    assert.equal(xs[0], 199, 'expected the window widened by one bar on the left');
+    assert.ok(xs.includes(240), 'expected the window widened by one bar on the right');
+});
+
+test('the cull widens by a bucket, not a bar, when reduced', () => {
+    const values = ramp(BARS);
+    const result = bucketOverlay(values, 8, BARS, 0, BARS - 1, null, 0, 200, 240);
+    const xs = pairs(result).map((p) => p[0]);
+    // 200/8 = 25 exactly, 240/8 = 30 exactly, so the widened floor reaches bucket 24
+    // and the ceiling bucket 30. A one-*bar* margin would have emitted neither.
+    assert.ok(xs.includes(24), `expected bucket 24, got ${xs[0]}..${xs[xs.length - 1]}`);
+    assert.ok(xs.includes(30), 'expected bucket 30');
+});
+
+test('a cull never resurrects a bar the indicator does not cover', () => {
+    // A warm-up leaves the leading bars uncovered. The cull must be clamped to the
+    // covered window, or a leading edge is drawn from zero -- the destructive case the
+    // engine's own contract calls out.
+    const values = ramp(BARS);
+    const covered = bucketOverlay(values, 1, BARS, 100, BARS - 1, null, 0, 0, BARS - 1);
+    const xs = pairs(covered).map((p) => p[0]);
+    assert.equal(xs[0], 100, 'the first emitted bar is the first covered bar');
+    // And with the window entirely inside the covered range, nothing shifts.
+    const culled = bucketOverlay(values, 1, BARS, 100, BARS - 1, null, 0, 300, 340);
+    const culledXs = pairs(culled).map((p) => p[0]);
+    assert.equal(culledXs[0], 299);
+    assert.ok(culledXs.every((x) => x >= 100), 'emitted an uncovered bar');
+});
+
+test('a window off the covered range emits nothing', () => {
+    const values = ramp(BARS);
+    const result = bucketOverlay(values, 1, BARS, 0, 100, null, 0, 400, 500);
+    assert.equal(result.points.length, 0);
+});
+
+test('the cull preserves per-point colour and its stride', () => {
+    const values = ramp(BARS);
+    const colors = new Float32Array(BARS * 4);
+    for (let i = 0; i < BARS; i++) {
+        colors[i * 4] = i / BARS;
+        colors[i * 4 + 3] = 1;
+    }
+    const full = bucketOverlay(values, 1, BARS, 0, BARS - 1, colors, 0);
+    const culled = bucketOverlay(values, 1, BARS, 0, BARS - 1, colors, 0, 100, 140);
+    assert.equal(culled.stride, 6);
+    // 100..140 widens by one bar to 99..141.
+    assert.equal(culled.points[0], 99);
+    // Colour travels with the value it was recorded against, not with the position.
+    const ordinal = culled.points[0];
+    assert.equal(culled.points[2], colors[ordinal * 4]);
+    assert.deepEqual(
+        Array.from(culled.points), Array.from(full.points).slice(99 * 6, 142 * 6),
+    );
+});
+
+test('the cull allocates from the window, not the series', () => {
+    // The reason the cull exists. Sizing the buffer from `sourceCount` allocates a
+    // full-length buffer per overlay per frame, which is the O(history) cost the
+    // window removes on the write side but reintroduces on the allocation side.
+    const values = ramp(BARS);
+    const result = bucketOverlay(values, 1, BARS, 0, BARS - 1, null, 0, 100, 140);
+    // 100..140 widens by one bar at each end to 99..141, which is 43 bars.
+    assert.equal(
+        result.points.length, 43 * 2,
+        'expected the buffer sized to the emitted window, not to 512 bars',
+    );
+    assert.ok(
+        result.points.length < BARS * 2 / 4,
+        'the buffer is still sized to a large fraction of the series',
+    );
+});
+
+test('a trimmed series still buckets on the absolute grid', () => {
+    // barBase is what stops a cull from putting a moving average a whole bucket away
+    // from the price it annotates. Derived from the absolute grid rather than compared
+    // against a rebuild, because a rebuild re-cuts and would assert the opposite.
+    const BASE_ORD = 1000; // 1000 bars trimmed before the retained window
+    const values = ramp(BARS);
+    const result = bucketOverlay(values, 4, BARS, 0, BARS - 1, null, BASE_ORD, 200, 240);
+    const xs = pairs(result).map((p) => p[0]);
+
+    // x is an **absolute bucket index**, so the unit is a bucket of 4, not a bar.
+    // Retained ordinal 200 is absolute bar 1200, which is bucket 300.
+    assert.ok(xs.includes(300), `expected absolute bucket 300, got ${xs[0]}..${xs[xs.length - 1]}`);
+    // 200 widened by a bucket to 196, i.e. absolute 1196, i.e. bucket 299.
+    assert.equal(xs[0], 299, 'expected the bucket holding the widened window start');
+    for (const x of xs) {
+        // x is a bucket index, so its group is absolute bars [x*4, (x+1)*4). The grid
+        // is cut on absolute boundaries: a bucket is aligned iff x*4 is, which every
+        // integer x satisfies. The assertion that matters is that the group's absolute
+        // bars lie inside the retained window — a retained-relative x would put bucket
+        // 196 at absolute bar 784, which is 216 bars before the data starts.
+        const firstAbsoluteBar = x * 4;
+        assert.ok(
+            firstAbsoluteBar >= BASE_ORD,
+            `emitted bucket ${x} starts at absolute bar ${firstAbsoluteBar}, before the retained base ${BASE_ORD}`,
+        );
+        assert.ok(
+            firstAbsoluteBar >= BASE_ORD + 196 && firstAbsoluteBar <= BASE_ORD + 244,
+            `emitted bucket ${x} covers absolute bar ${firstAbsoluteBar}, outside the widened window`,
+        );
+    }
+    // And every bucket advances by one, with no gap and no repeat.
+    for (let i = 1; i < xs.length; i++) {
+        assert.equal(xs[i], xs[i - 1] + 1, 'buckets are not contiguous');
+    }
+});

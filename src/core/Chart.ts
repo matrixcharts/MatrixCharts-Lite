@@ -113,7 +113,7 @@ import {
     type DragState,
 } from './drawingOrderModel.js';
 import { incrementalSlotUpdateWithScale, type SlotTableUpdate } from './incrementalSlots.js';
-import type { OverlayPainter } from './paint.js';
+import type { OverlayPainter, PointerClaimHandler } from './paint.js';
 import {
     type ChartViewport,
     type LogicalRange,
@@ -220,6 +220,17 @@ export class Chart {
     private lastPointerX: number = 0;
     private lastPointerY: number = 0;
     private activePointers: Map<number, { x: number; y: number }> = new Map();
+    /**
+     * The pointer id of a press a caller's claim handler took, or `null`.
+     *
+     * Kept out of `activePointers` on purpose: that map is what a pan and a pinch are
+     * built from, and a claimed press in it would let a second finger start a pinch
+     * underneath the caller's own drag.
+     */
+    private claimedPointerId: number | null = null;
+    private pointerClaimHandler: PointerClaimHandler | null = null;
+    /** Last reported claim-handler error, so a throwing handler is not reported per press. */
+    private lastPointerClaimError: string | null = null;
     private lastPinchDistance: number = 0;
     private lastPinchCenterX: number = 0;
     /**
@@ -607,7 +618,82 @@ export class Chart {
         }
     }
 
-    private redraw(): void {
+    /**
+     * Registers a handler offered every press before the chart decides what the gesture
+     * is. Return `true` to take the press.
+     *
+     * The engine owns the pointer surface — a press in the plot pans, a press in the
+     * gutter scales that pane — and that is right for a chart and wrong for a drawing
+     * tool. A trend line dragged by its own handle is not a pan, and a tool that cannot
+     * say so has to stop the engine's events from reaching it, which means the tool and
+     * the chart each hold half of one gesture. The failure is visible: the series slides
+     * while a drawing moves, or a drawing moves and the series does not.
+     *
+     * A claimed press is the caller's from the release down. The chart does not pan, zoom,
+     * scale a pane, or drag an order for the rest of the gesture, and it reports no click
+     * for it — a press that travelled far enough to be a pan is not also a click, and here
+     * the caller is reporting its own gesture through its own means. The crosshair does
+     * not track the pointer as a hover while the press is outstanding, because a pointer
+     * placing a drawing is not hovering the chart.
+     *
+     * The claim ends on release, cancel, or lost capture, whichever the browser delivers,
+     * and it cannot outlive its gesture: an unended claim would leave the chart unable to
+     * pan for the rest of the session, which is why the release path is the first thing
+     * `handlePointerEnd` does.
+     *
+     * `pointerCount` is the number of presses already down, and **excludes a press this
+     * handler has already claimed** — a claimed press is deliberately kept out of the set
+     * a pinch is built from, so a second finger during a claimed drag cannot become one.
+     * A handler that wants to decline a second finger tracks its own outstanding claim
+     * and treats the next press as a second.
+     *
+     * Throwing is reported once per distinct error and the press is **not** claimed, so
+     * the chart still pans. A handler that fails must not leave a chart that cannot be
+     * moved.
+     *
+     * Pass `null` to unregister. Dropped on `destroy()`, as every other handler is.
+     */
+    public setPointerClaimHandler(handler: PointerClaimHandler | null): void {
+        this.assertAlive();
+        if (handler !== null && typeof handler !== 'function') {
+            throw new Error('MatrixCharts: setPointerClaimHandler requires a function or null.');
+        }
+        this.pointerClaimHandler = handler;
+        // A handler replacing another mid-gesture cannot take over a press that is
+        // already outstanding, so the outstanding claim is dropped rather than left
+        // pointing at a handler the caller has replaced. The chart is then pannable
+        // again immediately, which is the safe direction to fail in.
+        this.claimedPointerId = null;
+    }
+
+    /**
+     * Repaints every layer from the state the chart already holds, now.
+     *
+     * Every layer is cleared and re-rendered, so a painter registered with
+     * `setOverlayPainter` is called again — which is the point. A caller whose own model
+     * changed, and which the engine knows nothing about, otherwise has no way to get its
+     * change on screen: `setOverlayPainter` deliberately emits no frame, so undo, a
+     * reload, a deleted drawing and an edited one all leave the last frame standing until
+     * a pan, a zoom, or a pointer move happens to repaint. This is what the paint seam's
+     * documentation already told callers to call, and it was not reachable.
+     *
+     * **This repaints, it does not recompute.** The visible candle slice, the vertical fit
+     * and the viewport are left exactly as they are, so this is the right call after
+     * changing something the chart did not store, and the wrong call after changing
+     * something it did — `setData`, `applyOptions`, `setVisibleLogicalRange` and the rest
+     * recompute and repaint on their own.
+     *
+     * Emits no event. Nothing about the chart's state changed, so there is nothing for a
+     * subscriber to be told; a caller repainting their own layer is not a viewport
+     * change.
+     */
+    public redraw(): void {
+        this.assertAlive();
+        // The collapsed-container rule, as everywhere else. Feeding is not skipped on
+        // this path — there is none — but painting a frame into a container that is sized
+        // and now measuring zero is exactly what the fallback geometry exists to avoid,
+        // and the last frame is better than an 800x500 one crammed into a sliver.
+        if (this.hasBeenSized() && this.containerIsZero()) return;
         for (const renderer of this.renderers) {
             renderer.clear();
             renderer.render();
@@ -626,6 +712,11 @@ export class Chart {
 
     private handlePointerDown = (event: PointerEvent): void => {
         if (event.pointerType === 'mouse' && event.button !== 0) return;
+        // A caller gets first refusal on every press, before the chart decides what the
+        // gesture is. This is the only point a drawing tool can say "mine" — every other
+        // gesture decision here is already made by the time a press has been recorded.
+        if (this.offerPointerClaim(event)) return;
+
         // Record the press before capturing. Capture is best effort, so a stale
         // pointer id must not stop the chart from tracking press and pan.
         this.activePointers.set(event.pointerId, { x: event.clientX, y: event.clientY });
@@ -952,6 +1043,19 @@ export class Chart {
     }
 
     private handlePointerEnd = (event: PointerEvent): void => {
+        // A claimed press ends here and goes no further. It is not in `activePointers`,
+        // so the pan/pinch bookkeeping below has nothing to do, and the crosshair is
+        // refreshed exactly as it is after any other release.
+        if (this.claimedPointerId === event.pointerId) {
+            this.claimedPointerId = null;
+            if (event.pointerType === 'mouse') {
+                this.updateCrosshair(event.clientX, event.clientY);
+            } else {
+                this.clearCrosshair();
+            }
+            return;
+        }
+
         const wasSinglePointer: boolean = this.activePointers.size === 1;
         this.activePointers.delete(event.pointerId);
 
@@ -992,12 +1096,71 @@ export class Chart {
         this.clearCrosshair();
     };
 
+    /**
+     * Offers a press to the caller's claim handler, and begins a claimed gesture if it
+     * takes it.
+     *
+     * Returned `true` means the claim was accepted and the chart will not pan, zoom,
+     * scale a pane, or drag an order for the rest of this gesture. The press is not
+     * recorded in `activePointers` at all, so the whole of `handlePointerMove` and
+     * `handlePointerEnd` see a chart with no gesture in progress — which is what keeps
+     * a tool from having to remember to un-set something, and what keeps a chart from
+     * being left mid-pan when a tool's drag ends.
+     *
+     * A second finger is deliberately **not** a claim. A claim is for a press a caller
+     * recognises as its own; a pinch is two presses arriving at once, and letting a
+     * handler claim only one of them produces a half-pan. The caller gets
+     * `pointerCount` so it can decline, and the whole-gesture pinch path stays the
+     * engine's.
+     */
+    private offerPointerClaim(event: PointerEvent): boolean {
+        const handler = this.pointerClaimHandler;
+        if (handler === null) return false;
+        let claimed: boolean;
+        try {
+            claimed = handler({
+                clientX: event.clientX,
+                clientY: event.clientY,
+                button: event.button,
+                pointerType: event.pointerType,
+                pointerId: event.pointerId,
+                /** Presses already down, so a handler can decline to claim a second. */
+                pointerCount: this.activePointers.size,
+                event,
+            });
+        } catch (error) {
+            // A throwing handler must not leave the chart unable to pan, which would be a
+            // far worse failure than the one that was being handled.
+            this.reportPointerClaimError(error);
+            return false;
+        }
+        if (!claimed) return false;
+
+        // A claimed press still captures the pointer, so the caller keeps receiving moves
+        // and the release even if the pointer leaves the chart. That is best effort in the
+        // same way the pan path's capture is, and bubbling still delivers pointerup.
+        this.capturePointer(event.pointerId);
+        // Deliberately **not** added to `activePointers`. That set is what a pan and a
+        // pinch are built from, and a second finger landing during a claimed drag would
+        // find two pointers in it and start a pinch underneath the tool. Tracked by id
+        // instead, so the only thing the chart knows about a claimed press is that one is
+        // outstanding.
+        this.claimedPointerId = event.pointerId;
+        // A claimed press is in progress, which is what stops the crosshair reading the
+        // pointer as a hover over the chart while it is placing a drawing.
+        this.pressMoved = true;
+        return true;
+    }
+
     /** A drag or pinch is under way, so pointer movement is not hover. */
     private isInteracting(): boolean {
         // The axis drag counts even though it leaves `isDragging` false: it is a
         // gesture in progress, and without this the crosshair would keep tracking
         // the pointer as hover while the price range is being dragged underneath it.
-        return this.isDragging || this.activePointers.size >= 2 || this.priceAxisDrag !== null;
+        // A claimed press counts for the same reason: the pointer is driving a caller's
+        // gesture, and the crosshair should not read it as a hover over the chart.
+        return this.isDragging || this.activePointers.size >= 2 || this.priceAxisDrag !== null
+            || this.claimedPointerId !== null;
     }
 
     private handleWheel = (event: WheelEvent): void => {
@@ -2855,6 +3018,29 @@ export class Chart {
     }
 
     /**
+     * Reports a claim handler's failure once per distinct error, and does not claim the
+     * press.
+     *
+     * The direction of the fallback is the whole point. A handler that throws on every
+     * press would otherwise leave a chart that cannot be panned, scrolled, or zoomed —
+     * the caller would have broken the chart completely in trying to add to it, with
+     * nothing on screen to say why. Declining instead leaves the chart behaving exactly as
+     * it did before the handler was registered.
+     */
+    private reportPointerClaimError(error: unknown): void {
+        const key: string = error instanceof Error
+            ? `${error.name}: ${error.message}`
+            : String(error);
+        if (this.lastPointerClaimError === key) return;
+        this.lastPointerClaimError = key;
+        console.error(
+            'MatrixCharts: a pointer claim handler threw; the press was not claimed '
+            + 'and the chart behaves as if no handler were registered.',
+            error,
+        );
+    }
+
+    /**
      * Screen-to-data for drawing geometry, matching `drawingProjector`.
      *
      * A y outside the pane is converted rather than rejected, for the same reason
@@ -3978,11 +4164,29 @@ export class Chart {
      */
     private displayedStartBucket: number = 0;
 
+    /**
+     * The retained-window ordinals currently on screen, from the same computation that
+     * slices the candles.
+     *
+     * Overlays are reduced over this rather than over the whole retained series. The
+     * candle path has always been culled — the engine draws the buckets the plot covers
+     * — and an overlay that reduced the entire series on every frame paid for every bar
+     * scrolled off the left edge as though it were about to be drawn. At 50,000 bars and
+     * 32 indicators that was 14.8 ms of every frame, against 0.28 ms culled.
+     *
+     * Read in retained-window ordinals, not buckets, because the reduction divides. Zero
+     * until the first pass, which is harmless: there is nothing to draw then.
+     */
+    private visibleFirstOrdinal: number = 0;
+    private visibleLastOrdinal: number = -1;
+
     private updateVisibleCandles(): void {
         const viewport: ChartViewport = this.viewport;
         if (this.candlePyramid.candleCount === 0) {
             this.displayedCandles = new Float32Array(0);
             this.displayedStartBucket = 0;
+            this.visibleFirstOrdinal = 0;
+            this.visibleLastOrdinal = -1;
         } else {
             let levelIndex: number = 0;
             while (
@@ -4024,6 +4228,17 @@ export class Chart {
             const startBucket: number = Math.max(0, firstBucket - levelBase - 1);
             const endBucket: number = Math.min(levelCount, lastBucket - levelBase + 2);
             this.displayedStartBucket = startBucket;
+            // The same window, in retained ordinals rather than buckets. `bucketOverlay`
+            // divides by the factor itself, and these are widened by one bar rather than
+            // one bucket because an overlay's coverage is checked per ordinal — the
+            // reduction clamps its own range to the covered window, so passing a
+            // deliberately generous range here cannot make it draw a bar it has no value
+            // for.
+            this.visibleFirstOrdinal = Math.max(0, visibleMinX - 1);
+            this.visibleLastOrdinal = Math.min(
+                this.candlePyramid.candleCount - 1,
+                visibleMaxX + 1,
+            );
             this.displayedCandles = endBucket > startBucket
                 ? this.sliceInSlotSpace(
                     level, startBucket, endBucket, aggregationFactor, levelBase, barBase,
@@ -4206,6 +4421,11 @@ export class Chart {
                 // The absolute origin of the retained window, so the overlay is bucketed
                 // on the same grid the candles are.
                 this.candlePyramid.getLevelBase(0),
+                // The window the candles above were sliced to. Clamped to the overlay's
+                // own covered range inside the reduction, so an indicator that starts
+                // partway across the series still begins partway across the chart.
+                this.visibleFirstOrdinal,
+                this.visibleLastOrdinal,
             );
             // An overlay on the price pane is measured in prices, so it needs the
             // same conversion the candles got. One on any other pane is left alone:
@@ -4378,6 +4598,11 @@ export class Chart {
         this.orderHandlers.clear();
         this.drawingOrderHandlers.clear();
         this.paneRangeHandlers.clear();
+        // A claim handler closes over whatever the caller's tool model is, so dropping it
+        // is what stops a destroyed chart being reachable from that model. The outstanding
+        // claim goes with it, so a destroyed chart has no gesture in progress.
+        this.pointerClaimHandler = null;
+        this.claimedPointerId = null;
         this.lastReportedRange = null;
         this.emittingCrosshair = false;
         this.emittingVisibleRange = false;

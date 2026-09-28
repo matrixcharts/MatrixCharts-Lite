@@ -109,3 +109,47 @@ export interface PaintContext {
  * return early.
  */
 export type OverlayPainter = (context: PaintContext) => void;
+
+/**
+ * A press, offered to a caller's claim handler before the chart decides what the
+ * gesture is.
+ *
+ * `clientX` and `clientY` are viewport coordinates, the same pair `PaintContext`'s
+ * projections and every pointer-driven helper take, so a handler can hit-test a
+ * drawing without a `getBoundingClientRect` of its own. The raw `event` is carried for
+ * a caller that needs something the summary does not have.
+ */
+export interface PointerClaim {
+    /** CSS x, relative to the viewport. */
+    clientX: number;
+    /** CSS y, relative to the viewport. */
+    clientY: number;
+    /** The pointer button, for a press to be claimed only on the primary one. */
+    button: number;
+    /** `mouse`, `touch`, or `pen`. */
+    pointerType: string;
+    /** The browser's pointer id, which identifies this press across moves and release. */
+    pointerId: number;
+    /**
+     * Presses already down when this one arrived, **excluding any press this handler has
+     * already claimed**.
+     *
+     * A claimed press is tracked by id rather than in the set a pinch is built from,
+     * because a second finger arriving during a claimed drag must not become a pinch
+     * underneath the caller's gesture. The consequence is that `pointerCount` does not
+     * count a press this handler took: a handler that wants to decline a second finger
+     * has to track its own outstanding claim and treat the second press as a second.
+     */
+    pointerCount: number;
+    /** The original event, for anything the summary above does not carry. */
+    readonly event: PointerEvent;
+}
+
+/**
+ * Offered every press before the chart turns it into a pan, a zoom, a pane scale or an
+ * order drag. Return `true` to take the press.
+ *
+ * The handler is asked, it does not decide alone: a `true` claims the press, and a
+ * `false` — or a throw — leaves the chart to do exactly what it would have done.
+ */
+export type PointerClaimHandler = (claim: PointerClaim) => boolean;

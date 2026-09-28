@@ -6,6 +6,103 @@ records what moved and why, per release.
 
 ## Unreleased
 
+### Added
+
+**`Chart.setPointerClaimHandler(handler | null)` — a way for a drawing tool to take a press
+the engine would otherwise turn into a pan.** The engine owns the pointer surface: a press
+in the plot pans, a press in the gutter scales that pane. That is right for a chart and
+wrong for a tool, and the drawing model was exported to build exactly those tools with no
+way to say "this drag is mine". Every tool author therefore had to stop the engine's
+events from reaching them, which means the tool and the chart each hold half of one
+gesture. The symptom is the series sliding while a drawing moves.
+
+A handler is offered every press **before** the chart decides what the gesture is, and
+returns `true` to take it. A claimed press is the caller's from the release down: no pan,
+no zoom, no pane scale, no order drag, and no click — a press that travelled far enough to
+be a pan is not also a click, and here the caller is reporting its own gesture through its
+own means. The crosshair stops reading the pointer as a hover for the duration, because a
+pointer placing a drawing is not hovering the chart.
+
+The claim is tracked by pointer id rather than in the set a pan and a pinch are built from,
+so a second finger during a claimed drag cannot become a pinch underneath the caller's
+gesture. The cost of that is stated rather than hidden: `pointerCount` excludes a press
+this handler already claimed, so a handler that wants to decline a second finger tracks its
+own outstanding claim and treats the next press as a second.
+
+**A claim cannot outlive its gesture**, which is the invariant the whole seam rests on: an
+unended claim would leave a chart that cannot be panned for the rest of the session, with
+nothing on screen to explain why. Release, cancel and lost capture all end it, and the
+release path is the first thing the pointer-end handler does. Replacing the handler mid
+gesture drops the claim, and `destroy()` drops both. A handler that throws does **not**
+claim and the press is declined — reported once per distinct error — because a handler
+failing on every press would otherwise leave a chart that cannot be moved at all, which is
+a far worse failure than the one it was working around.
+
+`PointerClaim` and `PointerClaimHandler` are exported as types.
+
+**`Chart.redraw()` is public, and the documentation that already told callers to call it
+was wrong.** The paint seam's documentation says a caller that has just changed its own
+model calls `redraw()` — and `redraw()` was `private`, so there was no way to do it. Every
+method except two carried an `assertAlive()` guard and the six drawing mutators had
+recently been given one; this was the remaining reachable path with no supported way to
+trigger a frame, and it is the one the drawing tools depend on.
+
+The visible consequence was that a drawing only appeared on screen when the user happened
+to pan, zoom or move the pointer, which reads as lag in the tool rather than as a missing
+API. `setOverlayPainter` deliberately emits no frame, which is correct — a painter changes
+nothing the engine draws — but it left a caller whose own model changed with no route to
+the screen.
+
+**It repaints; it does not recompute.** The visible candle slice, the vertical fit and the
+viewport are left exactly as they are, so it is the right call after changing something the
+chart did not store and the wrong call after changing something it did. Emits no event,
+because nothing the chart reports has changed.
+
+### Changed
+
+**A pan is bounded, a drawing is not, and the difference is now documented rather than
+worked around.** A pan holds the view to half a plot width of slack past either end, which
+is deliberate: it turns "I have scrolled the data off the screen" into a dead end
+`scrollToRealtime()` undoes. It is also why a drawing whose anchor sits in empty space
+cannot be reached by dragging to it. The two answer different questions — a gesture is a
+user acting on the chart, content is content the caller owns and may place anywhere — and
+the answer is `setVisibleLogicalRange`, which already honours a range past the series in
+both directions while holding to the same bound so an ask and a gesture cannot disagree.
+The contract now says so, under a heading of its own.
+
+### Fixed
+
+**Overlays were reduced over the whole retained series on every frame, so a chart with many
+indicators missed the frame budget at 50,000 bars and ran out of memory at a million.** The
+candle path was culled to the visible window; the overlay path was not. Every frame, for
+every overlay, the engine re-reduced the entire series and uploaded all of it, including
+the tens of thousands of bars scrolled off the left edge that the GPU clips anyway.
+`uploadVisibleOverlays` passed `candlePyramid.candleCount` as the range, in the same method
+that had computed the visible window for the candles thirty lines earlier; one argument
+was the whole difference.
+
+Per frame, 32 indicators, 800 bars on screen: **11.7 ms to 0.47 ms at 50,000 bars.** The
+before figure was one frame from missing 60 Hz, and **over** it at 16.5 ms once a quarter of
+the indicators carried a per-point colour — the MACD-histogram case, which the engine's own
+overlay contract names as the reason per-point colour exists. At 1,000,000 bars the old path
+exhausted the heap, since 32 coloured overlays at full width is 3.9 GB of colour buffers;
+it now costs 0.50 ms. Measured through a real `Chart` on the headless harness, both
+directions, in `PERFORMANCE.md`.
+
+The fix is a culled range, and it is free: the work is the same reduction over a narrower
+window, and the emitted buckets are the same buckets the full reduction produced, in the
+same order, with the same values. Three properties are asserted rather than assumed — a
+culled reduction is a contiguous slice of the full one at every factor, the range is
+clamped to the covered window and widened by a bucket at each end so an overlay entering
+from off-screen still reaches the plot edge, and a trimmed series still buckets on the
+absolute grid. That first one is the test that would catch a cull silently shifting an
+indicator off the candles it annotates. Six of the eight new tests fail against the old
+code.
+
+The output buffer is sized from the emitted window rather than from the series length, since
+allocating a full-length buffer per overlay per frame would leave the O(history) cost on
+the allocation side after removing it from the write side.
+
 ## v1.1.0
 
 Released: 2026-09-28

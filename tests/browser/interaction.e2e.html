@@ -139,6 +139,25 @@ globalThis.__mc = {
     xOf: (index) => chart.indexToCoordinate(index),
     indexAt: (x) => chart.coordinateToNearestIndex(x),
     spacing: () => chart.options().timeScale.barSpacing,
+    // The gesture seam, for the runner's claim invariants.
+    //
+    // A handler that claims everything and one that claims nothing, so the runner can
+    // drive the *same* real drag twice and assert the two produce different geometry.
+    // Asserting only the claimed case would pass with a seam that claims unconditionally;
+    // asserting only the unclaimed case would pass with no seam at all.
+    claimAll: (on) => {
+        if (on) chart.setPointerClaimHandler(() => true);
+        else chart.setPointerClaimHandler(() => false);
+    },
+    // Painter call count, so the runner can assert `redraw()` reaches the caller's layer.
+    // A real 2D context is in play here, so unlike the headless stub the painter is
+    // genuinely invoked — which is what makes this the end-to-end version of that test.
+    paints: 0,
+    installPainter: () => {
+        globalThis.__mc.paints = 0;
+        chart.setOverlayPainter(() => { globalThis.__mc.paints++; });
+    },
+    paintCount: () => globalThis.__mc.paints,
 };
 globalThis.__mcReady = true;
 </script>
