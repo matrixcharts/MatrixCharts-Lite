@@ -1,5 +1,5 @@
 {
-  "name": "matrixcharts",
+  "name": "@matrixcharts/lite",
   "version": "1.2.0",
   "description": "Zero-dependency WebGL2 candlestick chart with a Canvas2D fallback and a sequenced live candle feed.",
   "license": "ISC",
@@ -8,6 +8,15 @@
     "url": "git+https://github.com/matrixcharts/MatrixCharts-Lite.git"
   },
   "homepage": "https://github.com/matrixcharts/MatrixCharts-Lite#readme",
+  "keywords": [
+    "candlestick",
+    "chart",
+    "webgl2",
+    "ohlc",
+    "trading",
+    "financial-charting",
+    "canvas"
+  ],
   "bugs": {
     "url": "https://github.com/matrixcharts/MatrixCharts-Lite/issues"
   },
@@ -33,6 +42,10 @@
     "CHANGELOG.md"
   ],
   "sideEffects": false,
+  "publishConfig": {
+    "access": "public"
+  },
+  
   "scripts": {
     "dev": "vite",
     "build": "npm run build:esm && npm run build:cjs",
@@ -49,12 +62,6 @@
     "screenshot": "node scripts/screenshot.cjs",
     "check:interaction": "node scripts/check-interaction.mjs"
   },
-  "keywords": [
-    "candlestick",
-    "chart",
-    "webgl2",
-    "ohlc"
-  ],
   "devDependencies": {
     "puppeteer-core": "^25.12.0",
     "typescript": "^7.0.2",

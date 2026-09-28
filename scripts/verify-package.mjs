@@ -19,7 +19,19 @@ import { fileURLToPath } from 'node:url';
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const workspace = path.join(repoRoot, '.tmp', 'verify');
-const consumerModules = path.join(workspace, 'node_modules', 'matrixcharts');
+// The package name is read rather than written, because every consumer below has to
+// import the thing by exactly the name it will be published under, and a hard-coded one
+// silently keeps passing against the old name after a rename. A scoped name nests under
+// `node_modules/@scope/name`, which is the other thing worth deriving rather than
+// writing: `node_modules/matrixcharts` would resolve to nothing at all.
+const pkg = JSON.parse(readFileSync(path.join(repoRoot, 'package.json'), 'utf8'));
+const pkgName = pkg.name;
+// The same name with a slash, for the subpath-import assertions: a scoped package is
+// imported as `@scope/name` but reaches a blocked subpath as `@scope/name/...`, so the
+// two spellings differ and both are needed.
+const PKG_NAME = pkgName;
+const PKG_SPEC = pkgName;
+const consumerModules = path.join(workspace, 'node_modules', ...pkgName.split('/'));
 const tsc = path.join(repoRoot, 'node_modules', 'typescript', 'bin', 'tsc');
 
 // The exact set of runtime values the published entry exports. An allow-list, so
@@ -143,6 +155,37 @@ const packJson = JSON.parse(
 );
 const packedFiles = packJson[0].files.map((entry) => entry.path.replace(/\\/g, '/'));
 
+// The name npm itself would publish under, straight out of `npm pack --json`. This is the
+// only source here that is not `package.json` read back, which is what makes it able to
+// contradict it — every other name check in this file compares the manifest to the name
+// the consumers below were handed, so all of them move together and a wrong name passes.
+// Compared against npm's own answer instead, a renamed `name` field that nothing else
+// followed is caught here rather than at `npm publish`, which is the only place it
+// otherwise shows up and is too late to be cheap.
+check('the name npm would publish is the one the README and consumers use', () => {
+    const packed = packJson[0];
+    if (packed.name !== pkgName) {
+        throw new Error(`npm pack reports name ${JSON.stringify(packed.name)}, expected ${JSON.stringify(pkgName)}`);
+    }
+    if (packed.version !== pkg.version) {
+        throw new Error(`npm pack reports version ${JSON.stringify(packed.version)}, expected ${JSON.stringify(pkg.version)}`);
+    }
+    // A scoped package is private unless `publishConfig.access` says otherwise, and npm
+    // rejects the publish rather than defaulting to public.
+    if (pkgName.startsWith('@') && pkg.publishConfig?.access !== 'public') {
+        throw new Error(`scoped package ${pkgName} needs "publishConfig": { "access": "public" }`);
+    }
+    // The README is what a visitor copies an install line from, and it is the one place
+    // the old name survives a rename by accident.
+    const readme = readFileSync(path.join(repoRoot, 'README.md'), 'utf8');
+    if (readme.includes('matrixcharts') && !readme.includes(pkgName)) {
+        throw new Error(`README still refers to the old name; expected ${pkgName} in the install line`);
+    }
+    if (!readme.includes(pkgName)) {
+        throw new Error(`README does not mention ${pkgName}`);
+    }
+});
+
 check('tarball ships the ESM entry, CJS entry, types, and docs', () => {
     const missing = REQUIRED_PACK_PATHS.filter((required) => !packedFiles.includes(required));
     if (missing.length > 0) throw new Error(`missing from tarball: ${missing.join(', ')}`);
@@ -174,7 +217,7 @@ check('installed package declares per-condition types and defaults', () => {
     if (manifest.type !== 'module') throw new Error('root "type" must be "module"');
     if (manifest.sideEffects !== false) throw new Error('"sideEffects" must be false');
     // Each condition needs its own .d.ts, otherwise a CJS consumer sees an
-    // ESM-only module and TypeScript rejects require('matrixcharts').
+    // ESM-only module and TypeScript rejects require(${PKG_NAME}).
     const expected = {
         import: { types: './dist/esm/index.d.ts', default: './dist/esm/index.js' },
         require: { types: './dist/cjs/index.d.ts', default: './dist/cjs/index.js' },
@@ -210,11 +253,11 @@ check('require() exposes only the v1 value exports and blocks deep imports', () 
     const probe = [
         'const assert = require("node:assert/strict");',
         `const expected = ${JSON.stringify(VALUE_EXPORTS.slice().sort())};`,
-        'const cjs = require("matrixcharts");',
+        `const cjs = require("${PKG_NAME}");`,
         'assert.deepEqual(Object.keys(cjs).filter((n) => n !== "__esModule").sort(), expected);',
         'assert.equal(typeof cjs.Chart, "function");',
         'assert.equal(cjs.Chart.prototype.testDrawWebGLData, undefined);',
-        'assert.throws(() => require("matrixcharts/dist/esm/renderers/WebGL2Renderer.js"), /ERR_PACKAGE_PATH_NOT_EXPORTED/);',
+        `assert.throws(() => require("${PKG_SPEC}/dist/esm/renderers/WebGL2Renderer.js"), /ERR_PACKAGE_PATH_NOT_EXPORTED/);`,
     ].join('\n');
     writeFileSync(path.join(workspace, 'cjs-probe.cjs'), probe);
     runNode(path.join(workspace, 'cjs-probe.cjs'));
@@ -226,10 +269,10 @@ writeFileSync(
     [
         "import assert from 'node:assert/strict';",
         'const expected = ' + JSON.stringify(VALUE_EXPORTS.slice().sort()) + ';',
-        "const mod = await import('matrixcharts');",
+        `const mod = await import('${PKG_NAME}');`,
         'assert.deepEqual(Object.keys(mod).sort(), expected);',
         "assert.equal(typeof mod.WebSocketCandleSource, 'function');",
-        "await assert.rejects(import('matrixcharts/dist/esm/core/Chart.js'), (error) => error.code === 'ERR_PACKAGE_PATH_NOT_EXPORTED');",
+        `await assert.rejects(import('${PKG_SPEC}/dist/esm/core/Chart.js'), (error) => error.code === 'ERR_PACKAGE_PATH_NOT_EXPORTED');`,
         "process.stdout.write('ok');",
     ].join('\n'),
 );
@@ -242,7 +285,7 @@ const esmConsumer = path.join(workspace, 'consumer-esm');
 writeProject(esmConsumer, {
     'package.json': JSON.stringify({ name: 'consumer-esm', type: 'module', private: true }),
     'index.ts': [
-        "import { Chart, WebSocketCandleSource, type ChartOptions, type CandleData, type LogicalRange, type TimeRange, type Unsubscribe, type CrosshairMoveEvent, type ChartClickEvent, type VisibleRangeEvent, type ResolvedChartOptions, type ChartTheme, type CandlestickOptions, type PriceFormatOptions, type TimeScaleOptions, type GridOptions, type CrosshairOptions, type LayoutOptions } from 'matrixcharts';",
+        `import { Chart, WebSocketCandleSource, type ChartOptions, type CandleData, type LogicalRange, type TimeRange, type Unsubscribe, type CrosshairMoveEvent, type ChartClickEvent, type VisibleRangeEvent, type ResolvedChartOptions, type ChartTheme, type CandlestickOptions, type PriceFormatOptions, type TimeScaleOptions, type GridOptions, type CrosshairOptions, type LayoutOptions } from '${PKG_NAME}';`,
         'const options: ChartOptions = { maxRetainedCandles: 500, theme: "paper" };',
         '// Every nested option bag must be independently nameable.',
         'export const bags: [CandlestickOptions, PriceFormatOptions, TimeScaleOptions, GridOptions, CrosshairOptions, LayoutOptions] = [',
@@ -350,7 +393,7 @@ writeProject(esmConsumer, {
 const cjsConsumer = path.join(workspace, 'consumer-cjs');
 writeProject(cjsConsumer, {
     'index.cts': [
-        "import { Chart, ChartFeedController, type ChartTheme } from 'matrixcharts';",
+        `import { Chart, ChartFeedController, type ChartTheme } from '${PKG_NAME}';`,
         'const theme: ChartTheme = "dark";',
         'export function build(host: HTMLElement): Chart {',
         '    return new Chart(host, { theme });',
@@ -379,7 +422,7 @@ for (const [label, project] of [['ESM', esmConsumer], ['CommonJS', cjsConsumer]]
 
 const leakyConsumer = path.join(workspace, 'consumer-internal');
 writeProject(leakyConsumer, {
-    'index.ts': ["import { WebGL2Renderer } from 'matrixcharts/dist/esm/renderers/WebGL2Renderer.js';", 'export const r = WebGL2Renderer;'].join('\n'),
+    'index.ts': [`import { WebGL2Renderer } from '${PKG_SPEC}/dist/esm/renderers/WebGL2Renderer.js';`, 'export const r = WebGL2Renderer;'].join('\n'),
     'tsconfig.json': JSON.stringify({
         compilerOptions: { target: 'ES2020', lib: ['ES2020', 'DOM'], module: 'node16', moduleResolution: 'node16', noEmit: true, skipLibCheck: true },
         include: ['index.ts'],
@@ -393,8 +436,10 @@ check('a consumer cannot import an internal renderer by path', () => {
         output = `${error.stdout ?? ''}${error.stderr ?? ''}`;
     }
     // The exports map publishes no subpaths, so the resolution must fail rather
-    // than silently reaching into dist.
-    const blocked = /error TS2307: Cannot find module .*matrixcharts/.test(output)
+    // than silently reaching into dist. Matched against the real name so a rename does
+    // not leave this asserting a message tsc will never produce, and passing for the
+    // wrong reason.
+    const blocked = new RegExp(`error TS2307: Cannot find module .*${pkgName.replace('/', '\\/')}`).test(output)
         || /is not exported|ERR_PACKAGE_PATH_NOT_EXPORTED/.test(output);
     if (!blocked) {
         throw new Error(`tsc accepted a deep import of an internal module${output.trim() ? `: ${output.trim()}` : ''}`);
