@@ -4,8 +4,11 @@ Zero-dependency candlestick chart with WebGL2, Canvas2D fallback, and a sequence
 
 ## Install
 
+Not yet on npm — the registry name is unclaimed and no release has been published. Install
+from GitHub, which is the same published tree the npm package will carry:
+
 ```bash
-npm install matrixcharts
+npm install github:matrixcharts/MatrixCharts-Lite
 ```
 
 ```ts
