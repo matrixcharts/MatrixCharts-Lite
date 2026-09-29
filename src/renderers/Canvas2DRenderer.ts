@@ -408,6 +408,7 @@ public init(canvas: HTMLCanvasElement, emitter: EventEmitter<ChartEvents>): void
             // crosshair underneath one.
             this.paintCallerOverlay();
             this.renderCrosshair();
+            this.renderWatermarkBadge(this.viewport);
             return;
         }
 
@@ -690,6 +691,11 @@ public init(canvas: HTMLCanvasElement, emitter: EventEmitter<ChartEvents>): void
      * Renders the native MatrixCharts 'MC' brand watermark badge in the bottom-left
      * corner of the plot rect, just above the time axis.
      */
+    /**
+     * Renders the native MatrixCharts 'MC' brand watermark badge in the bottom-left
+     * corner of the plot rect, just above the time axis. Fully background-color aware
+     * using the engine's contrastText mechanics (matching price badges and OHLC chip).
+     */
     private renderWatermarkBadge(viewport: ChartViewport): void {
         const watermark = this.options.watermark;
         if (!watermark || !watermark.visible) return;
@@ -705,8 +711,10 @@ public init(canvas: HTMLCanvasElement, emitter: EventEmitter<ChartEvents>): void
         const ctx = this.ctx;
         ctx.save();
 
-        const isDark = (this.colors.background[0] * 0.299 + this.colors.background[1] * 0.587 + this.colors.background[2] * 0.114) < 0.5;
-        const alpha = watermark.opacity ?? 0.75;
+        // Background-aware ink matching chart tags and OHLC readout
+        const bg = this.colors.background;
+        const ink = contrastText(bg);
+        const alpha = Math.max(0.2, Math.min(1.0, watermark.opacity ?? 0.85));
 
         const cx = x + size / 2;
         const cy = y + size / 2;
@@ -715,14 +723,15 @@ public init(canvas: HTMLCanvasElement, emitter: EventEmitter<ChartEvents>): void
         // 1. Subtle circular badge backdrop
         ctx.beginPath();
         ctx.arc(cx, cy, r, 0, Math.PI * 2);
-        ctx.fillStyle = isDark ? `rgba(18, 24, 38, ${alpha})` : `rgba(240, 243, 250, ${alpha})`;
+        // Elevate backdrop relative to theme ink
+        ctx.fillStyle = this.withAlpha(ink, 0.12 * alpha);
         ctx.fill();
-        ctx.strokeStyle = isDark ? `rgba(255, 255, 255, ${alpha * 0.2})` : `rgba(0, 0, 0, ${alpha * 0.15})`;
+        ctx.strokeStyle = this.withAlpha(ink, 0.28 * alpha);
         ctx.lineWidth = 1;
         ctx.stroke();
 
-        // 2. Refined Monochrome MC Monogram
-        const fgColor = isDark ? `rgba(255, 255, 255, ${alpha * 0.95})` : `rgba(18, 24, 38, ${alpha * 0.95})`;
+        // 2. Refined Monochrome MC Monogram inside badge
+        const fgColor = this.withAlpha(ink, 0.90 * alpha);
         ctx.strokeStyle = fgColor;
         ctx.lineWidth = 1.4;
         ctx.lineCap = 'round';
