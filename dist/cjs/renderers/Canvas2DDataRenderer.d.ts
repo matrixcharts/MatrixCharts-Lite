@@ -1,5 +1,6 @@
 import type { EventEmitter, ChartEvents } from '../core/EventEmitter.js';
 import type { IDataRenderer } from '../core/IDataRenderer.js';
+import type { OverlayType } from '../core/overlays.js';
 import type { ResolvedVolumeColors } from '../core/options.js';
 import type { CandleRenderSpec, Rgba } from './WebGL2Renderer.js';
 import type { VerticalTransform } from './WebGLSeries.js';
@@ -35,7 +36,7 @@ export declare class Canvas2DDataRenderer implements IDataRenderer {
     drawCandlesticks(candles: Float32Array, spec: CandleRenderSpec): void;
     clearCandlesticks(): void;
     retainOverlays(activeIds: ReadonlySet<string>): void;
-    drawOverlay(id: string, points: Float32Array, stride: 2 | 6, color: Rgba, vertical: VerticalTransform | null, pane?: number): void;
+    drawOverlay(id: string, points: Float32Array, stride: 2 | 6, color: Rgba, vertical: VerticalTransform | null, pane?: number, type?: OverlayType, baseline?: number, points2?: Float32Array | null, fillColor?: Rgba | null): void;
     drawLine(points: Float32Array, color: Rgba): void;
     clearLine(): void;
     drawArea(points: Float32Array, fill: Rgba): void;

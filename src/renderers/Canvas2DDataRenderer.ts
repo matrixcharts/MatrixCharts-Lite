@@ -1,5 +1,6 @@
 import type { EventEmitter, ChartEvents } from '../core/EventEmitter.js';
 import type { IDataRenderer } from '../core/IDataRenderer.js';
+import type { OverlayType } from '../core/overlays.js';
 import type { PlotRect } from '../core/coordinates.js';
 import type { PaneLayout } from '../core/panes.js';
 import type { ResolvedVolumeColors } from '../core/options.js';
@@ -30,7 +31,17 @@ export class Canvas2DDataRenderer implements IDataRenderer {
     private histogramOffsetY = 0;
     private histogramPane = 0;
     private panes: PaneLayout | null = null;
-    private overlays = new Map<string, { points: Float32Array; stride: 2 | 6; color: Rgba; vertical: VerticalTransform | null; pane: number }>();
+    private overlays = new Map<string, {
+        points: Float32Array;
+        stride: 2 | 6;
+        color: Rgba;
+        vertical: VerticalTransform | null;
+        pane: number;
+        type: OverlayType;
+        baseline: number;
+        points2: Float32Array | null;
+        fillColor: Rgba | null;
+    }>();
 
     public init(canvas: HTMLCanvasElement, emitter: EventEmitter<ChartEvents>): void {
         const context = canvas.getContext('2d');
@@ -89,8 +100,19 @@ export class Canvas2DDataRenderer implements IDataRenderer {
         for (const id of this.overlays.keys()) if (!activeIds.has(id)) this.overlays.delete(id);
     }
 
-    public drawOverlay(id: string, points: Float32Array, stride: 2 | 6, color: Rgba, vertical: VerticalTransform | null, pane = 0): void {
-        this.overlays.set(id, { points, stride, color, vertical, pane });
+    public drawOverlay(
+        id: string,
+        points: Float32Array,
+        stride: 2 | 6,
+        color: Rgba,
+        vertical: VerticalTransform | null,
+        pane = 0,
+        type: OverlayType = 'line',
+        baseline = 0,
+        points2: Float32Array | null = null,
+        fillColor: Rgba | null = null,
+    ): void {
+        this.overlays.set(id, { points, stride, color, vertical, pane, type, baseline, points2, fillColor });
     }
 
     public drawLine(points: Float32Array, color: Rgba): void { this.line = new Float32Array(points); this.lineColor = color; }
@@ -180,13 +202,72 @@ export class Canvas2DDataRenderer implements IDataRenderer {
     private renderOverlays(): void {
         for (const entry of this.overlays.values()) {
             if (entry.points.length < entry.stride * 2) continue;
-            this.ctx.strokeStyle = this.css(entry.color);
-            this.ctx.beginPath();
-            this.ctx.moveTo(this.x(entry.points[0]), this.y(entry.points[1], entry.vertical));
-            for (let offset = entry.stride; offset < entry.points.length; offset += entry.stride) {
-                this.ctx.lineTo(this.x(entry.points[offset]), this.y(entry.points[offset + 1], entry.vertical));
+            const type = entry.type ?? 'line';
+            if (type === 'histogram') {
+                const baseCoord = this.y(entry.baseline, entry.vertical);
+                for (let offset = 0; offset < entry.points.length; offset += entry.stride) {
+                    const x = this.x(entry.points[offset]);
+                    const yVal = this.y(entry.points[offset + 1], entry.vertical);
+                    const color = entry.stride === 6
+                        ? [entry.points[offset + 2], entry.points[offset + 3], entry.points[offset + 4], entry.points[offset + 5]] as Rgba
+                        : entry.color;
+                    this.ctx.fillStyle = this.css(color);
+                    const barWidth = Math.max(1, this.scaleX * 0.7);
+                    const top = Math.min(baseCoord, yVal);
+                    const height = Math.max(Math.abs(baseCoord - yVal), 1);
+                    this.ctx.fillRect(x - barWidth / 2, top, barWidth, height);
+                }
+            } else if (type === 'area') {
+                const baseCoord = this.y(entry.baseline, entry.vertical);
+                const firstX = this.x(entry.points[0]);
+                const last = entry.points.length - entry.stride;
+                const lastX = this.x(entry.points[last]);
+                this.ctx.fillStyle = this.css(entry.fillColor ?? [entry.color[0], entry.color[1], entry.color[2], entry.color[3] * 0.3]);
+                this.ctx.beginPath();
+                this.ctx.moveTo(firstX, baseCoord);
+                for (let offset = 0; offset < entry.points.length; offset += entry.stride) {
+                    this.ctx.lineTo(this.x(entry.points[offset]), this.y(entry.points[offset + 1], entry.vertical));
+                }
+                this.ctx.lineTo(lastX, baseCoord);
+                this.ctx.closePath();
+                this.ctx.fill();
+                this.ctx.strokeStyle = this.css(entry.color);
+                this.ctx.beginPath();
+                this.ctx.moveTo(firstX, this.y(entry.points[1], entry.vertical));
+                for (let offset = entry.stride; offset < entry.points.length; offset += entry.stride) {
+                    this.ctx.lineTo(this.x(entry.points[offset]), this.y(entry.points[offset + 1], entry.vertical));
+                }
+                this.ctx.stroke();
+            } else if (type === 'band' && entry.points2 && entry.points2.length >= 2) {
+                this.ctx.fillStyle = this.css(entry.fillColor ?? [entry.color[0], entry.color[1], entry.color[2], entry.color[3] * 0.25]);
+                this.ctx.beginPath();
+                this.ctx.moveTo(this.x(entry.points[0]), this.y(entry.points[1], entry.vertical));
+                for (let offset = entry.stride; offset < entry.points.length; offset += entry.stride) {
+                    this.ctx.lineTo(this.x(entry.points[offset]), this.y(entry.points[offset + 1], entry.vertical));
+                }
+                const p2 = entry.points2;
+                const p2Stride = p2.length % 6 === 0 && entry.stride === 6 ? 6 : 2;
+                for (let offset = p2.length - p2Stride; offset >= 0; offset -= p2Stride) {
+                    this.ctx.lineTo(this.x(p2[offset]), this.y(p2[offset + 1], entry.vertical));
+                }
+                this.ctx.closePath();
+                this.ctx.fill();
+                this.ctx.strokeStyle = this.css(entry.color);
+                this.ctx.beginPath();
+                this.ctx.moveTo(this.x(entry.points[0]), this.y(entry.points[1], entry.vertical));
+                for (let offset = entry.stride; offset < entry.points.length; offset += entry.stride) {
+                    this.ctx.lineTo(this.x(entry.points[offset]), this.y(entry.points[offset + 1], entry.vertical));
+                }
+                this.ctx.stroke();
+            } else {
+                this.ctx.strokeStyle = this.css(entry.color);
+                this.ctx.beginPath();
+                this.ctx.moveTo(this.x(entry.points[0]), this.y(entry.points[1], entry.vertical));
+                for (let offset = entry.stride; offset < entry.points.length; offset += entry.stride) {
+                    this.ctx.lineTo(this.x(entry.points[offset]), this.y(entry.points[offset + 1], entry.vertical));
+                }
+                this.ctx.stroke();
             }
-            this.ctx.stroke();
         }
     }
     private renderHistogram(): void {

@@ -19,6 +19,8 @@ export interface PriceFormatOptions {
     minMove?: number;
 }
 
+export type PriceAxisPosition = 'left' | 'right' | 'both';
+
 export interface LayoutOptions {
     /** Plot background. Also used for the chart container and label plates. */
     background?: string;
@@ -28,15 +30,24 @@ export interface LayoutOptions {
      * Width reserved for the price axis, in CSS pixels. Price labels are drawn in
      * this gutter, right-aligned against the plot, so no longer overlap a candle.
      *
-     * Additive in 1.x. Sized in CSS pixels rather than measured from the label
-     * text, because the widest label depends on the visible price range, which
-     * depends on the plot height, which depends on this width. The default fits a
-     * separated price of up to six digits with two decimals; widen it for
-     * instruments quoted with more digits or a longer grouping.
+     * Additive in 1.x. Sized in CSS pixels. When omitted or undefined, the gutter width
+     * is dynamically measured from actual formatted price labels.
      */
     priceAxisWidth?: number;
     /** Height reserved for the time axis, in CSS pixels. Additive in 1.x. */
     timeAxisHeight?: number;
+    /**
+     * Placement of the price axis gutter:
+     * - 'left': gutter on the left (classic/default)
+     * - 'right': gutter on the right (TradingView style)
+     * - 'both': gutters on both left and right
+     */
+    priceAxisPosition?: PriceAxisPosition;
+    /**
+     * When true or when priceAxisWidth is omitted, the gutter width is dynamically measured
+     * from label font, digits, and formatted decimal precision. Defaults to true.
+     */
+    autoPriceAxisWidth?: boolean;
 }
 
 export interface VolumeOptions {
@@ -276,6 +287,8 @@ export interface ResolvedLayout {
     textColor: string;
     priceAxisWidth: number;
     timeAxisHeight: number;
+    priceAxisPosition: PriceAxisPosition;
+    autoPriceAxisWidth: boolean;
 }
 export interface ResolvedGrid { vertLines: boolean; horzLines: boolean; color: string }
 
@@ -391,7 +404,7 @@ const BASE_DEFAULTS: Omit<ResolvedChartOptions, 'theme' | 'locale' | 'candlestic
 
 /** Colors and chrome seeded per theme. Explicit overrides are re-applied on top. */
 const THEME_PRESETS: Record<ChartTheme, {
-    layout: Omit<ResolvedLayout, 'priceAxisWidth' | 'timeAxisHeight'>;
+    layout: Omit<ResolvedLayout, 'priceAxisWidth' | 'timeAxisHeight' | 'priceAxisPosition' | 'autoPriceAxisWidth'>;
     /** Volume colours are theme colours, but visibility and height are not. */
     volume: { colors: { up: string; down: string } };
     grid: ResolvedGrid;
@@ -654,9 +667,50 @@ export function runtimeLocale(): string {
  * Default gutter sizes, in CSS pixels. Not theme-dependent: they are layout
  * metrics rather than colours, so a theme change must not resize the plot.
  */
+/**
+ * Calculates the dynamic price axis gutter width in CSS pixels based on
+ * the configured price precision, locale, font metrics, and sample price values.
+ */
+export function measureDynamicPriceAxisWidth(
+    precision: number = 2,
+    samplePrice: number = 100000,
+    locale: string = 'en-US',
+    ctx?: CanvasRenderingContext2D | null,
+): number {
+    let formatted: string;
+    try {
+        formatted = new Intl.NumberFormat(locale, {
+            minimumFractionDigits: precision,
+            maximumFractionDigits: precision,
+            useGrouping: true,
+        }).format(samplePrice);
+    } catch {
+        formatted = samplePrice.toFixed(precision);
+    }
+    let textWidth = 0;
+    if (ctx && typeof ctx.measureText === 'function') {
+        ctx.save();
+        ctx.font = '11px sans-serif';
+        textWidth = ctx.measureText(formatted).width;
+        ctx.restore();
+    }
+    if (!(textWidth > 0)) {
+        let w = 0;
+        for (const ch of formatted) {
+            if (ch === ',' || ch === '.') w += 3.5;
+            else if (ch >= '0' && ch <= '9') w += 6.8;
+            else w += 7.0;
+        }
+        textWidth = w;
+    }
+    return Math.max(50, Math.round(textWidth + 17));
+}
+
 const DEFAULT_LAYOUT_METRICS = {
     priceAxisWidth: 78,
     timeAxisHeight: 22,
+    priceAxisPosition: 'left' as const,
+    autoPriceAxisWidth: true,
 } as const;
 
 /**
@@ -895,6 +949,10 @@ export function resolveOptions(partial: ChartOptions, fallbackTheme: ChartTheme 
                 layout.priceAxisWidth,
                 'layout.priceAxisWidth',
             );
+            resolved.layout.autoPriceAxisWidth = false;
+        }
+        if (layout.autoPriceAxisWidth !== undefined) {
+            resolved.layout.autoPriceAxisWidth = requireBoolean(layout.autoPriceAxisWidth, 'layout.autoPriceAxisWidth');
         }
         if (layout.timeAxisHeight !== undefined) {
             resolved.layout.timeAxisHeight = requireNonNegativeNumber(
@@ -902,6 +960,20 @@ export function resolveOptions(partial: ChartOptions, fallbackTheme: ChartTheme 
                 'layout.timeAxisHeight',
             );
         }
+        if (layout.priceAxisPosition !== undefined) {
+            if (layout.priceAxisPosition !== 'left' && layout.priceAxisPosition !== 'right' && layout.priceAxisPosition !== 'both') {
+                fail(`layout.priceAxisPosition must be 'left', 'right', or 'both'; received ${JSON.stringify(layout.priceAxisPosition)}.`);
+            }
+            resolved.layout.priceAxisPosition = layout.priceAxisPosition;
+        }
+    }
+
+    if (resolved.layout.autoPriceAxisWidth && partial.layout?.priceAxisWidth === undefined) {
+        resolved.layout.priceAxisWidth = measureDynamicPriceAxisWidth(
+            resolved.priceFormat.precision,
+            100000,
+            resolved.locale,
+        );
     }
 
     if (partial.grid !== undefined) {

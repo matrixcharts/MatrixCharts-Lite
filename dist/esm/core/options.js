@@ -267,9 +267,48 @@ export function runtimeLocale() {
  * Default gutter sizes, in CSS pixels. Not theme-dependent: they are layout
  * metrics rather than colours, so a theme change must not resize the plot.
  */
+/**
+ * Calculates the dynamic price axis gutter width in CSS pixels based on
+ * the configured price precision, locale, font metrics, and sample price values.
+ */
+export function measureDynamicPriceAxisWidth(precision = 2, samplePrice = 100000, locale = 'en-US', ctx) {
+    let formatted;
+    try {
+        formatted = new Intl.NumberFormat(locale, {
+            minimumFractionDigits: precision,
+            maximumFractionDigits: precision,
+            useGrouping: true,
+        }).format(samplePrice);
+    }
+    catch {
+        formatted = samplePrice.toFixed(precision);
+    }
+    let textWidth = 0;
+    if (ctx && typeof ctx.measureText === 'function') {
+        ctx.save();
+        ctx.font = '11px sans-serif';
+        textWidth = ctx.measureText(formatted).width;
+        ctx.restore();
+    }
+    if (!(textWidth > 0)) {
+        let w = 0;
+        for (const ch of formatted) {
+            if (ch === ',' || ch === '.')
+                w += 3.5;
+            else if (ch >= '0' && ch <= '9')
+                w += 6.8;
+            else
+                w += 7.0;
+        }
+        textWidth = w;
+    }
+    return Math.max(50, Math.round(textWidth + 17));
+}
 const DEFAULT_LAYOUT_METRICS = {
     priceAxisWidth: 78,
     timeAxisHeight: 22,
+    priceAxisPosition: 'left',
+    autoPriceAxisWidth: true,
 };
 /**
  * Volume defaults that are not theme colours. The histogram is off by default,
@@ -477,10 +516,23 @@ export function resolveOptions(partial, fallbackTheme = 'dark') {
             resolved.layout.textColor = requireColor(layout.textColor, 'layout.textColor');
         if (layout.priceAxisWidth !== undefined) {
             resolved.layout.priceAxisWidth = requireNonNegativeNumber(layout.priceAxisWidth, 'layout.priceAxisWidth');
+            resolved.layout.autoPriceAxisWidth = false;
+        }
+        if (layout.autoPriceAxisWidth !== undefined) {
+            resolved.layout.autoPriceAxisWidth = requireBoolean(layout.autoPriceAxisWidth, 'layout.autoPriceAxisWidth');
         }
         if (layout.timeAxisHeight !== undefined) {
             resolved.layout.timeAxisHeight = requireNonNegativeNumber(layout.timeAxisHeight, 'layout.timeAxisHeight');
         }
+        if (layout.priceAxisPosition !== undefined) {
+            if (layout.priceAxisPosition !== 'left' && layout.priceAxisPosition !== 'right' && layout.priceAxisPosition !== 'both') {
+                fail(`layout.priceAxisPosition must be 'left', 'right', or 'both'; received ${JSON.stringify(layout.priceAxisPosition)}.`);
+            }
+            resolved.layout.priceAxisPosition = layout.priceAxisPosition;
+        }
+    }
+    if (resolved.layout.autoPriceAxisWidth && partial.layout?.priceAxisWidth === undefined) {
+        resolved.layout.priceAxisWidth = measureDynamicPriceAxisWidth(resolved.priceFormat.precision, 100000, resolved.locale);
     }
     if (partial.grid !== undefined) {
         const grid = requirePlainObject(partial.grid, 'grid');

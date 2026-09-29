@@ -7,6 +7,7 @@ export type {
     CrosshairOptions,
     GridOptions,
     LayoutOptions,
+    PriceAxisPosition,
     PanesOptions,
     PriceFormatOptions,
     ResolvedChartOptions,
@@ -57,7 +58,7 @@ export type { OverlayPainter, PaintContext } from './core/paint.js';
 export type { PointerClaim, PointerClaimHandler } from './core/paint.js';
 export { ChartSyncGroup } from './core/ChartSyncGroup.js';
 export type { ChartSyncOptions } from './core/ChartSyncGroup.js';
-export type { OverlayPoint, OverlaySpec } from './core/overlays.js';
+export type { OverlayPoint, OverlaySpec, OverlayType } from './core/overlays.js';
 export type {
     MarkerPosition,
     MarkerShape,

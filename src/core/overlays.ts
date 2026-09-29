@@ -12,11 +12,15 @@
 import type { Rgba } from './options.js';
 import { PRICE_PANE } from './panes.js';
 
+export type OverlayType = 'line' | 'histogram' | 'band' | 'area';
+
 /** One value at one candle timestamp. */
 export interface OverlayPoint {
     /** Unix timestamp in milliseconds. Must match a candle timestamp exactly. */
     time: number;
     value: number;
+    /** Optional secondary value for band / cloud fill overlays. */
+    value2?: number;
     /**
      * CSS colour for this point, overriding the overlay's own colour. Lets a
      * single overlay change colour along its length — a MACD histogram signed by
@@ -36,14 +40,22 @@ export interface OverlaySpec {
     visible?: boolean;
     /**
      * Which pane to draw on. 0, the price pane, is the default and always exists.
-     *
-     * A higher index is for values that do not measure price — an RSI, a MACD
-     * histogram — which would otherwise be squashed into the price range. The pane
-     * must exist: it is created by declaring `panes.weights`, so naming an index
-     * that was never declared is rejected rather than quietly drawn on the wrong
-     * one.
      */
     pane?: number;
+    /**
+     * Rendering mode for this overlay:
+     * - 'line': continuous polyline (default)
+     * - 'histogram': vertical bars from baseline to value (e.g. MACD histogram)
+     * - 'band': filled cloud between value and value2 (or points and points2)
+     * - 'area': filled polygon between baseline and value
+     */
+    type?: OverlayType;
+    /** Reference baseline value for histogram or area fills (default 0). */
+    baseline?: number;
+    /** Secondary point series for band / cloud fill. */
+    points2?: readonly OverlayPoint[];
+    /** Fill colour for area or band. When omitted, overlay colour with alpha is used. */
+    fillColor?: string;
 }
 
 /** An overlay after validation: colour resolved, values aligned to candle ordinals. */
@@ -53,39 +65,19 @@ export interface ResolvedOverlay {
     color: Rgba;
     /** Pane this overlay is drawn on, already checked against the pane count. */
     pane: number;
-    /**
-     * One value per retained candle, indexed by candle ordinal. A timestamp that
-     * matched no candle is rejected rather than skipped, so this array is always
-     * the same length as the candle count and index `i` always means candle `i`.
-     * Ordinals outside `firstIndex`..`lastIndex` hold 0 and are never drawn.
-     *
-     * `length` is **capacity**, not the candle count. It is over-allocated so that a
-     * live feed can append a value per tick without reallocating the buffer on every
-     * bar, and a caller must never read past the candle count it was told about. The
-     * bucket reduction and the value read both take the count as an argument for that
-     * reason.
-     */
+    /** Overlay rendering mode: 'line' | 'histogram' | 'band' | 'area'. */
+    type: OverlayType;
+    /** Reference baseline value for histogram / area. */
+    baseline: number;
+    /** Primary values buffer indexed by candle ordinal. */
     values: Float32Array;
-    /**
-     * First and last ordinal the indicator actually covers, or -1 when it covers
-     * none.
-     *
-     * This matters more than it looks. Most indicators have a warm-up and emit
-     * nothing until they have enough history — a 21-period EMA over 1000 bars
-     * starts at bar 20. Treating the uncovered leading bars as zero would draw a
-     * line from price zero up to the first real value, which is the single most
-     * destructive thing an overlay could do to a chart.
-     */
+    /** Secondary values buffer for band fills, or null if not a band. */
+    values2: Float32Array | null;
     firstIndex: number;
     lastIndex: number;
-    /**
-     * Per-ordinal RGBA, or `null` when every point shares the overlay's colour.
-     *
-     * The common case is a whole overlay in one colour, and paying four floats per
-     * ordinal for that on every frame would be waste, so the uniform case stays
-     * `null` and the renderer expands the single colour itself.
-     */
     pointColors: Float32Array | null;
+    /** Resolved fill colour for area or band, or null for default derived colour. */
+    fillColor: Rgba | null;
 }
 
 function fail(message: string): never {
@@ -140,18 +132,27 @@ export function resolveOverlays(
             );
         }
         const values = new Float32Array(candleTimes.length);
+        const type: OverlayType = spec.type ?? 'line';
+        if (type !== 'line' && type !== 'histogram' && type !== 'band' && type !== 'area') {
+            fail(`Overlay ${JSON.stringify(spec.id)} has unknown type ${JSON.stringify(type)}.`);
+        }
+        const baseline: number = typeof spec.baseline === 'number' && Number.isFinite(spec.baseline) ? spec.baseline : 0;
+        const fillColor: Rgba | null = spec.fillColor !== undefined ? resolvePointColor(spec, spec.fillColor) : null;
+
         if (spec.points.length === 0) {
-            // Kept, but with nothing to draw. Not an error: an indicator that has
-            // not produced a value yet is a normal state, not a malformed series.
             resolved.push({
                 id: spec.id,
                 visible: spec.visible !== false && spec.points.length > 0,
                 color: resolveColor(spec),
                 pane,
+                type,
+                baseline,
                 values,
+                values2: null,
                 firstIndex: -1,
                 lastIndex: -1,
                 pointColors: null,
+                fillColor,
             });
             continue;
         }
@@ -199,15 +200,50 @@ export function resolveOverlays(
             lastIndex = ordinal;
         }
 
+        let values2: Float32Array | null = null;
+        if (Array.isArray(spec.points2)) {
+            values2 = new Float32Array(candleTimes.length);
+            for (let i = 0; i < spec.points2.length; i++) {
+                const pt = spec.points2[i];
+                if (typeof pt === 'object' && pt !== null && Number.isFinite(pt.time) && Number.isFinite(pt.value)) {
+                    const ord = indexOfTime(candleTimes, pt.time);
+                    if (ord >= 0) values2[ord] = pt.value;
+                }
+            }
+        } else {
+            // Check if any point has value2
+            let hasValue2 = false;
+            for (let i = 0; i < spec.points.length; i++) {
+                if (typeof spec.points[i].value2 === 'number' && Number.isFinite(spec.points[i].value2)) {
+                    hasValue2 = true;
+                    break;
+                }
+            }
+            if (hasValue2) {
+                values2 = new Float32Array(candleTimes.length);
+                for (let i = 0; i < spec.points.length; i++) {
+                    const pt = spec.points[i];
+                    if (typeof pt.value2 === 'number' && Number.isFinite(pt.value2)) {
+                        const ord = indexOfTime(candleTimes, pt.time);
+                        if (ord >= 0) values2[ord] = pt.value2;
+                    }
+                }
+            }
+        }
+
         resolved.push({
             id: spec.id,
             visible: spec.visible !== false,
             color: resolveColor(spec),
             pane,
+            type,
+            baseline,
             values,
+            values2,
             firstIndex,
             lastIndex,
             pointColors,
+            fillColor,
         });
     }
 
@@ -248,6 +284,11 @@ export function growOverlayValues(overlay: ResolvedOverlay, required: number): v
         const colors = new Float32Array(capacity * 4);
         colors.set(overlay.pointColors);
         overlay.pointColors = colors;
+    }
+    if (overlay.values2 !== null) {
+        const v2 = new Float32Array(capacity);
+        v2.set(overlay.values2);
+        overlay.values2 = v2;
     }
 }
 
@@ -310,6 +351,9 @@ export function trimOverlayStart(overlay: ResolvedOverlay, count: number): void 
         overlay.values.copyWithin(0, count);
         if (overlay.pointColors !== null) {
             overlay.pointColors.copyWithin(0, count * 4);
+        }
+        if (overlay.values2 !== null) {
+            overlay.values2.copyWithin(0, count);
         }
     }
     if (overlay.firstIndex >= 0) {

@@ -26,7 +26,7 @@ import type {
     ResolvedPanes,
     Rgba,
 } from './options.js';
-import { mergeOptionPartials, parseCssColor, resolveCandleColors, resolveOptions } from './options.js';
+import { measureDynamicPriceAxisWidth, mergeOptionPartials, parseCssColor, resolveCandleColors, resolveOptions } from './options.js';
 import { createRenderer } from './rendererFactory.js';
 import type { IDataRenderer } from './IDataRenderer.js';
 import { Canvas2DDataRenderer } from '../renderers/Canvas2DDataRenderer.js';
@@ -802,10 +802,17 @@ export class Chart {
      * chart.
      */
     private isInPriceAxisGutter(clientX: number): boolean {
-        const width: number = this.resolvedOptions.layout.priceAxisWidth;
-        if (!(width > 0)) return false;
+        const { priceAxisWidth, priceAxisPosition = 'left' } = this.resolvedOptions.layout;
+        if (!(priceAxisWidth > 0)) return false;
         const rect: DOMRect = this.canvasWrapper.getBoundingClientRect();
-        return clientX - rect.left < width;
+        const relX = clientX - rect.left;
+        if (priceAxisPosition === 'right') {
+            return relX >= rect.width - priceAxisWidth && relX <= rect.width;
+        }
+        if (priceAxisPosition === 'both') {
+            return (relX >= 0 && relX < priceAxisWidth) || (relX >= rect.width - priceAxisWidth && relX <= rect.width);
+        }
+        return relX >= 0 && relX < priceAxisWidth;
     }
 
     /**
@@ -1642,10 +1649,21 @@ export class Chart {
      * every reported range meaningless.
      */
     private plotRect(cssWidth: number, cssHeight: number): PlotRect {
-        const { priceAxisWidth, timeAxisHeight } = this.resolvedOptions.layout;
-        const width: number = Math.max(0, cssWidth - priceAxisWidth);
+        const { priceAxisWidth, timeAxisHeight, priceAxisPosition = 'left' } = this.resolvedOptions.layout;
+        let x = 0;
+        let width = cssWidth;
+        if (priceAxisPosition === 'right') {
+            x = 0;
+            width = Math.max(0, cssWidth - priceAxisWidth);
+        } else if (priceAxisPosition === 'both') {
+            x = priceAxisWidth;
+            width = Math.max(0, cssWidth - 2 * priceAxisWidth);
+        } else {
+            x = priceAxisWidth;
+            width = Math.max(0, cssWidth - priceAxisWidth);
+        }
         const height: number = Math.max(0, cssHeight - timeAxisHeight);
-        return { x: priceAxisWidth, y: 0, width, height };
+        return { x, y: 0, width, height };
     }
 
     /**
@@ -3035,24 +3053,51 @@ export class Chart {
      *
      * @param pane Optional pane index, for geometry anchored in a sub-pane's units.
      */
+    /**
+     * Returns the currently resolved price axis width in CSS pixels.
+     */
+    public getPriceAxisWidth(): number {
+        this.assertAlive();
+        return this.resolvedOptions.layout.priceAxisWidth;
+    }
+
+    /**
+     * Dynamically measures the required price axis gutter width from actual price digits,
+     * decimals, and font metrics.
+     */
+    public measurePriceAxisWidth(samplePrice?: number): number {
+        this.assertAlive();
+        const sample = samplePrice ?? (this.lastPrice()?.price ?? 100000);
+        return measureDynamicPriceAxisWidth(
+            this.resolvedOptions.priceFormat.precision,
+            sample,
+            this.resolvedOptions.locale,
+            this.uiRenderer ? (this.uiRenderer as any).ctx : null,
+        );
+    }
+
+    /**
+     * Re-measures dynamic gutter width and updates layout if changed.
+     */
+    public updateDynamicPriceAxisWidth(samplePrice?: number): void {
+        this.assertAlive();
+        if (!this.resolvedOptions.layout.autoPriceAxisWidth) return;
+        const width = this.measurePriceAxisWidth(samplePrice);
+        if (width !== this.resolvedOptions.layout.priceAxisWidth) {
+            this.resolvedOptions.layout.priceAxisWidth = width;
+            this.syncRendererSize();
+        }
+    }
+
     public drawingProjector(pane: number = PRICE_PANE): DrawPointProjector {
         this.assertAlive();
         const index: number = this.assertPaneExists(pane, 'drawingProjector');
-        // Resolved once, not per call: a projector runs once per anchor per hit
-        // test, and re-resolving the rect and transform on each of those would be
-        // the dominant cost of a hit test at a realistic drawing count.
-        const transform: VerticalTransform = this.paneTransform(index)!;
         return (point: DrawingPoint): { x: number; y: number } | null => {
             const x: number | null = this.timeToCoordinateUnchecked(point.time);
             if (x === null) return null;
-            // Pane 0 is drawn on the price scale, so on a log chart a raw price has
-            // to be converted before it meets the transform. The same conversion
-            // `priceToCoordinate` performs, taken through the pane's own path.
-            // `offsetY` is already absolute — `fitPaneTransform` folds the rect's
-            // origin into it — so this is the exact inverse of `paneValueAt`.
-            const scaled: number = index === PRICE_PANE
-                ? toScaleSpace(point.value, this.priceScale())
-                : point.value;
+            const transform: VerticalTransform | null = this.paneTransform(index);
+            if (!transform || transform.scaleY === 0) return null;
+            const scaled: number = this.paneValueToScale(index, point.value);
             return { x, y: scaled * transform.scaleY + transform.offsetY };
         };
     }
@@ -3128,19 +3173,55 @@ export class Chart {
     public drawingUnprojector(pane: number = PRICE_PANE): (x: number, y: number) => DrawingPoint {
         this.assertAlive();
         const index: number = this.assertPaneExists(pane, 'drawingUnprojector');
-        const transform: VerticalTransform = this.paneTransform(index)!;
         return (x: number, y: number): DrawingPoint => {
-            // Nearest real candle, so an anchor is always a timestamp the chart can
-            // re-project after a pan. An interpolated time would be a drawing the
-            // engine cannot place again — the same defect a fib's interpolated
-            // levels had.
             const time: number = this.coordinateToTimeUnchecked(x);
+            const transform: VerticalTransform | null = this.paneTransform(index);
+            if (!transform || transform.scaleY === 0) return { time, value: 0 };
             const scaled: number = paneValueAt(transform, y);
-            const value: number = index === PRICE_PANE
-                ? fromScaleSpace(scaled, this.priceScale())
-                : scaled;
+            const value: number = this.paneScaleToValue(index, scaled);
             return { time, value };
         };
+    }
+
+    /**
+     * Projects a screen point (x, y) back to data coordinates for any pane
+     * (Pane 0 = price, Panes 1..N = subpanes with local bounds).
+     */
+    public toData(x: number, y: number, pane: number = PRICE_PANE): DrawingPoint {
+        this.assertAlive();
+        return this.drawingUnprojector(pane)(x, y);
+    }
+
+    /**
+     * Projects a data point (time, value) to screen coordinates for any pane.
+     */
+    public toScreen(point: DrawingPoint, pane: number = PRICE_PANE): { x: number; y: number } | null {
+        this.assertAlive();
+        return this.drawingProjector(pane)(point);
+    }
+
+    /**
+     * Converts a screen y coordinate to a value within the specified pane.
+     */
+    public coordinateToPaneValue(pane: number, coordinateY: number): number | null {
+        this.assertAlive();
+        const index: number = this.assertPaneExists(pane, 'coordinateToPaneValue');
+        const transform: VerticalTransform | null = this.paneTransform(index);
+        if (!transform || transform.scaleY === 0) return null;
+        const scaled: number = paneValueAt(transform, coordinateY);
+        return this.paneScaleToValue(index, scaled);
+    }
+
+    /**
+     * Converts a value within the specified pane to a screen y coordinate.
+     */
+    public paneValueToCoordinate(pane: number, value: number): number | null {
+        this.assertAlive();
+        const index: number = this.assertPaneExists(pane, 'paneValueToCoordinate');
+        const transform: VerticalTransform | null = this.paneTransform(index);
+        if (!transform || transform.scaleY === 0) return null;
+        const scaled: number = this.paneValueToScale(index, value);
+        return scaled * transform.scaleY + transform.offsetY;
     }
 
     /**
@@ -4528,6 +4609,27 @@ export class Chart {
             // A pane below the price one has its own scale, so an overlay there is
             // read against its own axis rather than the price axis. Pane 0 passes
             // null and shares the price transform with the candles.
+            let points2: Float32Array | null = null;
+            if (overlay.values2 !== null) {
+                const bucketed2 = bucketOverlay(
+                    overlay.values2,
+                    factor,
+                    sourceCount,
+                    overlay.firstIndex,
+                    overlay.lastIndex,
+                    null,
+                    this.candlePyramid.getLevelBase(0),
+                    this.visibleFirstOrdinal,
+                    this.visibleLastOrdinal,
+                );
+                points2 = this.slotOverlayPoints(
+                    bucketed2.points,
+                    bucketed2.stride,
+                );
+            }
+            const baselineVal = overlay.pane === PRICE_PANE
+                ? toScaleSpace(overlay.baseline, this.priceScale())
+                : overlay.baseline;
             this.dataRenderer.drawOverlay(
                 overlay.id,
                 points,
@@ -4535,6 +4637,10 @@ export class Chart {
                 overlay.color,
                 overlay.pane === PRICE_PANE ? null : this.paneLayout.transforms[overlay.pane],
                 overlay.pane,
+                overlay.type,
+                baselineVal,
+                points2,
+                overlay.fillColor,
             );
         }
         this.dataRenderer.retainOverlays(active);

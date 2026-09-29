@@ -12,6 +12,7 @@ const {
     resolveCandleColors,
     resolveOptions,
     themeDefaults,
+    measureDynamicPriceAxisWidth,
 } = require('../.test-build/core/options.js');
 
 /**
@@ -480,4 +481,23 @@ test('setting a badge background without a text colour leaves the ink to be chos
     // And the theme leaves it unset too, which is what makes the promise above true.
     assert.equal(themeDefaults('dark').crosshair.readoutText[3], 0);
     assert.equal(themeDefaults('dark').candlestick.lastPriceTagText[3], 0);
+});
+
+test('layout.priceAxisPosition accepts left, right, both and rejects invalid strings', () => {
+    assert.equal(resolveOptions({ layout: { priceAxisPosition: 'left' } }).layout.priceAxisPosition, 'left');
+    assert.equal(resolveOptions({ layout: { priceAxisPosition: 'right' } }).layout.priceAxisPosition, 'right');
+    assert.equal(resolveOptions({ layout: { priceAxisPosition: 'both' } }).layout.priceAxisPosition, 'both');
+    throws(() => resolveOptions({ layout: { priceAxisPosition: 'middle' } }), /priceAxisPosition/);
+    throws(() => resolveOptions({ layout: { priceAxisPosition: 123 } }), /priceAxisPosition/);
+});
+
+test('measureDynamicPriceAxisWidth dynamically adapts to decimal precision and sample price', () => {
+    const width2 = measureDynamicPriceAxisWidth(2, 100000, 'en-US');
+    assert.equal(width2, 78);
+    const width0 = measureDynamicPriceAxisWidth(0, 100000, 'en-US');
+    assert.ok(width0 < width2);
+    assert.equal(width0, 61);
+    const width8 = measureDynamicPriceAxisWidth(8, 100000, 'en-US');
+    assert.ok(width8 > width2);
+    assert.equal(width8, 119);
 });

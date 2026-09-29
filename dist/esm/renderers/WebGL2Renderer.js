@@ -219,7 +219,7 @@ export class WebGL2Renderer {
      * frame, but their buffers are not, and recreating a vertex array per frame
      * per overlay is exactly the cost this design set out to avoid.
      */
-    drawOverlay(id, points, stride, color, vertical, pane = 0) {
+    drawOverlay(id, points, stride, color, vertical, pane = 0, type = 'line', baseline = 0, points2 = null, fillColor = null) {
         const gl = this.requireContext();
         let series = this.overlaySeries.get(id);
         if (!series) {
@@ -236,6 +236,194 @@ export class WebGL2Renderer {
         // over the pane above it.
         series.pane = pane;
         const pointCount = Math.floor(points.length / stride);
+        if (pointCount < 1) {
+            series.setPasses([]);
+            return;
+        }
+        if (type === 'histogram') {
+            const barCount = pointCount;
+            const vertices = new Float32Array(barCount * 6 * VERTEX_STRIDE);
+            const halfWidth = 0.35;
+            let target = 0;
+            for (let i = 0; i < barCount; i++) {
+                const src = i * stride;
+                const x = points[src];
+                const y = points[src + 1];
+                const hasOwn = stride === 6;
+                const r = hasOwn ? points[src + 2] : color[0];
+                const g = hasOwn ? points[src + 3] : color[1];
+                const b = hasOwn ? points[src + 4] : color[2];
+                const a = hasOwn ? points[src + 5] : color[3];
+                const x0 = x - halfWidth;
+                const x1 = x + halfWidth;
+                const y0 = baseline;
+                const y1 = y;
+                // Triangle 1: (x0, y0), (x1, y0), (x0, y1)
+                vertices[target++] = x0;
+                vertices[target++] = y0;
+                vertices[target++] = r;
+                vertices[target++] = g;
+                vertices[target++] = b;
+                vertices[target++] = a;
+                vertices[target++] = x1;
+                vertices[target++] = y0;
+                vertices[target++] = r;
+                vertices[target++] = g;
+                vertices[target++] = b;
+                vertices[target++] = a;
+                vertices[target++] = x0;
+                vertices[target++] = y1;
+                vertices[target++] = r;
+                vertices[target++] = g;
+                vertices[target++] = b;
+                vertices[target++] = a;
+                // Triangle 2: (x0, y1), (x1, y0), (x1, y1)
+                vertices[target++] = x0;
+                vertices[target++] = y1;
+                vertices[target++] = r;
+                vertices[target++] = g;
+                vertices[target++] = b;
+                vertices[target++] = a;
+                vertices[target++] = x1;
+                vertices[target++] = y0;
+                vertices[target++] = r;
+                vertices[target++] = g;
+                vertices[target++] = b;
+                vertices[target++] = a;
+                vertices[target++] = x1;
+                vertices[target++] = y1;
+                vertices[target++] = r;
+                vertices[target++] = g;
+                vertices[target++] = b;
+                vertices[target++] = a;
+            }
+            series.upload(vertices, null);
+            series.setPasses([{
+                    primitive: gl.TRIANGLES, count: barCount * 6, first: 0, indexed: false, snapOffset: 0,
+                }]);
+            return;
+        }
+        if (type === 'area' && pointCount >= 2) {
+            const segCount = pointCount - 1;
+            const vertices = new Float32Array(segCount * 6 * VERTEX_STRIDE);
+            const fill = fillColor ?? [color[0], color[1], color[2], color[3] * 0.3];
+            let target = 0;
+            for (let i = 0; i < segCount; i++) {
+                const s0 = i * stride;
+                const s1 = (i + 1) * stride;
+                const x0 = points[s0];
+                const y0 = points[s0 + 1];
+                const x1 = points[s1];
+                const y1 = points[s1 + 1];
+                // Triangle 1: (x0, baseline), (x1, baseline), (x0, y0)
+                vertices[target++] = x0;
+                vertices[target++] = baseline;
+                vertices[target++] = fill[0];
+                vertices[target++] = fill[1];
+                vertices[target++] = fill[2];
+                vertices[target++] = fill[3];
+                vertices[target++] = x1;
+                vertices[target++] = baseline;
+                vertices[target++] = fill[0];
+                vertices[target++] = fill[1];
+                vertices[target++] = fill[2];
+                vertices[target++] = fill[3];
+                vertices[target++] = x0;
+                vertices[target++] = y0;
+                vertices[target++] = fill[0];
+                vertices[target++] = fill[1];
+                vertices[target++] = fill[2];
+                vertices[target++] = fill[3];
+                // Triangle 2: (x0, y0), (x1, baseline), (x1, y1)
+                vertices[target++] = x0;
+                vertices[target++] = y0;
+                vertices[target++] = fill[0];
+                vertices[target++] = fill[1];
+                vertices[target++] = fill[2];
+                vertices[target++] = fill[3];
+                vertices[target++] = x1;
+                vertices[target++] = baseline;
+                vertices[target++] = fill[0];
+                vertices[target++] = fill[1];
+                vertices[target++] = fill[2];
+                vertices[target++] = fill[3];
+                vertices[target++] = x1;
+                vertices[target++] = y1;
+                vertices[target++] = fill[0];
+                vertices[target++] = fill[1];
+                vertices[target++] = fill[2];
+                vertices[target++] = fill[3];
+            }
+            series.upload(vertices, null);
+            series.setPasses([{
+                    primitive: gl.TRIANGLES, count: segCount * 6, first: 0, indexed: false, snapOffset: 0,
+                }]);
+            return;
+        }
+        if (type === 'band' && points2 && points2.length >= 2 && pointCount >= 2) {
+            const p2Stride = points2.length % 6 === 0 && stride === 6 ? 6 : 2;
+            const p2Count = Math.floor(points2.length / p2Stride);
+            const count = Math.min(pointCount, p2Count);
+            const segCount = count - 1;
+            const vertices = new Float32Array(segCount * 6 * VERTEX_STRIDE);
+            const fill = fillColor ?? [color[0], color[1], color[2], color[3] * 0.25];
+            let target = 0;
+            for (let i = 0; i < segCount; i++) {
+                const s0 = i * stride;
+                const s1 = (i + 1) * stride;
+                const p2s0 = i * p2Stride;
+                const p2s1 = (i + 1) * p2Stride;
+                const x0 = points[s0];
+                const y0_top = points[s0 + 1];
+                const x1 = points[s1];
+                const y1_top = points[s1 + 1];
+                const y0_bot = points2[p2s0 + 1];
+                const y1_bot = points2[p2s1 + 1];
+                // Triangle 1: (x0, y0_bot), (x1, y1_bot), (x0, y0_top)
+                vertices[target++] = x0;
+                vertices[target++] = y0_bot;
+                vertices[target++] = fill[0];
+                vertices[target++] = fill[1];
+                vertices[target++] = fill[2];
+                vertices[target++] = fill[3];
+                vertices[target++] = x1;
+                vertices[target++] = y1_bot;
+                vertices[target++] = fill[0];
+                vertices[target++] = fill[1];
+                vertices[target++] = fill[2];
+                vertices[target++] = fill[3];
+                vertices[target++] = x0;
+                vertices[target++] = y0_top;
+                vertices[target++] = fill[0];
+                vertices[target++] = fill[1];
+                vertices[target++] = fill[2];
+                vertices[target++] = fill[3];
+                // Triangle 2: (x0, y0_top), (x1, y1_bot), (x1, y1_top)
+                vertices[target++] = x0;
+                vertices[target++] = y0_top;
+                vertices[target++] = fill[0];
+                vertices[target++] = fill[1];
+                vertices[target++] = fill[2];
+                vertices[target++] = fill[3];
+                vertices[target++] = x1;
+                vertices[target++] = y1_bot;
+                vertices[target++] = fill[0];
+                vertices[target++] = fill[1];
+                vertices[target++] = fill[2];
+                vertices[target++] = fill[3];
+                vertices[target++] = x1;
+                vertices[target++] = y1_top;
+                vertices[target++] = fill[0];
+                vertices[target++] = fill[1];
+                vertices[target++] = fill[2];
+                vertices[target++] = fill[3];
+            }
+            series.upload(vertices, null);
+            series.setPasses([{
+                    primitive: gl.TRIANGLES, count: segCount * 6, first: 0, indexed: false, snapOffset: 0,
+                }]);
+            return;
+        }
         if (pointCount < 2) {
             series.setPasses([]);
             return;

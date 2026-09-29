@@ -450,3 +450,69 @@ test('a range on an empty chart changes nothing', () => {
         harness.dispose();
     }
 });
+
+test('priceAxisPosition configures plot rect placement and dimensions', () => {
+    const harnessRight = chart(100, { layout: { priceAxisPosition: 'right' } });
+    try {
+        const plot = harnessRight.chart.getPlotRect();
+        assert.equal(plot.x, 0, 'right-placed axis leaves plot at x=0');
+        assert.equal(plot.width, CSS_WIDTH - GUTTER, 'plot width is reduced by gutter on right');
+    } finally {
+        harnessRight.dispose();
+    }
+
+    const harnessBoth = chart(100, { layout: { priceAxisPosition: 'both' } });
+    try {
+        const plot = harnessBoth.chart.getPlotRect();
+        assert.equal(plot.x, GUTTER, 'both-placed axes start plot after left gutter');
+        assert.equal(plot.width, CSS_WIDTH - 2 * GUTTER, 'plot width is reduced by gutters on both sides');
+    } finally {
+        harnessBoth.dispose();
+    }
+});
+
+test('full multi-pane coordinate projection maps both pane 0 and indicator subpanes', () => {
+    const harness = chart(100, {
+        panes: { weights: [0.7, 0.3] },
+    });
+    try {
+        harness.chart.fitContent();
+        harness.chart.setPaneRange(1, [0, 100]);
+        harness.flush();
+
+        const c0 = harness.chart.getCandleAt(10);
+        assert.ok(c0 !== null);
+
+        // Pane 0 projections
+        const screen0 = harness.chart.toScreen({ time: c0.time, value: c0.close }, 0);
+        assert.ok(screen0 !== null);
+        assert.ok(screen0.x > 0);
+        assert.ok(Number.isFinite(screen0.x) && Number.isFinite(screen0.y));
+
+        const data0 = harness.chart.toData(screen0.x, screen0.y, 0);
+        assert.equal(data0.time, c0.time);
+        assert.ok(Math.abs(data0.value - c0.close) < 1e-3);
+
+        // Coordinate to pane value & back
+        const pVal0 = harness.chart.coordinateToPaneValue(0, screen0.y);
+        assert.ok(pVal0 !== null && Math.abs(pVal0 - c0.close) < 1e-3);
+        const coord0 = harness.chart.paneValueToCoordinate(0, pVal0);
+        assert.ok(coord0 !== null && Math.abs(coord0 - screen0.y) < 1e-3);
+
+        // Subpane 1 projections (value 50 in [0, 100] range lands in middle of pane 1)
+        const screen1 = harness.chart.toScreen({ time: c0.time, value: 50 }, 1);
+        assert.ok(screen1 !== null);
+        assert.ok(screen1.y > 400, 'lands inside pane 1 height rect');
+
+        const data1 = harness.chart.toData(screen1.x, screen1.y, 1);
+        assert.equal(data1.time, c0.time);
+        assert.ok(Math.abs(data1.value - 50) < 1e-2);
+
+        const pVal1 = harness.chart.coordinateToPaneValue(1, screen1.y);
+        assert.ok(pVal1 !== null && Math.abs(pVal1 - 50) < 1e-2);
+        const coord1 = harness.chart.paneValueToCoordinate(1, 50);
+        assert.ok(coord1 !== null && Math.abs(coord1 - screen1.y) < 1e-3);
+    } finally {
+        harness.dispose();
+    }
+});

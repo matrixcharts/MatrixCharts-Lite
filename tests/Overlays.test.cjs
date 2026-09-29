@@ -498,3 +498,32 @@ test('a trimmed series still buckets on the absolute grid', () => {
         assert.equal(xs[i], xs[i - 1] + 1, 'buckets are not contiguous');
     }
 });
+
+test('OverlaySpec supports type: line, histogram, band, area and baseline', () => {
+    const resolved = resolveOverlays([
+        { id: 'macd_hist', type: 'histogram', baseline: 0, points: points([1, -2, 3], 0) },
+        { id: 'bollinger_cloud', type: 'band', points: points([10, 11, 12], 0), points2: points([8, 9, 10], 0), fillColor: 'rgba(0, 100, 255, 0.2)' },
+        { id: 'rsi_area', type: 'area', baseline: 30, points: points([40, 50, 60], 0) },
+    ], times, color);
+
+    assert.equal(resolved.length, 3);
+    assert.equal(resolved[0].type, 'histogram');
+    assert.equal(resolved[0].baseline, 0);
+
+    assert.equal(resolved[1].type, 'band');
+    assert.ok(resolved[1].values2 !== null);
+    assert.equal(resolved[1].values2[0], 8);
+    assert.equal(resolved[1].values2[1], 9);
+    assert.equal(resolved[1].values2[2], 10);
+    assert.ok(resolved[1].fillColor !== null);
+
+    assert.equal(resolved[2].type, 'area');
+    assert.equal(resolved[2].baseline, 30);
+});
+
+test('OverlaySpec rejects invalid type string', () => {
+    throws(
+        () => resolveOverlays([{ id: 'bad', type: 'scatter', points: points([1], 0) }], times, color),
+        /unknown type/,
+    );
+});

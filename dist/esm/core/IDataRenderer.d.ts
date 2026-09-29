@@ -1,4 +1,5 @@
 import type { ResolvedVolumeColors } from './options.js';
+import type { OverlayType } from './overlays.js';
 import type { IRenderer } from './IRenderer.js';
 import type { VerticalTransform } from '../renderers/WebGLSeries.js';
 import type { CandleRenderSpec, Rgba } from '../renderers/WebGL2Renderer.js';
@@ -6,7 +7,7 @@ export interface IDataRenderer extends IRenderer {
     drawCandlesticks(candles: Float32Array, spec: CandleRenderSpec): void;
     clearCandlesticks(): void;
     retainOverlays(activeIds: ReadonlySet<string>): void;
-    drawOverlay(id: string, points: Float32Array, stride: 2 | 6, color: Rgba, vertical: VerticalTransform | null, pane?: number): void;
+    drawOverlay(id: string, points: Float32Array, stride: 2 | 6, color: Rgba, vertical: VerticalTransform | null, pane?: number, type?: OverlayType, baseline?: number, points2?: Float32Array | null, fillColor?: Rgba | null): void;
     drawLine(points: Float32Array, color: Rgba): void;
     clearLine(): void;
     drawArea(points: Float32Array, fill: Rgba, basePrice: number): void;

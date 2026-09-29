@@ -4,6 +4,19 @@ Notable changes to MatrixCharts, newest first. The frozen v1 public surface and
 its reasoning live in [docs/v1-contract.md](docs/v1-contract.md); this file
 records what moved and why, per release.
 
+## v1.2.3
+
+Released: 2026-09-29
+
+An additive core release providing configurable price axis placement, dynamic gutter width measurement, full multi-pane coordinate projections, and native histogram/area/band overlay rendering on WebGL2 and Canvas2D.
+
+### Added
+
+- **Configurable Price Axis Placement**: Added `layout.priceAxisPosition: 'left' | 'right' | 'both'`. Positions the price axis gutter, divider lines, tick marks, labels, last-price badges, price line tags, and crosshair badges to the left, right, or both sides of the chart.
+- **Dynamic Gutter Width Measurement**: Replaced rigid fixed gutters with dynamic width calculation based on font metrics, digits, and decimal precision (`measureDynamicPriceAxisWidth`), with automatic resize adjustment during data updates.
+- **Full Multi-Pane Coordinate Projection**: Upgraded `drawingProjector(pane)` and `drawingUnprojector(pane)` to project and unproject across both Pane 0 and Subpanes 1..N (RSI, MACD, etc.). Added public coordinate projection APIs: `toData(x, y, pane)`, `toScreen(point, pane)`, `coordinateToPaneValue(pane, y)`, and `paneValueToCoordinate(pane, value)`.
+- **Native Histogram & Area Overlays**: Extended `OverlaySpec` with `type: 'line' | 'histogram' | 'band' | 'area'`, `baseline`, `fillColor`, and `points2`/`value2` for cloud band fills. Implemented native WebGL2 instanced triangle/quad geometry batching and Canvas2D fallback rendering.
+
 ## v1.2.0
 
 Released: 2026-09-29

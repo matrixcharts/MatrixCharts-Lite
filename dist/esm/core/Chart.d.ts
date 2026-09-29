@@ -1084,6 +1084,19 @@ export declare class Chart {
      *
      * @param pane Optional pane index, for geometry anchored in a sub-pane's units.
      */
+    /**
+     * Returns the currently resolved price axis width in CSS pixels.
+     */
+    getPriceAxisWidth(): number;
+    /**
+     * Dynamically measures the required price axis gutter width from actual price digits,
+     * decimals, and font metrics.
+     */
+    measurePriceAxisWidth(samplePrice?: number): number;
+    /**
+     * Re-measures dynamic gutter width and updates layout if changed.
+     */
+    updateDynamicPriceAxisWidth(samplePrice?: number): void;
     drawingProjector(pane?: number): DrawPointProjector;
     /**
      * Registers a paint callback for content the engine does not own.
@@ -1131,6 +1144,26 @@ export declare class Chart {
      * @param pane Optional pane index, for geometry anchored in a sub-pane's units.
      */
     drawingUnprojector(pane?: number): (x: number, y: number) => DrawingPoint;
+    /**
+     * Projects a screen point (x, y) back to data coordinates for any pane
+     * (Pane 0 = price, Panes 1..N = subpanes with local bounds).
+     */
+    toData(x: number, y: number, pane?: number): DrawingPoint;
+    /**
+     * Projects a data point (time, value) to screen coordinates for any pane.
+     */
+    toScreen(point: DrawingPoint, pane?: number): {
+        x: number;
+        y: number;
+    } | null;
+    /**
+     * Converts a screen y coordinate to a value within the specified pane.
+     */
+    coordinateToPaneValue(pane: number, coordinateY: number): number | null;
+    /**
+     * Converts a value within the specified pane to a screen y coordinate.
+     */
+    paneValueToCoordinate(pane: number, value: number): number | null;
     /**
      * Validates a pane index for a geometry helper, and returns it.
      *

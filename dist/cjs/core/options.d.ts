@@ -5,6 +5,7 @@ export interface PriceFormatOptions {
     /** Smallest representable price step. Price ticks snap to a multiple of it. */
     minMove?: number;
 }
+export type PriceAxisPosition = 'left' | 'right' | 'both';
 export interface LayoutOptions {
     /** Plot background. Also used for the chart container and label plates. */
     background?: string;
@@ -14,15 +15,24 @@ export interface LayoutOptions {
      * Width reserved for the price axis, in CSS pixels. Price labels are drawn in
      * this gutter, right-aligned against the plot, so no longer overlap a candle.
      *
-     * Additive in 1.x. Sized in CSS pixels rather than measured from the label
-     * text, because the widest label depends on the visible price range, which
-     * depends on the plot height, which depends on this width. The default fits a
-     * separated price of up to six digits with two decimals; widen it for
-     * instruments quoted with more digits or a longer grouping.
+     * Additive in 1.x. Sized in CSS pixels. When omitted or undefined, the gutter width
+     * is dynamically measured from actual formatted price labels.
      */
     priceAxisWidth?: number;
     /** Height reserved for the time axis, in CSS pixels. Additive in 1.x. */
     timeAxisHeight?: number;
+    /**
+     * Placement of the price axis gutter:
+     * - 'left': gutter on the left (classic/default)
+     * - 'right': gutter on the right (TradingView style)
+     * - 'both': gutters on both left and right
+     */
+    priceAxisPosition?: PriceAxisPosition;
+    /**
+     * When true or when priceAxisWidth is omitted, the gutter width is dynamically measured
+     * from label font, digits, and formatted decimal precision. Defaults to true.
+     */
+    autoPriceAxisWidth?: boolean;
 }
 export interface VolumeOptions {
     /**
@@ -254,6 +264,8 @@ export interface ResolvedLayout {
     textColor: string;
     priceAxisWidth: number;
     timeAxisHeight: number;
+    priceAxisPosition: PriceAxisPosition;
+    autoPriceAxisWidth: boolean;
 }
 export interface ResolvedGrid {
     vertLines: boolean;
@@ -355,6 +367,15 @@ export declare function luminanceOf(rgba: readonly [number, number, number, numb
 export declare function contrastText(bgRgba: readonly [number, number, number, number]): readonly [number, number, number, number];
 export declare function priceLabelFormatter(locale: string, precision: number): Intl.NumberFormat;
 export declare function runtimeLocale(): string;
+/**
+ * Default gutter sizes, in CSS pixels. Not theme-dependent: they are layout
+ * metrics rather than colours, so a theme change must not resize the plot.
+ */
+/**
+ * Calculates the dynamic price axis gutter width in CSS pixels based on
+ * the configured price precision, locale, font metrics, and sample price values.
+ */
+export declare function measureDynamicPriceAxisWidth(precision?: number, samplePrice?: number, locale?: string, ctx?: CanvasRenderingContext2D | null): number;
 /** Preset-only snapshot for a theme, with no caller overrides applied. */
 export declare function themeDefaults(theme: ChartTheme): ResolvedChartOptions;
 /**

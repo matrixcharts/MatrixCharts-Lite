@@ -1,4 +1,5 @@
 import type { CandleStyle, ResolvedCandleColors, ResolvedVolumeColors } from '../core/options.js';
+import type { OverlayType } from '../core/overlays.js';
 import type { IDataRenderer } from '../core/IDataRenderer.js';
 import type { EventEmitter, ChartEvents } from '../core/EventEmitter.js';
 import { type VerticalTransform } from './WebGLSeries.js';
@@ -83,7 +84,7 @@ export declare class WebGL2Renderer implements IDataRenderer {
      * frame, but their buffers are not, and recreating a vertex array per frame
      * per overlay is exactly the cost this design set out to avoid.
      */
-    drawOverlay(id: string, points: Float32Array, stride: 2 | 6, color: Rgba, vertical: VerticalTransform | null, pane?: number): void;
+    drawOverlay(id: string, points: Float32Array, stride: 2 | 6, color: Rgba, vertical: VerticalTransform | null, pane?: number, type?: OverlayType, baseline?: number, points2?: Float32Array | null, fillColor?: Rgba | null): void;
     /**
      * Drops overlays that are no longer supplied, so removing one releases its
      * buffers instead of leaving an invisible series alive for the chart's life.

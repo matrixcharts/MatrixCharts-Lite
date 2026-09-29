@@ -703,7 +703,14 @@ export class Canvas2DRenderer {
             const text = this.options.crosshair.axisLabelText[3] === 0
                 ? contrastText(effectiveBg)
                 : this.options.crosshair.axisLabelText;
-            this.drawTag(this.formatAxisValue(this.crosshairValue), plot.x - 6, this.crosshairY, background, text, 'right');
+            const position = this.options.layout.priceAxisPosition ?? 'left';
+            const valFormatted = this.formatAxisValue(this.crosshairValue);
+            if (position === 'left' || position === 'both') {
+                this.drawTag(valFormatted, plot.x - 6, this.crosshairY, background, text, 'right');
+            }
+            if (position === 'right' || position === 'both') {
+                this.drawTag(valFormatted, plot.x + plot.width + 6, this.crosshairY, background, text, 'left');
+            }
         }
         const timeTag = this.crosshairTime === null
             ? null
@@ -734,9 +741,16 @@ export class Canvas2DRenderer {
         this.ctx.fillStyle = this.options.layout.textColor;
         this.ctx.strokeStyle = this.withAlpha(this.colors.grid, 0.38 / Math.max(this.colors.grid[3], 0.01));
         this.ctx.lineWidth = 1;
+        const position = this.options.layout.priceAxisPosition ?? 'left';
         this.ctx.beginPath();
-        this.ctx.moveTo(plot.x + 0.5, plot.y);
-        this.ctx.lineTo(plot.x + 0.5, plotBottom);
+        if (position === 'left' || position === 'both') {
+            this.ctx.moveTo(plot.x + 0.5, plot.y);
+            this.ctx.lineTo(plot.x + 0.5, plotBottom);
+        }
+        if (position === 'right' || position === 'both') {
+            this.ctx.moveTo(plotRight - 0.5, plot.y);
+            this.ctx.lineTo(plotRight - 0.5, plotBottom);
+        }
         this.ctx.moveTo(plot.x, plotBottom - 0.5);
         this.ctx.lineTo(plotRight, plotBottom - 0.5);
         this.ctx.stroke();
@@ -751,7 +765,13 @@ export class Canvas2DRenderer {
                 const index = labels.tickIndex.get(y);
                 if (index !== undefined && labels.keep[index] === false)
                     continue;
-                this.drawLabel(this.formatAxisValue(tick.price), plot.x - 6, y, 'right');
+                const formatted = this.formatAxisValue(tick.price);
+                if (position === 'left' || position === 'both') {
+                    this.drawLabel(formatted, plot.x - 6, y, 'right');
+                }
+                if (position === 'right' || position === 'both') {
+                    this.drawLabel(formatted, plotRight + 6, y, 'left');
+                }
             }
         }
         // Separators are drawn after the labels so a division reads as sitting on
@@ -890,7 +910,15 @@ export class Canvas2DRenderer {
             if (line.axisLabelVisible) {
                 const index = labels.lineIndex.get(y);
                 if (index === undefined || labels.keep[index]) {
-                    this.drawTag(this.formatAxisValue(line.price), plot.x - 6, crispY, line.axisLabelColor ?? line.color);
+                    const position = this.options.layout.priceAxisPosition ?? 'left';
+                    const formatted = this.formatAxisValue(line.price);
+                    const tagColor = line.axisLabelColor ?? line.color;
+                    if (position === 'left' || position === 'both') {
+                        this.drawTag(formatted, plot.x - 6, crispY, tagColor, undefined, 'right');
+                    }
+                    if (position === 'right' || position === 'both') {
+                        this.drawTag(formatted, plotRight + 6, crispY, tagColor, undefined, 'left');
+                    }
                 }
             }
         }
@@ -917,7 +945,14 @@ export class Canvas2DRenderer {
             this.ctx.lineTo(plotRight, crispY);
             this.ctx.stroke();
             this.ctx.restore();
-            this.drawTag(this.formatAxisValue(this.lastPrice.price), plot.x - 6, crispY, background, text);
+            const position = this.options.layout.priceAxisPosition ?? 'left';
+            const formatted = this.formatAxisValue(this.lastPrice.price);
+            if (position === 'left' || position === 'both') {
+                this.drawTag(formatted, plot.x - 6, crispY, background, text, 'right');
+            }
+            if (position === 'right' || position === 'both') {
+                this.drawTag(formatted, plotRight + 6, crispY, background, text, 'left');
+            }
         }
     }
     /**

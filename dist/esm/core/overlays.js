@@ -48,18 +48,26 @@ export function resolveOverlays(specs, candleTimes, resolveColor, resolvePointCo
                 + 'declaring panes.weights, one entry per pane.');
         }
         const values = new Float32Array(candleTimes.length);
+        const type = spec.type ?? 'line';
+        if (type !== 'line' && type !== 'histogram' && type !== 'band' && type !== 'area') {
+            fail(`Overlay ${JSON.stringify(spec.id)} has unknown type ${JSON.stringify(type)}.`);
+        }
+        const baseline = typeof spec.baseline === 'number' && Number.isFinite(spec.baseline) ? spec.baseline : 0;
+        const fillColor = spec.fillColor !== undefined ? resolvePointColor(spec, spec.fillColor) : null;
         if (spec.points.length === 0) {
-            // Kept, but with nothing to draw. Not an error: an indicator that has
-            // not produced a value yet is a normal state, not a malformed series.
             resolved.push({
                 id: spec.id,
                 visible: spec.visible !== false && spec.points.length > 0,
                 color: resolveColor(spec),
                 pane,
+                type,
+                baseline,
                 values,
+                values2: null,
                 firstIndex: -1,
                 lastIndex: -1,
                 pointColors: null,
+                fillColor,
             });
             continue;
         }
@@ -102,15 +110,52 @@ export function resolveOverlays(specs, candleTimes, resolveColor, resolvePointCo
                 firstIndex = ordinal;
             lastIndex = ordinal;
         }
+        let values2 = null;
+        if (Array.isArray(spec.points2)) {
+            values2 = new Float32Array(candleTimes.length);
+            for (let i = 0; i < spec.points2.length; i++) {
+                const pt = spec.points2[i];
+                if (typeof pt === 'object' && pt !== null && Number.isFinite(pt.time) && Number.isFinite(pt.value)) {
+                    const ord = indexOfTime(candleTimes, pt.time);
+                    if (ord >= 0)
+                        values2[ord] = pt.value;
+                }
+            }
+        }
+        else {
+            // Check if any point has value2
+            let hasValue2 = false;
+            for (let i = 0; i < spec.points.length; i++) {
+                if (typeof spec.points[i].value2 === 'number' && Number.isFinite(spec.points[i].value2)) {
+                    hasValue2 = true;
+                    break;
+                }
+            }
+            if (hasValue2) {
+                values2 = new Float32Array(candleTimes.length);
+                for (let i = 0; i < spec.points.length; i++) {
+                    const pt = spec.points[i];
+                    if (typeof pt.value2 === 'number' && Number.isFinite(pt.value2)) {
+                        const ord = indexOfTime(candleTimes, pt.time);
+                        if (ord >= 0)
+                            values2[ord] = pt.value2;
+                    }
+                }
+            }
+        }
         resolved.push({
             id: spec.id,
             visible: spec.visible !== false,
             color: resolveColor(spec),
             pane,
+            type,
+            baseline,
             values,
+            values2,
             firstIndex,
             lastIndex,
             pointColors,
+            fillColor,
         });
     }
     return resolved;
@@ -152,6 +197,11 @@ export function growOverlayValues(overlay, required) {
         const colors = new Float32Array(capacity * 4);
         colors.set(overlay.pointColors);
         overlay.pointColors = colors;
+    }
+    if (overlay.values2 !== null) {
+        const v2 = new Float32Array(capacity);
+        v2.set(overlay.values2);
+        overlay.values2 = v2;
     }
 }
 /**
@@ -211,6 +261,9 @@ export function trimOverlayStart(overlay, count) {
         overlay.values.copyWithin(0, count);
         if (overlay.pointColors !== null) {
             overlay.pointColors.copyWithin(0, count * 4);
+        }
+        if (overlay.values2 !== null) {
+            overlay.values2.copyWithin(0, count);
         }
     }
     if (overlay.firstIndex >= 0) {

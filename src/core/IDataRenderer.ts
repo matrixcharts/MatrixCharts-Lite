@@ -20,6 +20,7 @@
 // can name this type; it exists so `WebGL2Renderer` and a test double are held to the
 // same shape.
 import type { ResolvedVolumeColors } from './options.js';
+import type { OverlayType } from './overlays.js';
 import type { IRenderer } from './IRenderer.js';
 import type { VerticalTransform } from '../renderers/WebGLSeries.js';
 import type { CandleRenderSpec, Rgba } from '../renderers/WebGL2Renderer.js';
@@ -36,6 +37,10 @@ export interface IDataRenderer extends IRenderer {
         color: Rgba,
         vertical: VerticalTransform | null,
         pane?: number,
+        type?: OverlayType,
+        baseline?: number,
+        points2?: Float32Array | null,
+        fillColor?: Rgba | null,
     ): void;
 
     drawLine(points: Float32Array, color: Rgba): void;
