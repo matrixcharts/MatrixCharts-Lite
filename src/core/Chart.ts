@@ -755,7 +755,7 @@ export class Chart {
             } else {
                 this.priceAxisDrag = null;
                 const rect = this.canvasWrapper.getBoundingClientRect();
-                const separatorIndex = this.separatorAtRow(event.clientY - rect.top);
+                const separatorIndex = this.separatorAtRow(event.clientY - rect.top, 2);
                 if (separatorIndex !== null) {
                     this.paneSeparatorDrag = {
                         index: separatorIndex,
@@ -854,7 +854,7 @@ export class Chart {
      * the caller's double-click another, and the two would disagree on exactly the
      * pixels nobody tested.
      */
-    private separatorAtRow(y: number): number | null {
+    private separatorAtRow(y: number, slop: number = 0): number | null {
         const rects: PlotRect[] = this.paneRects;
         const separatorHeight: number = this.resolvedOptions.panes.separatorHeight;
         if (!(separatorHeight > 0)) return null;
@@ -862,7 +862,7 @@ export class Chart {
             const pane = rects[i];
             const sepTop = pane.y + pane.height;
             const sepBottom = sepTop + separatorHeight;
-            if (y >= sepTop - 3 && y <= sepBottom + 3) return i;
+            if (y >= sepTop - slop && y < sepBottom + slop) return i;
         }
         return null;
     }
@@ -1312,6 +1312,9 @@ export class Chart {
         if (nextPaneCount !== previous.panes.weights.length) {
             for (const index of Array.from(this.lockedPaneRanges.keys())) {
                 if (index >= nextPaneCount) this.lockedPaneRanges.delete(index);
+            }
+            if (this.resolvedOptions.volume.pane >= nextPaneCount) {
+                this.resolvedOptions.volume.pane = 0;
             }
         }
 
@@ -3990,6 +3993,15 @@ export class Chart {
             }
             let minimum: number = Number.POSITIVE_INFINITY;
             let maximum: number = Number.NEGATIVE_INFINITY;
+            const isVolumePane = this.resolvedOptions.volume.visible && this.resolvedOptions.volume.pane === index;
+            if (isVolumePane) {
+                minimum = 0;
+                const count: number = this.displayedCandles.length / CANDLE_STRIDE;
+                for (let i = 0; i < count; i++) {
+                    const value: number = this.displayedCandles[i * CANDLE_STRIDE + CANDLE_VOLUME];
+                    if (value > maximum) maximum = value;
+                }
+            }
             for (const overlay of this.overlays) {
                 if (!overlay.visible || overlay.pane !== index) continue;
                 const range: [number, number] | null = visibleOverlayRange(
@@ -4604,8 +4616,11 @@ export class Chart {
             return;
         }
 
-        const plot: PlotRect = this.viewport.plot;
-        const regionHeight: number = plot.height * volume.heightRatio;
+        const paneIndex: number = volume.pane ?? 0;
+        const paneRect: PlotRect = (paneIndex > 0 && this.paneRects && this.paneRects[paneIndex])
+            ? this.paneRects[paneIndex]
+            : this.viewport.plot;
+        const regionHeight: number = paneIndex > 0 ? paneRect.height : paneRect.height * volume.heightRatio;
         if (regionHeight <= 0) {
             this.dataRenderer.clearHistogram();
             return;
@@ -4626,16 +4641,16 @@ export class Chart {
             return;
         }
 
-        // Bars occupy the bottom of the plot, growing upward, so the price axis
-        // keeps the full height and the histogram reads as a strip beneath it.
+        // Bars occupy the bottom of the pane/plot, growing upward
         const scaleY: number = -(regionHeight * 0.92) / peak;
-        const baseline: number = plot.y + plot.height;
+        const baseline: number = paneRect.y + paneRect.height;
         const offsetY: number = baseline - 0 * scaleY;
         this.dataRenderer.drawHistogram(
             this.displayedCandles,
             volume.colors,
             scaleY,
             offsetY,
+            paneIndex,
         );
     }
 

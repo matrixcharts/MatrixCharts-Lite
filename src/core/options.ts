@@ -60,6 +60,11 @@ export interface VolumeOptions {
      * it is expressed with `panes.weights` and its own `pane` index.
      */
     heightRatio?: number;
+    /**
+     * Which pane to draw the volume on. 0 is the price pane (default).
+     * If set to an index >= 1, volume occupies that dedicated sub-pane.
+     */
+    pane?: number;
 }
 
 /**
@@ -284,6 +289,7 @@ export interface ResolvedVolume {
     visible: boolean;
     colors: ResolvedVolumeColors;
     heightRatio: number;
+    pane: number;
 }
 export interface ResolvedPriceScale {
     mode: 'linear' | 'log';
@@ -661,6 +667,7 @@ const DEFAULT_LAYOUT_METRICS = {
 const DEFAULT_VOLUME_METRICS = {
     visible: false,
     heightRatio: 0.2,
+    pane: 0,
 } as const;
 
 /**
@@ -836,6 +843,9 @@ export function resolveOptions(partial: ChartOptions, fallbackTheme: ChartTheme 
             if (resolved.volume.heightRatio <= 0) {
                 fail('volume.heightRatio must be greater than 0; a histogram with no height draws nothing.');
             }
+        }
+        if (volume.pane !== undefined) {
+            resolved.volume.pane = requireIntegerInRange(volume.pane, 'volume.pane', 0, 50);
         }
         // A single colour applies to both directions unless a direction overrides
         // it, so the common case is one option rather than two identical ones.

@@ -1,6 +1,7 @@
 import type { EventEmitter, ChartEvents } from '../core/EventEmitter.js';
 import type { IDataRenderer } from '../core/IDataRenderer.js';
 import type { PlotRect } from '../core/coordinates.js';
+import type { PaneLayout } from '../core/panes.js';
 import type { ResolvedVolumeColors } from '../core/options.js';
 import type { CandleRenderSpec, Rgba } from './WebGL2Renderer.js';
 import type { VerticalTransform } from './WebGLSeries.js';
@@ -27,6 +28,8 @@ export class Canvas2DDataRenderer implements IDataRenderer {
     private histogramColors: ResolvedVolumeColors | null = null;
     private histogramScaleY = 0;
     private histogramOffsetY = 0;
+    private histogramPane = 0;
+    private panes: PaneLayout | null = null;
     private overlays = new Map<string, { points: Float32Array; stride: 2 | 6; color: Rgba; vertical: VerticalTransform | null; pane: number }>();
 
     public init(canvas: HTMLCanvasElement, emitter: EventEmitter<ChartEvents>): void {
@@ -95,11 +98,12 @@ export class Canvas2DDataRenderer implements IDataRenderer {
     public drawArea(points: Float32Array, fill: Rgba): void { this.area = new Float32Array(points); this.areaFill = fill; }
     public clearArea(): void { this.area = new Float32Array(0); }
 
-    public drawHistogram(levels: Float32Array, colors: ResolvedVolumeColors, scaleY: number, offsetY: number): void {
+    public drawHistogram(levels: Float32Array, colors: ResolvedVolumeColors, scaleY: number, offsetY: number, pane: number = 0): void {
         this.histogram = new Float32Array(levels);
         this.histogramColors = colors;
         this.histogramScaleY = scaleY;
         this.histogramOffsetY = offsetY;
+        this.histogramPane = pane;
     }
 
     public clearHistogram(): void { this.histogram = new Float32Array(0); }
@@ -110,6 +114,7 @@ export class Canvas2DDataRenderer implements IDataRenderer {
         this.scaleX = payload.scaleX;
         this.scaleY = payload.scaleY;
         this.plot = payload.plot;
+        this.panes = payload.panes ?? null;
     };
 
     private x(value: number): number { return this.offsetX + value * this.scaleX; }
@@ -186,11 +191,15 @@ export class Canvas2DDataRenderer implements IDataRenderer {
     }
     private renderHistogram(): void {
         if (this.histogram.length === 0 || this.histogramColors === null) return;
+        const targetRect = (this.histogramPane > 0 && this.panes && this.panes.rects[this.histogramPane])
+            ? this.panes.rects[this.histogramPane]
+            : this.plot;
+        const baseline = targetRect.y + targetRect.height;
         for (let offset = 0; offset < this.histogram.length; offset += CANDLE_STRIDE) {
             const x = this.x(this.histogram[offset]);
             const y = this.histogramOffsetY + this.histogram[offset + CANDLE_VOLUME] * this.histogramScaleY;
             this.ctx.fillStyle = this.css(this.histogram[offset + CANDLE_CLOSE] >= this.histogram[offset + CANDLE_OPEN] ? this.histogramColors.up : this.histogramColors.down);
-            this.ctx.fillRect(x - this.scaleX * 0.35, y, this.scaleX * 0.7, this.plot.y + this.plot.height - y);
+            this.ctx.fillRect(x - this.scaleX * 0.35, y, this.scaleX * 0.7, baseline - y);
         }
     }
 }

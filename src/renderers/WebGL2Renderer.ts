@@ -515,10 +515,12 @@ export class WebGL2Renderer implements IDataRenderer {
         colors: ResolvedVolumeColors,
         scaleY: number,
         offsetY: number,
+        pane: number = 0,
     ): void {
         const gl: WebGL2RenderingContext = this.requireContext();
         const series = this.volumeSeries;
         if (!series) return;
+        series.pane = pane;
         if (levels.length % CANDLE_STRIDE !== 0) {
             throw new Error('MatrixCharts: Histogram input must contain candle records.');
         }

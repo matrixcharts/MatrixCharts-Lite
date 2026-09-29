@@ -49,6 +49,7 @@ export interface IDataRenderer extends IRenderer {
         colors: ResolvedVolumeColors,
         scaleY: number,
         offsetY: number,
+        pane?: number,
     ): void;
     clearHistogram(): void;
 }
