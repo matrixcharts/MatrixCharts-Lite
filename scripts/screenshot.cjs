@@ -22,10 +22,8 @@ const fs = require('node:fs');
 const PUPPETEER_CANDIDATES = [
     'puppeteer-core',
     'puppeteer-core/node_modules/puppeteer-core',
-    'D:/Projects/Trade-Metrics/node_modules/puppeteer-core',
 ];
 const CHROME_CANDIDATES = [
-    'C:/Users/User/.cache/puppeteer/chrome/win64-152.0.7977.75/chrome-win64/chrome.exe',
     'C:/Program Files/Google/Chrome/Application/chrome.exe',
     'C:/Program Files (x86)/Google/Chrome/Application/chrome.exe',
     'C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe',

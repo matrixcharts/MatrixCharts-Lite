@@ -64,7 +64,6 @@ const readUiLayer = (target) => target.evaluate(() => {
 
 const CHROME_CANDIDATES = [
     process.env.CHROME_PATH,
-    'C:/Users/User/.cache/puppeteer/chrome/win64-152.0.7977.75/chrome-win64/chrome.exe',
     'C:/Program Files/Google/Chrome/Application/chrome.exe',
     'C:/Program Files (x86)/Google/Chrome/Application/chrome.exe',
     '/usr/bin/google-chrome',
@@ -74,7 +73,6 @@ const CHROME_CANDIDATES = [
 const CORE_CANDIDATES = [
     'puppeteer-core',
     'puppeteer-core/node_modules/puppeteer-core',
-    'D:/Projects/Trade-Metrics/node_modules/puppeteer-core',
 ];
 
 // The contract, stated as the user put it: under half a pixel.

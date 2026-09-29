@@ -8,7 +8,6 @@ const URL = process.argv[2] ?? 'http://localhost:5173/tests/browser/performance.
 const puppeteer = requireFromHere(process.env.PUPPETEER_CORE ?? 'puppeteer-core');
 const chromeCandidates = [
     process.env.CHROME_PATH,
-    'C:/Users/User/.cache/puppeteer/chrome/win64-152.0.7977.75/chrome-win64/chrome.exe',
     'C:/Program Files/Google/Chrome/Application/chrome.exe',
     'C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe',
 ].filter((candidate) => candidate && fs.existsSync(candidate));
