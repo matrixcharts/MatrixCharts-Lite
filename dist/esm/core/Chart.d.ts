@@ -314,6 +314,11 @@ export declare class Chart {
      */
     redraw(): void;
     private bindEvents;
+    /**
+     * Hit-tests the native 'MC' brand watermark badge in the bottom-left corner
+     * of the plot rect.
+     */
+    private isWatermarkHit;
     private handlePointerDown;
     /**
      * Whether a press at this client x is in the price axis gutter rather than the plot.

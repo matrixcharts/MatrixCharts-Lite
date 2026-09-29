@@ -274,6 +274,15 @@ export class Chart {
         this.handlePointerDown = (event) => {
             if (event.pointerType === 'mouse' && event.button !== 0)
                 return;
+            const rect = this.canvasWrapper.getBoundingClientRect();
+            const localX = event.clientX - rect.left;
+            const localY = event.clientY - rect.top;
+            if (this.isWatermarkHit(localX, localY)) {
+                if (typeof window !== 'undefined') {
+                    window.open('https://github.com/matrixcharts/MatrixCharts-Lite', '_blank', 'noopener,noreferrer');
+                }
+                return;
+            }
             // A caller gets first refusal on every press, before the chart decides what the
             // gesture is. This is the only point a drawing tool can say "mine" — every other
             // gesture decision here is already made by the time a press has been recorded.
@@ -359,12 +368,20 @@ export class Chart {
             // follow the pointer before any press, which is the common case.
             if (!this.isInteracting()) {
                 const rect = this.canvasWrapper.getBoundingClientRect();
-                if (this.separatorAtRow(event.clientY - rect.top) !== null) {
+                const localX = event.clientX - rect.left;
+                const localY = event.clientY - rect.top;
+                if (this.isWatermarkHit(localX, localY)) {
+                    this.canvasWrapper.style.cursor = 'pointer';
+                    this.canvasWrapper.title = 'MatrixCharts-Lite (GitHub)';
+                }
+                else if (this.separatorAtRow(localY) !== null) {
                     this.canvasWrapper.style.cursor = 'ns-resize';
+                    this.canvasWrapper.title = '';
                     this.clearCrosshair();
                 }
                 else {
                     this.canvasWrapper.style.cursor = '';
+                    this.canvasWrapper.title = '';
                     this.updateCrosshair(event.clientX, event.clientY);
                 }
             }
@@ -762,6 +779,25 @@ export class Chart {
         this.canvasWrapper.addEventListener('lostpointercapture', this.handlePointerEnd);
         this.canvasWrapper.addEventListener('pointerleave', this.handlePointerLeave);
         this.canvasWrapper.addEventListener('wheel', this.handleWheel, { passive: false });
+    }
+    /**
+     * Hit-tests the native 'MC' brand watermark badge in the bottom-left corner
+     * of the plot rect.
+     */
+    isWatermarkHit(localX, localY) {
+        if (!this.resolvedOptions.watermark.visible)
+            return false;
+        const width = this.canvasWrapper.clientWidth;
+        const height = this.canvasWrapper.clientHeight;
+        const plot = this.plotRect(width, height);
+        if (plot.width < 100 || plot.height < 60)
+            return false;
+        const size = 24;
+        const padding = 10;
+        const x = plot.x + padding;
+        const y = plot.y + plot.height - size - padding;
+        // Hit box with generous 4px padding for easy clicking
+        return localX >= x - 4 && localX <= x + size + 4 && localY >= y - 4 && localY <= y + size + 4;
     }
     /**
      * Whether a press at this client x is in the price axis gutter rather than the plot.
