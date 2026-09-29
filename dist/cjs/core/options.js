@@ -33,6 +33,7 @@ const BASE_DEFAULTS = {
     // One pane filling the plot, and a hairline between panes. The separator
     // colour is resolved after the grid colour, which it defaults to.
     panes: { weights: [1], separatorHeight: 1, separatorColor: '' },
+    watermark: { visible: true, opacity: 0.75 },
     timeScale: {
         barSpacing: candlestickBodyWidth_js_1.DEFAULT_CANDLE_SPACING_PX,
         minBarSpacing: exports.DEFAULT_MIN_BAR_SPACING,

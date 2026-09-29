@@ -154,6 +154,11 @@ export declare class Canvas2DRenderer implements IRenderer {
      * silently ignored.
      */
     setOverlayPainter(painter: OverlayPainter | null): void;
+    /**
+     * Renders the native MatrixCharts 'MC' brand watermark badge in the bottom-left
+     * corner of the plot rect, just above the time axis.
+     */
+    private renderWatermarkBadge;
     private renderCrosshair;
     /**
      * The rect of the pane the crosshair is over, or `null` on a divider.

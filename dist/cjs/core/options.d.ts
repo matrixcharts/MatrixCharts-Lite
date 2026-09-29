@@ -1,3 +1,12 @@
+export interface WatermarkOptions {
+    /**
+     * Whether the brand watermark badge is visible.
+     * In MatrixCharts-Lite, the watermark is part of the free community license contract.
+     */
+    visible?: boolean;
+    /** Opacity of the watermark badge (0.1 to 1.0). Defaults to 0.75. */
+    opacity?: number;
+}
 export type ChartTheme = 'dark' | 'paper';
 export interface PriceFormatOptions {
     /** Maximum fraction digits on price labels. Integer 0-20. */
@@ -254,6 +263,7 @@ export interface ChartOptions {
     crosshair?: CrosshairOptions;
     timeScale?: TimeScaleOptions;
     candlestick?: CandlestickOptions;
+    watermark?: WatermarkOptions;
 }
 export interface ResolvedPriceFormat {
     precision: number;
@@ -334,6 +344,10 @@ export interface ResolvedCandlestick {
     lastPriceTagText: Rgba;
 }
 /** Every option resolved to a concrete value. Returned by `chart.options()`. */
+export interface ResolvedWatermark {
+    visible: boolean;
+    opacity: number;
+}
 export interface ResolvedChartOptions {
     maxRetainedCandles: number;
     theme: ChartTheme;
@@ -348,6 +362,7 @@ export interface ResolvedChartOptions {
     crosshair: ResolvedCrosshair;
     timeScale: ResolvedTimeScale;
     candlestick: ResolvedCandlestick;
+    watermark: ResolvedWatermark;
 }
 /** Normalised RGBA, each channel 0-1. */
 export type Rgba = [number, number, number, number];

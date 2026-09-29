@@ -10,6 +10,17 @@ import { DEFAULT_CANDLE_SPACING_PX } from '../math/candlestickBodyWidth.js';
 import { resolvePaneOptions } from './panes.js';
 import { DEFAULT_MAX_WHITESPACE_RATIO } from './sessionScale.js';
 
+
+export interface WatermarkOptions {
+    /**
+     * Whether the brand watermark badge is visible.
+     * In MatrixCharts-Lite, the watermark is part of the free community license contract.
+     */
+    visible?: boolean;
+    /** Opacity of the watermark badge (0.1 to 1.0). Defaults to 0.75. */
+    opacity?: number;
+}
+
 export type ChartTheme = 'dark' | 'paper';
 
 export interface PriceFormatOptions {
@@ -279,6 +290,7 @@ export interface ChartOptions {
     crosshair?: CrosshairOptions;
     timeScale?: TimeScaleOptions;
     candlestick?: CandlestickOptions;
+    watermark?: WatermarkOptions;
 }
 
 export interface ResolvedPriceFormat { precision: number; minMove: number }
@@ -357,6 +369,11 @@ export interface ResolvedCandlestick {
 }
 
 /** Every option resolved to a concrete value. Returned by `chart.options()`. */
+export interface ResolvedWatermark {
+    visible: boolean;
+    opacity: number;
+}
+
 export interface ResolvedChartOptions {
     maxRetainedCandles: number;
     theme: ChartTheme;
@@ -371,6 +388,7 @@ export interface ResolvedChartOptions {
     crosshair: ResolvedCrosshair;
     timeScale: ResolvedTimeScale;
     candlestick: ResolvedCandlestick;
+    watermark: ResolvedWatermark;
 }
 
 /** Normalised RGBA, each channel 0-1. */
@@ -389,6 +407,7 @@ const BASE_DEFAULTS: Omit<ResolvedChartOptions, 'theme' | 'locale' | 'candlestic
     // One pane filling the plot, and a hairline between panes. The separator
     // colour is resolved after the grid colour, which it defaults to.
     panes: { weights: [1], separatorHeight: 1, separatorColor: '' },
+    watermark: { visible: true, opacity: 0.75 },
     timeScale: {
         barSpacing: DEFAULT_CANDLE_SPACING_PX,
         minBarSpacing: DEFAULT_MIN_BAR_SPACING,

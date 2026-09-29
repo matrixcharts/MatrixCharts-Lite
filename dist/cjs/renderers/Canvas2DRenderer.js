@@ -581,6 +581,64 @@ class Canvas2DRenderer {
         // re-registered it would still be silenced by the old message.
         this.lastOverlayPainterError = null;
     }
+    /**
+     * Renders the native MatrixCharts 'MC' brand watermark badge in the bottom-left
+     * corner of the plot rect, just above the time axis.
+     */
+    renderWatermarkBadge(viewport) {
+        const watermark = this.options.watermark;
+        if (!watermark || !watermark.visible)
+            return;
+        const plot = viewport.plot;
+        if (plot.width < 100 || plot.height < 60)
+            return;
+        const size = 26;
+        const padding = 10;
+        const x = plot.x + padding;
+        const y = plot.y + plot.height - size - padding;
+        const ctx = this.ctx;
+        ctx.save();
+        const isDark = (this.colors.background[0] * 0.299 + this.colors.background[1] * 0.587 + this.colors.background[2] * 0.114) < 0.5;
+        const alpha = watermark.opacity ?? 0.75;
+        const cx = x + size / 2;
+        const cy = y + size / 2;
+        const r = size / 2;
+        // 1. Subtle circular badge backdrop
+        ctx.beginPath();
+        ctx.arc(cx, cy, r, 0, Math.PI * 2);
+        ctx.fillStyle = isDark ? `rgba(18, 24, 38, ${alpha})` : `rgba(240, 243, 250, ${alpha})`;
+        ctx.fill();
+        ctx.strokeStyle = isDark ? `rgba(255, 255, 255, ${alpha * 0.2})` : `rgba(0, 0, 0, ${alpha * 0.15})`;
+        ctx.lineWidth = 1;
+        ctx.stroke();
+        // 2. Refined Monochrome MC Monogram
+        const fgColor = isDark ? `rgba(255, 255, 255, ${alpha * 0.95})` : `rgba(18, 24, 38, ${alpha * 0.95})`;
+        ctx.strokeStyle = fgColor;
+        ctx.lineWidth = 1.4;
+        ctx.lineCap = 'round';
+        ctx.lineJoin = 'round';
+        // 'M' shape
+        ctx.beginPath();
+        ctx.moveTo(cx - 7, cy + 4.5);
+        ctx.lineTo(cx - 7, cy - 4.5);
+        ctx.lineTo(cx - 3.5, cy);
+        ctx.lineTo(cx, cy - 4.5);
+        ctx.lineTo(cx, cy + 4.5);
+        ctx.stroke();
+        // 'C' shape with upward trend arc
+        ctx.beginPath();
+        ctx.arc(cx + 4.2, cy, 4.2, 0.4 * Math.PI, 1.85 * Math.PI, false);
+        ctx.stroke();
+        // Arrowhead on C top-right tip
+        const tipX = cx + 7.2;
+        const tipY = cy - 3.8;
+        ctx.beginPath();
+        ctx.moveTo(tipX - 3, tipY);
+        ctx.lineTo(tipX, tipY);
+        ctx.lineTo(tipX - 0.5, tipY + 3);
+        ctx.stroke();
+        ctx.restore();
+    }
     renderCrosshair() {
         if (!this.options.crosshair.visible)
             return;
