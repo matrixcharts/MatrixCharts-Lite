@@ -1,0 +1,55 @@
+import type { CandleFeedMessage, CandleSource, CandleSourceState } from './CandleSource.js';
+type WebSocketFactory = (url: string) => WebSocket;
+type FeedListener = (message: CandleFeedMessage) => void;
+type StateListener = (state: CandleSourceState) => void;
+export interface WebSocketCandleSourceOptions {
+    reconnectMinDelayMs?: number;
+    reconnectMaxDelayMs?: number;
+    heartbeatTimeoutMs?: number;
+    watchdogIntervalMs?: number;
+    webSocketFactory?: WebSocketFactory;
+}
+export declare class WebSocketCandleSource implements CandleSource {
+    private readonly url;
+    private socket;
+    private currentState;
+    private readonly messageListeners;
+    private readonly stateListeners;
+    private readonly reconnectMinDelayMs;
+    private readonly reconnectMaxDelayMs;
+    private readonly heartbeatTimeoutMs;
+    private readonly watchdogIntervalMs;
+    private readonly createSocket;
+    private reconnectTimer;
+    private watchdogTimer;
+    private reconnectAttempt;
+    private lastSequence;
+    private lastHeartbeatAt;
+    private resyncRequestedAt;
+    private synchronized;
+    private resyncRequested;
+    private manuallyStopped;
+    constructor(url: string, options?: WebSocketCandleSourceOptions);
+    get state(): CandleSourceState;
+    subscribe(onMessage: FeedListener, onStateChange: StateListener): () => void;
+    start(): void;
+    stop(): void;
+    requestSnapshot(reason: string): void;
+    private connect;
+    private handleOpen;
+    private handleSocketMessage;
+    private handleError;
+    private handleClose;
+    private checkHealth;
+    private requestResync;
+    private restartConnection;
+    private scheduleReconnect;
+    private detachSocket;
+    private clearReconnectTimer;
+    private emitMessage;
+    private setState;
+    private parseMessage;
+    private parseCandle;
+}
+export {};
+//# sourceMappingURL=WebSocketCandleSource.d.ts.map

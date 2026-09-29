@@ -1,5 +1,4 @@
 node_modules/
-dist/
 .test-build/
 .tmp/
 .DS_Store
