@@ -163,6 +163,11 @@ export declare class Canvas2DRenderer implements IRenderer {
      * corner of the plot rect, just above the time axis. Fully background-color aware
      * using the engine's contrastText mechanics (matching price badges and OHLC chip).
      */
+    /**
+     * Renders the native MatrixCharts 'MC' brand watermark badge in the bottom-left
+     * corner of the plot rect, just above the time axis. Fully background-color aware
+     * using crisp TradingView-style typography and contrast mechanics.
+     */
     private renderWatermarkBadge;
     private renderCrosshair;
     /**

@@ -588,6 +588,11 @@ export class Canvas2DRenderer {
      * corner of the plot rect, just above the time axis. Fully background-color aware
      * using the engine's contrastText mechanics (matching price badges and OHLC chip).
      */
+    /**
+     * Renders the native MatrixCharts 'MC' brand watermark badge in the bottom-left
+     * corner of the plot rect, just above the time axis. Fully background-color aware
+     * using crisp TradingView-style typography and contrast mechanics.
+     */
     renderWatermarkBadge(viewport) {
         const watermark = this.options.watermark;
         if (!watermark || !watermark.visible)
@@ -595,13 +600,12 @@ export class Canvas2DRenderer {
         const plot = viewport.plot;
         if (plot.width < 100 || plot.height < 60)
             return;
-        const size = 26;
+        const size = 24;
         const padding = 10;
         const x = plot.x + padding;
         const y = plot.y + plot.height - size - padding;
         const ctx = this.ctx;
         ctx.save();
-        // Background-aware ink matching chart tags and OHLC readout
         const bg = this.colors.background;
         const ink = contrastText(bg);
         const alpha = Math.max(0.2, Math.min(1.0, watermark.opacity ?? 0.85));
@@ -611,38 +615,17 @@ export class Canvas2DRenderer {
         // 1. Subtle circular badge backdrop
         ctx.beginPath();
         ctx.arc(cx, cy, r, 0, Math.PI * 2);
-        // Elevate backdrop relative to theme ink
-        ctx.fillStyle = this.withAlpha(ink, 0.12 * alpha);
+        ctx.fillStyle = this.withAlpha(ink, 0.10 * alpha);
         ctx.fill();
-        ctx.strokeStyle = this.withAlpha(ink, 0.28 * alpha);
+        ctx.strokeStyle = this.withAlpha(ink, 0.22 * alpha);
         ctx.lineWidth = 1;
         ctx.stroke();
-        // 2. Refined Monochrome MC Monogram inside badge
-        const fgColor = this.withAlpha(ink, 0.90 * alpha);
-        ctx.strokeStyle = fgColor;
-        ctx.lineWidth = 1.4;
-        ctx.lineCap = 'round';
-        ctx.lineJoin = 'round';
-        // 'M' shape
-        ctx.beginPath();
-        ctx.moveTo(cx - 7, cy + 4.5);
-        ctx.lineTo(cx - 7, cy - 4.5);
-        ctx.lineTo(cx - 3.5, cy);
-        ctx.lineTo(cx, cy - 4.5);
-        ctx.lineTo(cx, cy + 4.5);
-        ctx.stroke();
-        // 'C' shape with upward trend arc
-        ctx.beginPath();
-        ctx.arc(cx + 4.2, cy, 4.2, 0.4 * Math.PI, 1.85 * Math.PI, false);
-        ctx.stroke();
-        // Arrowhead on C top-right tip
-        const tipX = cx + 7.2;
-        const tipY = cy - 3.8;
-        ctx.beginPath();
-        ctx.moveTo(tipX - 3, tipY);
-        ctx.lineTo(tipX, tipY);
-        ctx.lineTo(tipX - 0.5, tipY + 3);
-        ctx.stroke();
+        // 2. Crisp, bold TradingView-style typography monogram
+        ctx.font = 'bold 10px -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif';
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+        ctx.fillStyle = this.withAlpha(ink, 0.85 * alpha);
+        ctx.fillText('MC', cx, cy + 0.5);
         ctx.restore();
     }
     renderCrosshair() {
