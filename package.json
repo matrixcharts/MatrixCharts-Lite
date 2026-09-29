@@ -1,6 +1,6 @@
 {
   "name": "@matrixcharts/lite",
-  "version": "1.2.0",
+  "version": "1.2.1",
   "description": "Zero-dependency WebGL2 candlestick chart with a Canvas2D fallback and a sequenced live candle feed.",
   "license": "ISC",
   "repository": {

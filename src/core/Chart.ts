@@ -245,6 +245,7 @@ export class Chart {
      * is the height the press was measured against, held for the same reason: a resize
      * mid-drag must not retroactively rescale a gesture already under way.
      */
+    private paneSeparatorDrag: { index: number; startY: number; startWeights: number[] } | null = null;
     private priceAxisDrag: {
         pane: number;
         pressY: number;
@@ -754,15 +755,26 @@ export class Chart {
             } else {
                 this.priceAxisDrag = null;
                 const rect = this.canvasWrapper.getBoundingClientRect();
-                const hit = this.hitTest(event.clientX - rect.left, event.clientY - rect.top);
-                if (hit?.kind === 'order' && hit.status === 'working') {
-                    this.orderDrag = { id: hit.id };
-                    this.isDragging = false;
-                } else {
-                    this.orderDrag = null;
+                const separatorIndex = this.separatorAtRow(event.clientY - rect.top);
+                if (separatorIndex !== null) {
+                    this.paneSeparatorDrag = {
+                        index: separatorIndex,
+                        startY: event.clientY,
+                        startWeights: [...this.resolvedOptions.panes.weights]
+                    };
                     this.isDragging = true;
-                    this.lastPointerX = event.clientX;
-                    this.lastPointerY = event.clientY;
+                    this.orderDrag = null;
+                } else {
+                    const hit = this.hitTest(event.clientX - rect.left, event.clientY - rect.top);
+                    if (hit?.kind === 'order' && hit.status === 'working') {
+                        this.orderDrag = { id: hit.id };
+                        this.isDragging = false;
+                    } else {
+                        this.orderDrag = null;
+                        this.isDragging = true;
+                        this.lastPointerX = event.clientX;
+                        this.lastPointerY = event.clientY;
+                    }
                 }
             }
         } else if (this.activePointers.size === 2) {
@@ -842,6 +854,55 @@ export class Chart {
      * the caller's double-click another, and the two would disagree on exactly the
      * pixels nobody tested.
      */
+    private separatorAtRow(y: number): number | null {
+        const rects: PlotRect[] = this.paneRects;
+        const separatorHeight: number = this.resolvedOptions.panes.separatorHeight;
+        if (!(separatorHeight > 0)) return null;
+        for (let i = 0; i < rects.length - 1; i++) {
+            const pane = rects[i];
+            const sepTop = pane.y + pane.height;
+            const sepBottom = sepTop + separatorHeight;
+            if (y >= sepTop - 3 && y <= sepBottom + 3) return i;
+        }
+        return null;
+    }
+
+    private updatePaneSeparatorDrag(clientY: number): void {
+        const drag = this.paneSeparatorDrag;
+        if (drag === null) return;
+        const delta: number = clientY - drag.startY;
+        
+        const plot: PlotRect = this.viewport.plot;
+        const count: number = drag.startWeights.length;
+        const separators: number = Math.max(0, count - 1);
+        const separatorTotal: number = this.resolvedOptions.panes.separatorHeight * separators;
+        const available: number = Math.max(0, plot.height - separatorTotal);
+        if (available <= 0) return;
+        
+        let totalWeight = 0;
+        for (let i = 0; i < drag.startWeights.length; i++) {
+            totalWeight += drag.startWeights[i];
+        }
+        
+        const heights = drag.startWeights.map(w => (w / totalWeight) * available);
+        const minHeight = 20;
+        let actualDelta = delta;
+        
+        if (heights[drag.index] + actualDelta < minHeight) {
+            actualDelta = minHeight - heights[drag.index];
+        }
+        if (heights[drag.index + 1] - actualDelta < minHeight) {
+            actualDelta = heights[drag.index + 1] - minHeight;
+        }
+        
+        heights[drag.index] += actualDelta;
+        heights[drag.index + 1] -= actualDelta;
+        
+        const newWeights = heights.map(h => h / available);
+        this.resolvedOptions.panes.weights = newWeights;
+        this.handleResize();
+    }
+
     private paneAtRow(y: number): number | null {
         const rects: PlotRect[] = this.paneRects;
         for (let index = 0; index < rects.length; index++) {
@@ -975,7 +1036,14 @@ export class Chart {
         // Hover tracking is independent of the buttons: the crosshair has to
         // follow the pointer before any press, which is the common case.
         if (!this.isInteracting()) {
-            this.updateCrosshair(event.clientX, event.clientY);
+            const rect = this.canvasWrapper.getBoundingClientRect();
+            if (this.separatorAtRow(event.clientY - rect.top) !== null) {
+                this.canvasWrapper.style.cursor = 'ns-resize';
+                this.clearCrosshair();
+            } else {
+                this.canvasWrapper.style.cursor = '';
+                this.updateCrosshair(event.clientX, event.clientY);
+            }
         }
 
         if (!this.activePointers.has(event.pointerId)) return;
@@ -990,6 +1058,10 @@ export class Chart {
 
         if (this.activePointers.size >= 2) {
             this.handlePinchMove();
+            return;
+        }
+        if (this.paneSeparatorDrag !== null) {
+            this.updatePaneSeparatorDrag(event.clientY);
             return;
         }
         // After the pinch branch, so two pointers always mean pinch. A press on the
@@ -1071,6 +1143,7 @@ export class Chart {
             // The axis drag ends with the gesture that started it. Dropping the
             // baseline here is what stops a later press from measuring against a
             // range captured several gestures ago.
+            this.paneSeparatorDrag = null;
             this.priceAxisDrag = null;
             this.orderDrag = null;
             // A press that never travelled is a click; one that travelled was a pan.
@@ -1160,7 +1233,7 @@ export class Chart {
         // A claimed press counts for the same reason: the pointer is driving a caller's
         // gesture, and the crosshair should not read it as a hover over the chart.
         return this.isDragging || this.activePointers.size >= 2 || this.priceAxisDrag !== null
-            || this.claimedPointerId !== null;
+            || this.paneSeparatorDrag !== null || this.claimedPointerId !== null;
     }
 
     private handleWheel = (event: WheelEvent): void => {
