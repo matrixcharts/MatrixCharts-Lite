@@ -4,9 +4,54 @@ Notable changes to MatrixCharts, newest first. The frozen v1 public surface and
 its reasoning live in [docs/v1-contract.md](docs/v1-contract.md); this file
 records what moved and why, per release.
 
+## v1.3.0
+
+Unreleased.
+
+**This is the first release that actually reaches npm.** The published `latest` is **1.2.0**,
+so 1.2.1, 1.2.2 and 1.2.3 were version numbers this repository carried and never shipped —
+which is why this is a minor bump rather than a patch: the unreleased work since 1.2.0 is
+additive, and it includes a new public option.
+
+Minor, not patch, and not by preference: `watermark: { visible, opacity }` is a new field on
+the resolved options, and labelling an added option as a patch release is the same category of
+error as calling a capability green when it is not there. `docs/v1-contract.md` explicitly
+permits this — "additive APIs may appear in later 1.x releases" — so nothing in the frozen
+surface moved.
+
+Carried from the three commits tagged 1.2.1–1.2.3, none of which shipped:
+
+- **Multi-pane coordinate projection** — `toData`/`toScreen`/`coordinateToPaneValue`/
+  `paneValueToCoordinate`, and `drawingProjector`/`drawingUnprojector` across panes 0..N.
+- **Configurable price axis placement** — `layout.priceAxisPosition: 'left' | 'right' | 'both'`.
+- **Dynamic gutter width** — measured from font metrics, digits and precision.
+- **Native histogram / area / band overlays** — `OverlaySpec.type` extended, with WebGL2
+  instanced batching and a Canvas2D fallback.
+- **A brand watermark badge** — `watermark.visible` and `watermark.opacity`.
+
+Added since, and **not** a public API change:
+
+- **The pointer-release teardown is now idempotent.** In a real browser `lostpointercapture`
+  fires *after* a completed `pointerup`, so every release arrives twice. The teardown now drops
+  a pointer the chart is not tracking. **No observable behaviour changes today** — `wasSinglePointer`
+  is read before the delete, so the stray delivery was already suppressed — and the guard is
+  there so the next feature that adds a side effect to the release path inherits a teardown that
+  is safe to run twice. Nine contract tests in `tests/PointerRelease.test.cjs`.
+- **The headless harness stamps `event.type`** onto dispatched pointer events. A stub that omits
+  a field the chart reads is a stub that can disagree with a browser.
+- **`check:interaction` refuses to run against the wrong engine.** Both packages ship
+  `tests/browser/interaction.e2e.html` at the same path and the runner asked a bare
+  `localhost:5173`, so whichever dev server was listening answered it. A run from this checkout
+  against the advanced checkout's server reported 30/32 in which **every result was about the
+  other engine**. The page now declares its repository and the runner asserts it.
+- **`dist/` is no longer tracked**, so a commit can no longer be a day behind its own build, and
+  `"prepack": "npm run build"` is restored so a publish cannot ship a stale bundle. Verified that
+  the pnpm approval prompt which got `prepack` removed in `32b7b53` does not reproduce on
+  pnpm 11.8.0; `prepublishOnly` was rejected in its favour because it does not run on `pnpm pack`.
+
 ## v1.2.3
 
-Released: 2026-09-29
+Not published. See v1.3.0 above.
 
 An additive core release providing configurable price axis placement, dynamic gutter width measurement, full multi-pane coordinate projections, and native histogram/area/band overlay rendering on WebGL2 and Canvas2D.
 
