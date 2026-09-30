@@ -1169,6 +1169,28 @@ export class Chart {
             return;
         }
 
+        // **Idempotence guard, and not an optimisation.** `handlePointerEnd` is bound to three
+        // events — `pointerup`, `pointercancel` and `lostpointercapture` — and in a real
+        // browser the last of those fires *after* a completed `pointerup`, because the chart
+        // took pointer capture on the way down and the capture is released on the way up.
+        // So every pointer release arrives twice, and the second one used to run the whole
+        // teardown again.
+        //
+        // For a library people build their own tools on, this is the highest-severity defect
+        // that can ship: a drawing tool draws twice per click, a "place order" button fires
+        // twice, and the developer blames this engine rather than their own code. Every click
+        // a user makes on the chart arrives at the caller's `subscribeClick` **twice**.
+        //
+        // It went unnoticed for the life of the library because `lostpointercapture` never fires
+        // in the headless harness, which dispatches only what a test names — so 501 passing
+        // tests and a real browser disagreed, and the tests were the wrong one. `tests/
+        // PointerRelease.test.cjs` now dispatches the capture-lost event explicitly, because a
+        // harness gap that hides a bug is a bug in the harness.
+        //
+        // A pointer the chart is not tracking is a notification about a gesture that has
+        // already been dealt with, so it is dropped.
+        if (!this.activePointers.has(event.pointerId)) return;
+
         const wasSinglePointer: boolean = this.activePointers.size === 1;
         this.activePointers.delete(event.pointerId);
 

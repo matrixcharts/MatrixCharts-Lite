@@ -100,6 +100,10 @@ proto.beginPath = function () {
 // The runner drives real events, so it needs the plot's box in CSS pixels and a
 // handle on the chart itself.
 globalThis.__mc = {
+    // **Which repository this page's engine came from.** See the note: the runner asserts this
+    // matches its own, because both repositories ship a `tests/browser/interaction.e2e.html`
+    // and a dev server left running from the *other* one will serve this path happily.
+    repo: 'lite',
     chart,
     source,
     drawn,

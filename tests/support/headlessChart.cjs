@@ -103,9 +103,17 @@ function installDom({ width = DEFAULT_WIDTH, height = DEFAULT_HEIGHT } = {}) {
             };
         }
 
-        /** Dispatches straight to the registered handlers; enough for the chart's own use. */
+        /**
+         * Dispatches straight to the registered handlers; enough for the chart's own use.
+         *
+         * `type` is stamped onto the event because a real `PointerEvent` carries it, and a
+         * handler that branches on it would read `undefined` here and take a different path
+         * than a browser would. The stub is faithful only in the fields the chart reads, and
+         * this is one it reads.
+         */
         dispatch(type, event = {}) {
-            for (const handler of this.listeners.get(type) ?? []) handler(event);
+            const payload = { type, ...event };
+            for (const handler of this.listeners.get(type) ?? []) handler(payload);
         }
     }
 

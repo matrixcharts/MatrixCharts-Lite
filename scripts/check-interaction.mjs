@@ -148,6 +148,54 @@ try {
 
     await page.goto(URL, { waitUntil: 'networkidle2' });
     await page.waitForFunction(() => globalThis.__mcReady === true, { timeout: 20000 });
+
+    // **Refuse to run against another repository's engine.** Both `@matrixcharts/lite` and
+    // `@matrixcharts/advanced` ship a `tests/browser/interaction.e2e.html`, and the default
+    // URL is a bare `localhost:5173` — so whichever dev server happens to be listening wins,
+    // and every invariant below reports on *that* engine while this file's name and this
+    // repo's history say otherwise.
+    //
+    // It is not hypothetical. Running this from the lite checkout while the advanced
+    // checkout's `vite` was on 5173 produced a clean-looking 30/32 in which **every result
+    // was about the advanced engine** — including a "log axis" failure lite's own engine does
+    // not have, which vanished the moment the URL pointed at a lite server (32/33, log span
+    // exactly 1.50000x). The tell was in the output the whole time: lite's engine resolves
+    // the mode to `'log'` and the failure printed `"logarithmic"`, a spelling that has never
+    // existed in lite's source.
+    //
+    // A check that can silently measure a different codebase is worse than no check, because
+    // its result looks like evidence. So the page declares which repository it is, and this
+    // asserts it before a single invariant is recorded. `MC_EXPECT_REPO` overrides, for
+    // anyone deliberately cross-running.
+    const EXPECT_REPO = process.env.MC_EXPECT_REPO
+        ?? (existsSync(resolve(root, 'src/core/AdvancedChart.ts')) ? 'advanced' : 'lite');
+    const servedRepo = await page.evaluate(() => globalThis.__mc?.repo ?? null);
+    if (servedRepo !== EXPECT_REPO) {
+        // `null` means the page carries no marker at all, which in practice means it is the
+        // *other* repository's copy from before this check existed. Said explicitly, because
+        // "repo=null" reads like a bug in the page rather than like a wrong server.
+        const why = servedRepo === null
+            ? 'that page declares no repository, so it predates this check — which in practice\n'
+              + 'means it is the other package\'s copy'
+            : `that page declares repo='${servedRepo}'`;
+        console.error(
+            `interaction: refusing to run. This script is in the ${EXPECT_REPO} checkout, but\n`
+            + `  ${URL}\n`
+            + `was served by a page this check does not recognise: ${why}.\n`
+            + '\n'
+            + 'Both packages ship this page at the same path, so a dev server left running\n'
+            + 'from the other repository answers this URL, and every invariant below would\n'
+            + 'report on the wrong engine — passing or failing for reasons that have nothing\n'
+            + 'to do with this checkout.\n'
+            + '\n'
+            + 'Start this repository\'s own server and pass its URL:\n'
+            + `  npx vite --port 5199 --strictPort        # in the ${EXPECT_REPO} checkout\n`
+            + '  npm run check:interaction -- http://localhost:5199/tests/browser/interaction.e2e.html',
+        );
+        await browser.close();
+        process.exit(1);
+    }
+
     await wait(500);
 
     // The reported price range has to be the range the pane is actually showing.
@@ -689,14 +737,36 @@ try {
     });
     await wait(300);
     const logBefore = await readVertical();
+    // **The mode both reads are interpreted in, asserted rather than assumed.** `spanOf` and
+    // `centreOf` take each value's *own* `mode`, so if the before-read and the after-read
+    // disagree about the mode, the ratio is a quotient of two different quantities and no
+    // tolerance can make it meaningful.
+    //
+    // That is not hypothetical: this invariant was failing at 1.64992x where 1.5x was asked
+    // for, and 1.649916 is exactly the *price-difference* ratio of a correctly applied 1.5x
+    // log-span scale — the signature of `toScale` being a no-op on the before-read. The
+    // engine's drag arithmetic is right; the measurement was mixing spaces, and it presented
+    // as a numeric drift rather than as a broken test, which is the worst way for a test to
+    // be wrong.
+    //
+    // So the mode is pinned first, and both reads are then forced into the same space. A
+    // failure here says "the mode did not take", which is actionable; a failure downstream
+    // says "1.64992x", which is not.
+    const logMode = logBefore.mode;
+    record(
+        'a log price scale reports itself as log when the drag case reads it',
+        logMode === 'log',
+        `mode before the log drag: ${JSON.stringify(logMode)}`,
+    );
+    const inLogSpace = (v) => ({ ...v, mode: logMode });
     await page.mouse.move(axisX, axisStartY);
     await page.mouse.down();
     await page.mouse.move(axisX, axisStartY + travel, { steps: 10 });
     await page.mouse.up();
     await wait(250);
     const logAfter = await readVertical();
-    const logFactor = spanOf(logAfter) / spanOf(logBefore);
-    const logCentreHeld = Math.abs(centreOf(logAfter) - centreOf(logBefore));
+    const logFactor = spanOf(inLogSpace(logAfter)) / spanOf(inLogSpace(logBefore));
+    const logCentreHeld = Math.abs(centreOf(inLogSpace(logAfter)) - centreOf(inLogSpace(logBefore)));
     const ratioBefore = logBefore.high / logBefore.low;
     const ratioAfter = logAfter.high / logAfter.low;
     record(
