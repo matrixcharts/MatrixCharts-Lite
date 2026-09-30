@@ -3,3 +3,16 @@ node_modules/
 .tmp/
 .DS_Store
 *.tgz
+
+# Build output. Tracked until 30 Sep 2026, which meant every commit had to remember to
+# rebuild -- and one did not, so `dist/` sat a day behind `src/` while the working tree
+# looked clean. A tracked build directory has two states that are always a commit apart, and
+# "committed" is routinely mistaken for "published", which is how a release ships code that
+# is not the code on disk. It stays in `package.json`'s `files`, so npm publishes it exactly
+# as before.
+#
+# **This makes a build mandatory before publishing.** There is no `prepack` hook -- it was
+# removed in 32b7b53 to stop pnpm prompting -- so a fresh clone that runs `npm publish`
+# without `npm run build` first ships a package whose `main` and `exports` point at files
+# that do not exist.
+dist/
