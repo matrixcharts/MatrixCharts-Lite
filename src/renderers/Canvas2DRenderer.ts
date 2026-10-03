@@ -383,12 +383,13 @@ public init(canvas: HTMLCanvasElement, emitter: EventEmitter<ChartEvents>): void
     public clear(): void {
         const cssWidth: number = this.canvas.width / this.devicePixelRatio;
         const cssHeight: number = this.canvas.height / this.devicePixelRatio;
-        if (this.isGridLayer) {
-            this.ctx.fillStyle = this.options.layout.background;
-            this.ctx.fillRect(0, 0, cssWidth, cssHeight);
-            return;
-        }
         this.ctx.clearRect(0, 0, cssWidth, cssHeight);
+        if (this.isGridLayer) {
+            if (this.options.layout.background && this.options.layout.background !== 'transparent') {
+                this.ctx.fillStyle = this.options.layout.background;
+                this.ctx.fillRect(0, 0, cssWidth, cssHeight);
+            }
+        }
     }
 
     /** `rgba(...)` string from an already-parsed colour, at a given alpha. */

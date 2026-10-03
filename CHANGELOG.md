@@ -4,6 +4,10 @@ Notable changes to MatrixCharts, newest first. The frozen v1 public surface and
 its reasoning live in [docs/v1-contract.md](docs/v1-contract.md); this file
 records what moved and why, per release.
 
+## v1.3.1
+
+- **Fix background grid canvas clearing on theme change** — `Canvas2DRenderer.clear()` now always calls `this.ctx.clearRect()` before filling `options.layout.background`. This eliminates ghost line and axis label accumulation during replay or viewport panning when switching themes or using `layout: { background: 'transparent' }`.
+
 ## v1.3.0
 
 Unreleased.
